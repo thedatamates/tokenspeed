@@ -783,7 +783,9 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 } else if (request->GeneratedSize() >= request->GetBlockDiffusionParams().max_new_tokens) {
                     // Scheduler-enforced termination: the executor reported the
                     // commit without Finish but the generation budget is spent.
-                    handleEvent(forward::Finish{request->Id()});
+                    // Apply the FSM transition directly — the planner never
+                    // re-enters the outside-event path.
+                    finishForward(request);
                 } else if (auto ev = scheduleDenoise(request, token_budget)) {
                     // Next canvas (fresh reservation, steps_taken = 0).
                     push_op(applyEventAndGenerateOp(request, std::move(*ev)));

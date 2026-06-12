@@ -102,22 +102,26 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
     requests_.at(event.request_id)->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
 }
 
+void Scheduler::finishForward(Request* request) {
+    // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
+    auto token_pages = request->GetFullPagedTokens(true);
+
+    // page_hashes are only needed for L3 storage (BackUp ops).
+    // Without L3, pass empty to avoid any size-mismatch bugs.
+    std::vector<std::string> page_hashes;
+    if (config_.enable_l3_storage) {
+        page_hashes = request->GetStorageInfo().rolling_hashes;
+        if (page_hashes.size() != token_pages.size()) {
+            page_hashes = ComputePagedHashes(token_pages, "");
+        }
+    }
+    request->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
+                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
+}
+
 void Scheduler::handleEvent(const forward::Finish& event) {
     if (auto req = find_request(event.request_id)) {
-        // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
-        auto token_pages = req->GetFullPagedTokens(true);
-
-        // page_hashes are only needed for L3 storage (BackUp ops).
-        // Without L3, pass empty to avoid any size-mismatch bugs.
-        std::vector<std::string> page_hashes;
-        if (config_.enable_l3_storage) {
-            page_hashes = req->GetStorageInfo().rolling_hashes;
-            if (page_hashes.size() != token_pages.size()) {
-                page_hashes = ComputePagedHashes(token_pages, "");
-            }
-        }
-        req->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
-                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
+        finishForward(req);
     }
 }
 

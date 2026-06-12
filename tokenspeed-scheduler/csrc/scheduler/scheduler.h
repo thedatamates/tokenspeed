@@ -115,6 +115,12 @@ private:
                                                                                        std::int32_t remaining);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
+    // Applies fsm::FinishEvent to `request` (terminal prefix-cache insert +
+    // writeback hand-off). Shared by the outside-event path (executor-reported
+    // forward::Finish) and the planner's own max_new_tokens termination, which
+    // must apply the transition directly rather than re-entering handleEvent.
+    void finishForward(Request* request);
+
     void check_device_mem();
 
 private:
