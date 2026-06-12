@@ -30,6 +30,6 @@
 namespace tokenspeed::fsm {
 
 using State = std::variant<Bootstrapping, Submitted, Prefetching, PrefetchDone, Aborting, Prefilling, PrefillDone,
-                           Decoding, Draining, WritingBack, Retracting, Retracted, Finished>;
+                           Decoding, Denoising, Committing, Draining, WritingBack, Retracting, Retracted, Finished>;
 
 }  // namespace tokenspeed::fsm

@@ -90,6 +90,9 @@ private:
     PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event);
+    DiffusionOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDenoiseEvent event);
+    DiffusionOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDenoiseFromRetractedEvent event);
+    DiffusionOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleCommitEvent event);
     std::optional<WriteBackOperation> applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractEvent event);
     PrefetchOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event);
 
@@ -105,6 +108,11 @@ private:
                                                            std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
         Request* request, std::map<std::string, std::int32_t>& simulated_free);
+    // Block-diffusion: schedule one denoise pass (canvas entry acquires the
+    // per-canvas page reservation). remaining = forward-token budget left.
+    std::optional<fsm::ScheduleDenoiseEvent> scheduleDenoise(Request* request, std::int32_t remaining);
+    std::optional<fsm::ScheduleDenoiseFromRetractedEvent> scheduleDenoiseFromRetracted(Request* request,
+                                                                                       std::int32_t remaining);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
     void check_device_mem();
@@ -120,6 +128,7 @@ private:
     void handleEvent(const forward::Abort& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
+    void handleEvent(const forward::DenoiseResult& event);
 
 private:
     Request* find_request(std::string rid) {

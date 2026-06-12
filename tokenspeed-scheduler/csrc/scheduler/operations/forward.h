@@ -73,7 +73,34 @@ struct DecodeOperation : public ForwardOperationBase {
     std::int32_t hist_token_len = -1;
 };
 
-using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
+// Block-diffusion row kinds.
+enum class DiffusionKind : std::int32_t {
+    // Decoder mode (bidirectional, KV read-only) over the executor-resident
+    // canvas; the executor must not write the canvas-reservation pages.
+    kDenoise = 0,
+    // Encoder mode (causal) over the argmax canvas, writing KV into the
+    // reservation pages at positions committed_len … committed_len+canvas_len-1.
+    kCommit = 1,
+};
+
+// Block-diffusion row: one denoise or commit pass over the current canvas.
+// input_length == canvas_len (these are real forward rows; they consume
+// forward-token budget like prefill chunks but kDenoise allocates nothing).
+struct DiffusionOperation : public ForwardOperationBase {
+    DiffusionKind kind{DiffusionKind::kDenoise};
+    // Tokens in the current canvas (≤ configured canvas_length for the final
+    // truncated canvas near max_new_tokens).
+    std::int32_t canvas_len{};
+    // Tokens already committed (prompt + prior canvases) = canvas start
+    // position; drives canvas position ids and attention extents.
+    std::int32_t committed_len{};
+    // Scheduler's per-canvas step counter. 0 ⇒ the executor must (re)init the
+    // canvas (fresh random canvas, zero self-conditioning — also after
+    // retraction).
+    std::int32_t steps_taken{};
+};
+
+using ForwardOperation = std::variant<PrefillOperation, DecodeOperation, DiffusionOperation>;
 
 struct FlatForwardOperation {
     std::vector<std::string> request_ids;
@@ -91,6 +118,13 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> extend_prefix_lens;
     std::vector<std::int32_t> decode_input_ids;
     std::vector<std::int32_t> hist_token_lens;
+
+    // Block-diffusion rows (SoA, len = num_diffusion(), indexed after the
+    // decode rows: row = num_extends() + #decodes + i).
+    std::vector<DiffusionKind> diffusion_kinds;
+    std::vector<std::int32_t> diffusion_canvas_lens;
+    std::vector<std::int32_t> diffusion_committed_lens;
+    std::vector<std::int32_t> diffusion_steps_taken;
 
     // Mamba extension (SoA)
     std::vector<std::int32_t> mamba_working_indices;
@@ -110,8 +144,14 @@ struct FlatForwardOperation {
     std::map<std::string, std::vector<std::int32_t>> paged_cache_block_table_base_offsets;
 
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
+        // Row partition invariant: [ extends | decodes | diffusion ]. The
+        // prefill-first partition is the original AR invariant; the second
+        // partition moves diffusion rows after the decodes and is a no-op
+        // when no diffusion requests exist (AR plans stay byte-identical).
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
+        std::stable_partition(ops.begin(), ops.end(),
+                              [](const ForwardOperation& a) { return !std::holds_alternative<DiffusionOperation>(a); });
         for (auto& op : ops) {
             std::visit(
                 [this](auto& inner) {
@@ -142,6 +182,11 @@ struct FlatForwardOperation {
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
                 hist_token_lens.push_back(decode->hist_token_len);
+            } else if (auto* diffusion = std::get_if<DiffusionOperation>(&op)) {
+                diffusion_kinds.push_back(diffusion->kind);
+                diffusion_canvas_lens.push_back(diffusion->canvas_len);
+                diffusion_committed_lens.push_back(diffusion->committed_len);
+                diffusion_steps_taken.push_back(diffusion->steps_taken);
             }
         }
         const std::size_t num_reqs = request_ids.size();
@@ -170,6 +215,7 @@ struct FlatForwardOperation {
 
     bool empty() const { return request_ids.empty(); }
     std::size_t num_extends() const { return extend_prefix_lens.size(); }
+    std::size_t num_diffusion() const { return diffusion_kinds.size(); }
 
 private:
     template <typename Key>

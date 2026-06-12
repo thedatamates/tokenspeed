@@ -46,9 +46,18 @@ struct UpdateReserveNumTokens {
 struct Abort {
     std::string request_id;
 };
+
+// Block-diffusion: reported by the executor after each denoise pass.
+// converged=false increments the scheduler's per-canvas step counter;
+// converged=true (or the max_denoising_steps backstop) moves the request to
+// Committing. Commits report the existing ExtendResult/Finish.
+struct DenoiseResult {
+    std::string request_id;
+    bool converged{};
+};
 }  // namespace forward
 
-using ForwardEvent =
-    std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens>;
+using ForwardEvent = std::variant<forward::ExtendResult, forward::Finish, forward::Abort,
+                                  forward::UpdateReserveNumTokens, forward::DenoiseResult>;
 
 }  // namespace tokenspeed

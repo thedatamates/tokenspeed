@@ -20,6 +20,8 @@
 
 #include <stdexcept>
 
+#include <spdlog/spdlog.h>
+
 #include "resource/allocator/owned_pages.h"
 #include "fsm/states.h"
 #include "scheduler/outside_events/inc.h"
@@ -126,7 +128,35 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 }
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (auto req = find_request(event.request_id)) {
+        if (req->IsBlockDiffusion()) {
+            // Diffusion requests grow only via commit results. Anything else
+            // (a result raced with retraction/abort under overlap scheduling)
+            // is stale: the canvas is regenerable and must not mutate the
+            // committed history.
+            if (!req->Is<fsm::Committing>()) {
+                spdlog::warn("[Scheduler] Dropping stale ExtendResult for block-diffusion request {} in state {}",
+                             event.request_id, req->StateName());
+                return;
+            }
+            const auto progress = req->GetDiffusionProgress();
+            if (static_cast<std::int32_t>(event.tokens.size()) > progress.canvas_len) {
+                throw std::invalid_argument(
+                    "Scheduler::handleEvent(ExtendResult): commit reported more tokens than the canvas reservation "
+                    "covers; request_id=" +
+                    event.request_id);
+            }
+        }
         req->Apply(fsm::ExtendResultEvent{event.tokens});
+    }
+}
+
+void Scheduler::handleEvent(const forward::DenoiseResult& event) {
+    if (auto req = find_request(event.request_id)) {
+        if (!req->IsBlockDiffusion()) {
+            throw std::logic_error("Scheduler::handleEvent(DenoiseResult): request is not block-diffusion; id=" +
+                                   event.request_id);
+        }
+        req->Apply(fsm::DenoiseResultEvent{event.converged, req->GetBlockDiffusionParams().max_denoising_steps});
     }
 }
 

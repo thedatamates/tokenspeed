@@ -22,16 +22,35 @@
 
 #include <span>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace tokenspeed {
+
+// Block-diffusion generation mode (DiffusionGemma-style). Present on a
+// RequestSpec, the request denoises fixed-length canvases instead of decoding
+// token-by-token: prefill → repeat per canvas {N denoise passes, 1 commit
+// pass} → finish. Absent ⇒ plain autoregressive request (unchanged).
+struct BlockDiffusionParams {
+    // Tokens per canvas (CL). Must be a positive multiple of page_size and
+    // fit within max_scheduled_tokens.
+    std::int32_t canvas_length{};
+    // Scheduler-enforced backstop: a canvas commits after at most this many
+    // denoise passes even if the executor never reports convergence.
+    std::int32_t max_denoising_steps{};
+    // Total generation budget; canvases = ceil(max_new_tokens / canvas_length),
+    // the final canvas is truncated to the remaining budget.
+    std::int32_t max_new_tokens{};
+};
 
 struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
     std::vector<std::string> rolling_hashes;
     std::int32_t storage_hit_pages{0};
+    // Engaged ⇒ block-diffusion request; absent ⇒ autoregressive.
+    std::optional<BlockDiffusionParams> block_diffusion{};
 };
 
 struct PrefillInfo {

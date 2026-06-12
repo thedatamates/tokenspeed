@@ -163,6 +163,36 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const auto& spec : request_specs) {
+        if (spec.block_diffusion.has_value()) {
+            const auto& bd = *spec.block_diffusion;
+            if (bd.canvas_length <= 0 || bd.max_denoising_steps <= 0 || bd.max_new_tokens <= 0) {
+                throw std::invalid_argument("Scheduler::SubmitRequests: block_diffusion params must be positive; id=" +
+                                            spec.request_id);
+            }
+            if (bd.canvas_length % config_.page_size != 0) {
+                throw std::invalid_argument(
+                    "Scheduler::SubmitRequests: block_diffusion.canvas_length must be a multiple of page_size; id=" +
+                    spec.request_id);
+            }
+            if (bd.canvas_length > config_.max_scheduled_tokens) {
+                throw std::invalid_argument(
+                    "Scheduler::SubmitRequests: block_diffusion.canvas_length exceeds max_scheduled_tokens (the "
+                    "denoise row could never be scheduled); id=" +
+                    spec.request_id);
+            }
+            if (config_.role != Role::kFused) {
+                throw std::invalid_argument(
+                    "Scheduler::SubmitRequests: block_diffusion requires Role::kFused (P/D disaggregation is "
+                    "unsupported); id=" +
+                    spec.request_id);
+            }
+            if (hybrid_prefix_cache_.has_value()) {
+                throw std::invalid_argument(
+                    "Scheduler::SubmitRequests: block_diffusion is unsupported with the hybrid prefix cache "
+                    "(mamba/paged-cache-group adjuncts); id=" +
+                    spec.request_id);
+            }
+        }
         auto req = std::make_unique<Request>(spec, config_.page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
     }
@@ -215,7 +245,8 @@ std::size_t Scheduler::AvailableKvPages() const {
 std::size_t Scheduler::ActiveKvPages() const {
     std::unordered_set<std::int32_t> active_pages;
     for (const auto& [_, req] : requests_) {
-        if (req->Is<fsm::Prefilling>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>()) {
+        if (req->Is<fsm::Prefilling>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>() ||
+            req->Is<fsm::Denoising>() || req->Is<fsm::Committing>()) {
             for (std::int32_t page : req->GetOccupiedPages()) {
                 active_pages.insert(page);
             }

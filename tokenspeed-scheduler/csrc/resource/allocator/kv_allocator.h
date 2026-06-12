@@ -50,6 +50,12 @@ public:
     std::int32_t TailPageAvailableTokens() const { return tail_page_available_tokens_; };
     void ReleaseOwnershipByID(const std::vector<std::int32_t>& pages) { pages_.ReleaseOwnershipByID(pages); }
 
+    // Return the last n pages to the pool (block-diffusion: drop an unconsumed
+    // canvas reservation). Caller must fix tail accounting afterwards via
+    // ResetTailPageAvailableTokens.
+    void ReleaseLast(std::int32_t n) { OwnedPages released = pages_.TakeLast(n); }
+    void ResetTailPageAvailableTokens(std::int32_t num_tokens) { tail_page_available_tokens_ = num_tokens; }
+
 private:
     PageAllocator* allocator_;
     std::int32_t page_size_;

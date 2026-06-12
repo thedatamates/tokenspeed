@@ -170,6 +170,89 @@ private:
     MambaChunkAllocator* mamba_allocator_{};
 };
 
+// Block-diffusion: schedule one denoise pass. Entering a canvas
+// (PrefillDone → Denoising, Committing → Denoising) acquires the canvas
+// reservation; Denoising → Denoising only marks the pass in flight.
+struct ScheduleDenoiseEvent : InvalidTransitionHandler<ScheduleDenoiseEvent> {
+    using InvalidTransitionHandler<ScheduleDenoiseEvent>::operator();
+
+    explicit ScheduleDenoiseEvent(std::int32_t canvas_len) : canvas_len_(canvas_len) {}
+
+    // Canvas entry: reserve ceil-page coverage for canvas_len tokens so the
+    // eventual commit cannot fail, then start at step 0 (executor inits canvas).
+    Denoising operator()(PrefillDone&& state);
+    Denoising operator()(Committing&& state);
+    // Continuing canvas: one more pass over the same canvas, no allocation.
+    Denoising operator()(Denoising&& state);
+
+private:
+    std::int32_t canvas_len_{};
+};
+
+// Block-diffusion: Retracted → Denoising recovery (mirrors
+// ScheduleDecodeFromRetractedEvent). Committed KV is recovered via LoadBack;
+// canvas progress was discarded at retraction, so the canvas restarts with a
+// fresh reservation at step 0.
+struct ScheduleDenoiseFromRetractedEvent : InvalidTransitionHandler<ScheduleDenoiseFromRetractedEvent> {
+    using InvalidTransitionHandler<ScheduleDenoiseFromRetractedEvent>::operator();
+
+    ScheduleDenoiseFromRetractedEvent(std::int32_t canvas_len, PageAllocator* device_allocator,
+                                      ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
+                                      MatchResult match_result, std::vector<TreeNode*> loadback_diff)
+        : canvas_len_(canvas_len),
+          device_allocator_(device_allocator),
+          req_pool_allocator_(req_pool_allocator),
+          kv_prefix_cache_(kv_prefix_cache),
+          match_result_(std::move(match_result)),
+          loadback_diff_(std::move(loadback_diff)) {}
+
+    Denoising operator()(Retracted&& state);
+
+    const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
+
+private:
+    std::int32_t canvas_len_{};
+    PageAllocator* device_allocator_{};
+    ReqPoolAllocator* req_pool_allocator_{};
+    KVPrefixCache* kv_prefix_cache_{};
+    MatchResult match_result_{};
+    std::vector<TreeNode*> loadback_diff_;
+};
+
+// Block-diffusion: schedule the single commit pass for a converged canvas.
+struct ScheduleCommitEvent : InvalidTransitionHandler<ScheduleCommitEvent> {
+    using InvalidTransitionHandler<ScheduleCommitEvent>::operator();
+
+    Committing operator()(Committing&& state) {
+        state.MarkCommitScheduled();
+        return std::move(state);
+    }
+};
+
+// Block-diffusion outside event: the executor finished one denoise pass.
+// converged=false increments steps_taken and stays Denoising unless the
+// scheduler-enforced max_denoising_steps backstop is reached; converged=true
+// (or the backstop) transitions to Committing.
+struct DenoiseResultEvent : InvalidTransitionHandler<DenoiseResultEvent> {
+    using InvalidTransitionHandler<DenoiseResultEvent>::operator();
+
+    DenoiseResultEvent(bool converged, std::int32_t max_denoising_steps)
+        : converged_(converged), max_denoising_steps_(max_denoising_steps) {}
+
+    std::variant<Denoising, Committing> operator()(Denoising&& state);
+
+    // Overlap scheduling / retraction races: a denoise result can arrive after
+    // the canvas was discarded (retract) or the request terminalized. Canvas
+    // progress is regenerable, so the stale result is dropped.
+    Retracting operator()(Retracting&& state) { return std::move(state); }
+    Retracted operator()(Retracted&& state) { return std::move(state); }
+    Finished operator()(Finished&& state) { return std::move(state); }
+
+private:
+    bool converged_{};
+    std::int32_t max_denoising_steps_{};
+};
+
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
     explicit FinishEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator,
@@ -184,6 +267,10 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     // Returns Draining (needs device→host writeback) or Finished.
     std::variant<Draining, Finished> operator()(Decoding&& state);
     std::variant<Draining, Finished> operator()(PrefillDone&& state);
+    // Block-diffusion: EOS reported with the commit, or max_new_tokens reached.
+    // Unused canvas-reservation pages are released here (local allocator pages
+    // beyond the committed history are dropped back to the pool).
+    std::variant<Draining, Finished> operator()(Committing&& state);
 
     // Retracting: writeback already in-flight.
     WritingBack operator()(Retracting&& state);
@@ -211,6 +298,8 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Prefilling&&);
     Finished operator()(PrefillDone&&);
     Finished operator()(Decoding&&);
+    Finished operator()(Denoising&&);
+    Finished operator()(Committing&&);
     Finished operator()(Retracting&&);
     Finished operator()(Retracted&&);
     Finished operator()(Draining&&);
@@ -230,6 +319,10 @@ struct ScheduleRetractEvent : InvalidTransitionHandler<ScheduleRetractEvent> {
 
     Retracting operator()(Decoding&& state);
     Retracting operator()(PrefillDone&& state);
+    // Block-diffusion: canvas progress is discarded (regenerable) and the
+    // canvas reservation freed; committed KV follows the normal writeback path.
+    Retracting operator()(Denoising&& state);
+    Retracting operator()(Committing&& state);
 
     MatchResult GetMatchResult() { return match_result_; }
 

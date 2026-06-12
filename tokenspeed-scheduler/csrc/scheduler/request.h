@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -94,6 +95,32 @@ public:
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t GetLastToken() const { return token_container_.LastToken(); }
+
+    // Block-diffusion mode (absent ⇒ autoregressive request).
+    bool IsBlockDiffusion() const { return block_diffusion_.has_value(); }
+    const BlockDiffusionParams& GetBlockDiffusionParams() const {
+        if (!block_diffusion_.has_value()) {
+            throw std::logic_error("Request::GetBlockDiffusionParams: not a block-diffusion request; id=" + id_);
+        }
+        return *block_diffusion_;
+    }
+    // Generated (committed) tokens so far; drives canvas truncation near
+    // max_new_tokens.
+    std::int32_t GeneratedSize() const { return token_container_.Size() - token_container_.PrefillSize(); }
+
+    fsm::DiffusionProgress GetDiffusionProgress() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> fsm::DiffusionProgress
+                requires(std::same_as<T, fsm::Denoising> || std::same_as<T, fsm::Committing>)
+            { return s.Progress(); },
+            [this](const auto&) -> fsm::DiffusionProgress {
+                throw std::logic_error("Request::GetDiffusionProgress: expected state=Denoising or Committing; got "
+                                       "state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
 
     PrefillInfo GetPrefillInfo() const;
 
@@ -197,11 +224,14 @@ public:
     OwnedPages TakeFirstPages(std::int32_t n) {
         return std::visit(Overloaded{
             [n]<typename T>(T& s) -> OwnedPages
-                requires(std::same_as<T, fsm::Decoding> || std::same_as<T, fsm::PrefillDone>)
+                requires(std::same_as<T, fsm::Decoding> || std::same_as<T, fsm::PrefillDone> ||
+                         std::same_as<T, fsm::Denoising> || std::same_as<T, fsm::Committing>)
             { return s.GetLocalKVAllocatorPtr()->TakeFirst(n); },
             [this](auto&) -> OwnedPages {
-                throw std::logic_error("Request::TakeFirstPages: expected state=Decoding or PrefillDone; got state=" +
-                                       StateName());
+                throw std::logic_error(
+                    "Request::TakeFirstPages: expected state=Decoding, PrefillDone, Denoising, or Committing; got "
+                    "state=" +
+                    StateName());
             },
             },
             state_);
@@ -218,6 +248,8 @@ public:
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::Denoising&) -> std::string { return "Denoising"; },
+                              [](const fsm::Committing&) -> std::string { return "Committing"; },
                               [](const fsm::Draining&) -> std::string { return "Draining"; },
                               [](const fsm::WritingBack&) -> std::string { return "WritingBack"; },
                               [](const fsm::Retracting&) -> std::string { return "Retracting"; },
@@ -277,6 +309,7 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+    std::optional<BlockDiffusionParams> block_diffusion_;
 };
 
 using ConstRequestVector = std::vector<const Request*>;

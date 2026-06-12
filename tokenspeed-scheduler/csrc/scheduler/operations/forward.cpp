@@ -303,6 +303,75 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     };
 }
 
+// Block-diffusion: schedule one denoise pass. Entering a canvas (from
+// PrefillDone or from Committing after the commit result) reserves
+// page-coverage for canvas_len tokens up front so the eventual commit can
+// never fail; a continuing pass allocates nothing. Every diffusion row costs
+// canvas_len forward tokens against max_scheduled_tokens.
+std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* request, std::int32_t remaining) {
+    const auto& params = request->GetBlockDiffusionParams();
+
+    std::int32_t canvas_len = 0;
+    bool entering_canvas = false;
+    if (request->Is<fsm::Denoising>()) {
+        canvas_len = request->GetDiffusionProgress().canvas_len;
+    } else {
+        // PrefillDone (first canvas) or Committing with commit_done (next
+        // canvas); truncate the final canvas to the remaining budget.
+        canvas_len = std::min(params.canvas_length, params.max_new_tokens - request->GeneratedSize());
+        entering_canvas = true;
+    }
+    if (canvas_len <= 0 || canvas_len > remaining) {
+        return {};
+    }
+
+    if (entering_canvas) {
+        const std::int32_t tail_available = request->TailPageAvailableTokens();
+        const std::int32_t extra_tokens = std::max(0, canvas_len - tail_available);
+        const std::int32_t pages_needed = (extra_tokens + config_.page_size - 1) / config_.page_size;
+        if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(pages_needed)) {
+            return {};
+        }
+    }
+
+    return fsm::ScheduleDenoiseEvent{canvas_len};
+}
+
+// Block-diffusion: Retracted → Denoising recovery. Mirrors
+// scheduleDecodeFromRetracted: re-match committed history, LoadBack the
+// host-only pages, and reserve a fresh canvas. The canvas restarts at step 0.
+std::optional<fsm::ScheduleDenoiseFromRetractedEvent> Scheduler::scheduleDenoiseFromRetracted(Request* request,
+                                                                                              std::int32_t remaining) {
+    if (req_pool_allocator_.AvailableSlots() == 0) return {};
+
+    const auto& params = request->GetBlockDiffusionParams();
+    const std::int32_t canvas_len = std::min(params.canvas_length, params.max_new_tokens - request->GeneratedSize());
+    if (canvas_len <= 0 || canvas_len > remaining) {
+        return {};
+    }
+
+    MatchResult match_result = kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
+    std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
+
+    const std::int32_t device_matched = match_result.device.DepthInPage();
+    const std::int32_t host_matched = match_result.host.DepthInPage();
+    std::int32_t num_tokens = canvas_len;
+    if (host_matched > device_matched) {
+        num_tokens += config_.page_size * (host_matched - device_matched);
+    }
+    std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;
+
+    std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed)) {
+        return {};
+    }
+
+    return fsm::ScheduleDenoiseFromRetractedEvent{
+        canvas_len,    &device_allocator_, &req_pool_allocator_, &kv_prefix_cache_, std::move(match_result),
+        loadback_diff,
+    };
+}
+
 std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* request) {
     auto full_paged_tokens = request->GetFullPagedTokens(true);
     std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(request->GetDeviceNode());
@@ -546,13 +615,86 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     return op;
 }
 
+DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDenoiseEvent event) {
+    std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
+    request->Apply(std::move(event));
+    std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
+    std::int32_t sz = static_cast<std::int32_t>(all_pages.size()) - begin;
+
+    const auto progress = request->GetDiffusionProgress();
+    DiffusionOperation op{{
+        .request_id = request->Id(),
+        .request_pool_index = request->GetReqPoolIndex(),
+        .input_length = progress.canvas_len,
+        .occupied_pages = std::move(all_pages),
+        .begin = begin,
+        .size = sz,
+        .prefill_length = request->PrefillSize(),
+    }};
+    op.kind = DiffusionKind::kDenoise;
+    op.canvas_len = progress.canvas_len;
+    op.committed_len = request->TokenSize();
+    op.steps_taken = progress.steps_taken;
+    return op;
+}
+
+DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDenoiseFromRetractedEvent event) {
+    request->Apply(std::move(event));
+    if (!request->Is<fsm::Denoising>()) {
+        throw std::logic_error(
+            "Scheduler::applyEventAndGenerateOp: expected state=Denoising after loadback recovery; got state=" +
+            request->StateName());
+    }
+    std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
+    std::int32_t sz = static_cast<std::int32_t>(all_pages.size());
+
+    const auto progress = request->GetDiffusionProgress();
+    DiffusionOperation op{{
+        .request_id = request->Id(),
+        .request_pool_index = request->GetReqPoolIndex(),
+        .input_length = progress.canvas_len,
+        .occupied_pages = std::move(all_pages),
+        .begin = 0,
+        .size = sz,
+        .prefill_length = request->PrefillSize(),
+    }};
+    op.kind = DiffusionKind::kDenoise;
+    op.canvas_len = progress.canvas_len;
+    op.committed_len = request->TokenSize();
+    op.steps_taken = progress.steps_taken;  // 0: executor re-inits the canvas
+    return op;
+}
+
+DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleCommitEvent event) {
+    std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
+    request->Apply(std::move(event));
+
+    const auto progress = request->GetDiffusionProgress();
+    DiffusionOperation op{{
+        .request_id = request->Id(),
+        .request_pool_index = request->GetReqPoolIndex(),
+        .input_length = progress.canvas_len,
+        .occupied_pages = request->GetOccupiedPages(),
+        .begin = begin,
+        .size = 0,  // the reservation was already surfaced when the canvas was entered
+        .prefill_length = request->PrefillSize(),
+    }};
+    op.kind = DiffusionKind::kCommit;
+    op.canvas_len = progress.canvas_len;
+    op.committed_len = request->TokenSize();
+    op.steps_taken = progress.steps_taken;
+    return op;
+}
+
 std::tuple<std::vector<ForwardOperation>, std::variant<std::vector<LoadBackOperation>, std::vector<WriteBackOperation>>>
 Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     auto priority = [&](const Request* req) -> int {
         if (req->Is<fsm::Prefilling>()) return 1;
         if (req->Is<fsm::Submitted>()) return 2;
-        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
+        if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Denoising>() ||
+            req->Is<fsm::Committing>()) {
             // Decode-first if mixed-batch is enabled; prefill-first otherwise.
+            // Diffusion passes schedule alongside decodes.
             return config_.enable_mixed_prefill_decode ? 0 : 3;
         }
         if (req->Is<fsm::Retracted>()) return 4;
@@ -585,17 +727,27 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free =
         hybrid_prefix_cache_ ? hybrid_prefix_cache_->InitialSimulatedFree() : std::map<std::string, std::int32_t>{};
+    // Block-diffusion bookkeeping for the retract trigger below: a request
+    // whose pass/commit is still in flight is merely waiting for the executor
+    // (not starved), while a failed canvas-entry/commit schedule is genuine
+    // pressure.
+    bool diffusion_waiting_on_executor = false;
+    bool diffusion_starved = false;
     for (Request* request : candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
-            std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+            std::int32_t reserver_num_tokens =
+                config_.role == Role::kP || request->IsBlockDiffusion() ? 0 : config_.decode_input_tokens;
             if (auto ev = schedulePrefill(request, token_budget, reserver_num_tokens, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
-            std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
+            // Block-diffusion requests reserve no decode slot: the per-canvas
+            // reservation is acquired on entering Denoising instead.
+            std::int32_t decode_input_tokens =
+                config_.role == Role::kP || request->IsBlockDiffusion() ? 0 : config_.decode_input_tokens;
 
             if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
                                                     config_.disable_l2_cache, simulated_free)) {
@@ -607,6 +759,43 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
                     loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_nodes, op_id));
                 }
+            }
+        } else if (request->IsBlockDiffusion() &&
+                   (request->Is<fsm::PrefillDone>() || request->Is<fsm::Denoising>() ||
+                    request->Is<fsm::Committing>())) {
+            // Block-diffusion passes follow the decode mixed-batch semantics.
+            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
+
+            if (request->Is<fsm::Denoising>() && request->GetDiffusionProgress().pass_in_flight) {
+                // One denoise pass at a time: wait for the DenoiseResult.
+                diffusion_waiting_on_executor = true;
+            } else if (request->Is<fsm::Committing>()) {
+                const auto progress = request->GetDiffusionProgress();
+                if (!progress.commit_done) {
+                    if (progress.commit_scheduled) {
+                        // Exactly one commit pass: wait for its ExtendResult.
+                        diffusion_waiting_on_executor = true;
+                    } else if (progress.canvas_len <= token_budget) {
+                        push_op(applyEventAndGenerateOp(request, fsm::ScheduleCommitEvent{}));
+                    } else {
+                        diffusion_starved = true;
+                    }
+                } else if (request->GeneratedSize() >= request->GetBlockDiffusionParams().max_new_tokens) {
+                    // Scheduler-enforced termination: the executor reported the
+                    // commit without Finish but the generation budget is spent.
+                    handleEvent(forward::Finish{request->Id()});
+                } else if (auto ev = scheduleDenoise(request, token_budget)) {
+                    // Next canvas (fresh reservation, steps_taken = 0).
+                    push_op(applyEventAndGenerateOp(request, std::move(*ev)));
+                } else {
+                    diffusion_starved = true;
+                }
+            } else if (auto ev = scheduleDenoise(request, token_budget)) {
+                // PrefillDone → first canvas, or one more pass over the
+                // current canvas.
+                push_op(applyEventAndGenerateOp(request, std::move(*ev)));
+            } else {
+                diffusion_starved = true;
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             // If mixed-batch is disabled, skip ALL decode if any prefill was scheduled this round.
@@ -620,7 +809,18 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
-            if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
+            if (request->IsBlockDiffusion()) {
+                if (auto ev = scheduleDenoiseFromRetracted(request, token_budget)) {
+                    std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
+                    push_op(applyEventAndGenerateOp(request, std::move(*ev)));
+                    if (!loadback_diff.empty()) {
+                        cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
+                        loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, {}, op_id));
+                    }
+                } else {
+                    diffusion_starved = true;
+                }
+            } else if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)));
@@ -633,10 +833,23 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     }
 
     // If all active decode requests failed, device memory is exhausted: retract the longest one.
-    if (ops.empty() && !candidates.empty()) {
+    // Block-diffusion: requests merely waiting for an in-flight pass/commit
+    // result are not pressure — only trigger when something actually failed
+    // to schedule.
+    if (ops.empty() && !candidates.empty() && (diffusion_starved || !diffusion_waiting_on_executor)) {
+        auto diffusion_retractable = [](const Request* req) -> bool {
+            if (req->Is<fsm::Denoising>()) return true;  // canvas progress is regenerable
+            if (req->Is<fsm::Committing>()) {
+                // Don't discard a commit whose result is already in flight.
+                const auto progress = req->GetDiffusionProgress();
+                return !(progress.commit_scheduled && !progress.commit_done);
+            }
+            return false;
+        };
         std::vector<Request*> retract_candidates;
         for (Request* req : candidates) {
-            if ((req->Is<fsm::Decoding>() || (req->Is<fsm::PrefillDone>() && config_.role != Role::kD)) &&
+            if ((req->Is<fsm::Decoding>() || (req->Is<fsm::PrefillDone>() && config_.role != Role::kD) ||
+                 diffusion_retractable(req)) &&
                 config_.role != Role::kP) {
                 retract_candidates.push_back(req);
             }

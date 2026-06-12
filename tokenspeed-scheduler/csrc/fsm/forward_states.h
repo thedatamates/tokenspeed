@@ -277,6 +277,130 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
+// Scheduler-facing snapshot of a block-diffusion request's per-canvas progress.
+// Valid while the request is Denoising or Committing.
+struct DiffusionProgress {
+    std::int32_t canvas_len{};    // tokens in the current canvas (≤ configured canvas_length)
+    std::int32_t steps_taken{};   // denoise passes completed for this canvas
+    bool pass_in_flight{};        // a denoise pass was scheduled and its DenoiseResult is pending
+    bool commit_scheduled{};      // (Committing) the commit pass was scheduled
+    bool commit_done{};           // (Committing) the commit ExtendResult arrived
+};
+
+// Common base for the block-diffusion states. Beyond the committed-history
+// resources of ForwardState, the request holds a canvas reservation: the tail
+// pages of the local KV allocator, acquired on canvas entry, so that a
+// converged canvas can never fail to commit. The reservation is dark until
+// the commit pass writes it; denoise passes read committed KV only.
+struct DiffusionState : public ForwardState {
+    DiffusionState(TokenContainer* token_container, std::int32_t page_size,
+                   std::unique_ptr<HostNodeRef>&& host_node_ref, std::unique_ptr<DeviceNodeRef>&& node_ref,
+                   std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
+                   std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken)
+        : ForwardState(token_container, page_size, std::move(node_ref), std::move(local_kv_allocator),
+                       std::move(req_pool_index)),
+          host_node_ref_(std::move(host_node_ref)),
+          canvas_len_{canvas_len},
+          steps_taken_{steps_taken} {}
+
+    DiffusionState(DiffusionState&&) noexcept = default;
+    DiffusionState& operator=(DiffusionState&&) noexcept = default;
+
+    std::int32_t GetCanvasLen() const { return canvas_len_; }
+    std::int32_t GetStepsTaken() const { return steps_taken_; }
+
+    std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
+
+    // Drop the unconsumed canvas reservation, keeping committed-history pages.
+    // The committed tokens beyond the radix-inserted full pages live in at
+    // most one page (the first local page after a retract-time TakeFirst), so
+    // everything past the first remaining local page is reservation. Tail
+    // accounting is reset to the committed token count so a future
+    // Acquire(canvas_len) lands the next canvas at the right positions.
+    void ReleaseCanvasReservation() {
+        const std::int32_t local_pages = static_cast<std::int32_t>(local_kv_allocator_->Pages().size());
+        const std::int32_t keep = local_pages > 0 ? 1 : 0;
+        if (local_pages - keep > 0) {
+            local_kv_allocator_->ReleaseLast(local_pages - keep);
+        }
+        const std::int32_t committed = token_container_->Size();
+        local_kv_allocator_->ResetTailPageAvailableTokens(keep == 0 ? 0
+                                                                    : (page_size_ - committed % page_size_) %
+                                                                          page_size_);
+    }
+
+private:
+    std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
+
+protected:
+    std::int32_t canvas_len_{};
+    std::int32_t steps_taken_{};
+};
+
+// Block-diffusion: each NextExecutionPlan may schedule one denoise pass over
+// the executor-resident canvas. steps_taken == 0 tells the executor to
+// (re)initialize the canvas (fresh random canvas, zero self-conditioning).
+struct Denoising : public DiffusionState {
+    Denoising(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
+              std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
+              std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken,
+              bool pass_in_flight)
+        : DiffusionState(token_container, page_size, std::move(host_node_ref), std::move(node_ref),
+                         std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken),
+          pass_in_flight_{pass_in_flight} {}
+
+    Denoising(Denoising&&) noexcept = default;
+    Denoising& operator=(Denoising&&) noexcept = default;
+
+    DiffusionProgress Progress() const {
+        return DiffusionProgress{
+            .canvas_len = canvas_len_,
+            .steps_taken = steps_taken_,
+            .pass_in_flight = pass_in_flight_,
+        };
+    }
+
+private:
+    bool pass_in_flight_{};
+};
+
+// Block-diffusion: the canvas converged (or hit the step backstop); the next
+// plan schedules exactly one commit pass. The commit's ExtendResult appends
+// the kept tokens; the request then finishes or re-enters Denoising with a
+// fresh canvas reservation on the following plan.
+struct Committing : public DiffusionState {
+    Committing(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
+               std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
+               std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken)
+        : DiffusionState(token_container, page_size, std::move(host_node_ref), std::move(node_ref),
+                         std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken) {}
+
+    Committing(Committing&&) noexcept = default;
+    Committing& operator=(Committing&&) noexcept = default;
+
+    DiffusionProgress Progress() const {
+        return DiffusionProgress{
+            .canvas_len = canvas_len_,
+            .steps_taken = steps_taken_,
+            .commit_scheduled = commit_scheduled_,
+            .commit_done = commit_done_,
+        };
+    }
+
+    void MarkCommitScheduled() { commit_scheduled_ = true; }
+
+    // Commit ExtendResult: the kept tokens (≤ canvas_len, truncated after the
+    // first EOS) become committed request history.
+    void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) {
+        token_container_->Extend(result_tokens);
+        commit_done_ = true;
+    }
+
+private:
+    bool commit_scheduled_{};
+    bool commit_done_{};
+};
+
 // Request has finished it's generation, and host pages have been allocated,
 // ready to WriteBack to l2 Cache, but no ops generated yet.
 struct Draining {

@@ -343,6 +343,132 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
                     std::move(local_mamba_allocator)};
 }
 
+// PrefillDone -> Denoising: enter the first canvas. The prefill pages stay in
+// the local allocator (vanilla path: radix insert happens at finish/retract,
+// mirroring ScheduleDecodeEvent); the canvas reservation is acquired here so
+// the eventual commit cannot fail.
+Denoising ScheduleDenoiseEvent::operator()(PrefillDone&& state) {
+    auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
+    auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
+
+    local_kv_allocator->Acquire(canvas_len_);
+
+    return Denoising{state.GetTokenContainer(),
+                     state.GetPageSize(),
+                     std::move(host_node_ref),
+                     std::move(device_node_ref),
+                     std::move(local_kv_allocator),
+                     std::move(state).TakeReqPoolIndex(),
+                     canvas_len_,
+                     /*steps_taken=*/0,
+                     /*pass_in_flight=*/true};
+}
+
+// Committing -> Denoising: the committed canvas became request history
+// (ExtendResult already appended the tokens); reserve the next canvas and
+// restart the step counter. steps_taken == 0 tells the executor to
+// reinitialize its canvas scratch.
+Denoising ScheduleDenoiseEvent::operator()(Committing&& state) {
+    auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
+    auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
+
+    local_kv_allocator->Acquire(canvas_len_);
+
+    return Denoising{state.GetTokenContainer(),
+                     state.GetPageSize(),
+                     std::move(host_node_ref),
+                     std::move(device_node_ref),
+                     std::move(local_kv_allocator),
+                     std::move(state).TakeReqPoolIndex(),
+                     canvas_len_,
+                     /*steps_taken=*/0,
+                     /*pass_in_flight=*/true};
+}
+
+// Denoising -> Denoising: one more pass over the same canvas; no allocation.
+Denoising ScheduleDenoiseEvent::operator()(Denoising&& state) {
+    const std::int32_t canvas_len = state.GetCanvasLen();
+    const std::int32_t steps_taken = state.GetStepsTaken();
+    auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
+    auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
+
+    return Denoising{state.GetTokenContainer(),
+                     state.GetPageSize(),
+                     std::move(host_node_ref),
+                     std::move(device_node_ref),
+                     std::move(local_kv_allocator),
+                     std::move(state).TakeReqPoolIndex(),
+                     canvas_len,
+                     steps_taken,
+                     /*pass_in_flight=*/true};
+}
+
+// Retracted -> Denoising: recover committed KV via LoadBack (host → device),
+// then restart the interrupted canvas with a fresh reservation at step 0.
+Denoising ScheduleDenoiseFromRetractedEvent::operator()(Retracted&& state) {
+    std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
+    std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
+    if (match_result_.host.DepthInPage() > match_result_.device.DepthInPage()) {
+        host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
+        if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(
+                match_result_.NodesWithout<ResourceType::Device>())) {
+            throw std::logic_error(
+                "ScheduleDenoiseFromRetractedEvent: failed to allocate device pages for host cache recovery");
+        }
+        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
+    } else {
+        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
+    }
+    TokenContainer* token_container = state.GetTokenContainer();
+    std::int32_t page_size = state.GetPageSize();
+    auto local_kv_allocator = std::move(state).TakeKVAllocator();
+    auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
+    local_kv_allocator->Acquire(canvas_len_);
+    return Denoising{token_container,
+                     page_size,
+                     std::move(host_node_ref),
+                     std::move(device_node_ref),
+                     std::move(local_kv_allocator),
+                     std::move(req_pool_index),
+                     canvas_len_,
+                     /*steps_taken=*/0,
+                     /*pass_in_flight=*/true};
+}
+
+// Denoising -> Denoising / Committing: executor reported one finished denoise
+// pass. The scheduler owns the step counter; the backstop fires here even for
+// an executor that never reports convergence.
+std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& state) {
+    const std::int32_t canvas_len = state.GetCanvasLen();
+    const std::int32_t steps_taken = state.GetStepsTaken() + 1;
+    auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
+    auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
+
+    if (converged_ || steps_taken >= max_denoising_steps_) {
+        return Committing{state.GetTokenContainer(),
+                          state.GetPageSize(),
+                          std::move(host_node_ref),
+                          std::move(device_node_ref),
+                          std::move(local_kv_allocator),
+                          std::move(state).TakeReqPoolIndex(),
+                          canvas_len,
+                          steps_taken};
+    }
+    return Denoising{state.GetTokenContainer(),
+                     state.GetPageSize(),
+                     std::move(host_node_ref),
+                     std::move(device_node_ref),
+                     std::move(local_kv_allocator),
+                     std::move(state).TakeReqPoolIndex(),
+                     canvas_len,
+                     steps_taken,
+                     /*pass_in_flight=*/false};
+}
+
 // Decode -> Finish / PrefillDone -> Finish
 // This transection is triggered by python side Advance
 template <typename ForwardStateT>
@@ -410,6 +536,15 @@ std::variant<Draining, Finished> FinishEvent::operator()(Decoding&& state) {
 }
 
 std::variant<Draining, Finished> FinishEvent::operator()(PrefillDone&& state) {
+    return apply(std::move(state));
+}
+
+// Block-diffusion finish (EOS at commit or max_new_tokens reached). apply()
+// inserts the committed full pages into the prefix cache and takes them from
+// the local allocator; whatever remains — including unused canvas-reservation
+// pages from a mid-canvas EOS truncation — is released when the local
+// allocator is dropped.
+std::variant<Draining, Finished> FinishEvent::operator()(Committing&& state) {
     return apply(std::move(state));
 }
 
@@ -500,6 +635,14 @@ Finished AbortEvent::operator()(Decoding&&) {
     return Finished{};
 }
 
+Finished AbortEvent::operator()(Denoising&&) {
+    return Finished{};
+}
+
+Finished AbortEvent::operator()(Committing&&) {
+    return Finished{};
+}
+
 Finished AbortEvent::operator()(Retracting&&) {
     return Finished{};
 }
@@ -571,6 +714,21 @@ Retracting ScheduleRetractEvent::operator()(Decoding&& state) {
 }
 
 Retracting ScheduleRetractEvent::operator()(PrefillDone&& state) {
+    return applyRetract(std::move(state));
+}
+
+// Block-diffusion: canvas progress is regenerable — drop the unconsumed
+// reservation before the standard retract writeback. The page holding the
+// last committed tokens (not radix-insertable due to except_last) is kept in
+// the local allocator across Retracting/Retracted, so its device KV survives
+// and no recovery forward is needed on resume.
+Retracting ScheduleRetractEvent::operator()(Denoising&& state) {
+    state.ReleaseCanvasReservation();
+    return applyRetract(std::move(state));
+}
+
+Retracting ScheduleRetractEvent::operator()(Committing&& state) {
+    state.ReleaseCanvasReservation();
     return applyRetract(std::move(state));
 }
 
