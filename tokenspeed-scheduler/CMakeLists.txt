@@ -108,6 +108,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_prefix_cache_host_match.cpp
         tests/cpp/test_abort.cpp
         tests/cpp/test_basic_lifecycle.cpp
+        tests/cpp/test_block_diffusion.cpp
         tests/cpp/test_chunked_prefill.cpp
         tests/cpp/test_batch_scheduling.cpp
         tests/cpp/test_prefetch.cpp
