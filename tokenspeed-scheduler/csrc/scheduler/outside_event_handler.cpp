@@ -143,6 +143,12 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
                 return;
             }
             const auto progress = req->GetDiffusionProgress();
+            if (progress.phase != fsm::DiffusionProgress::Phase::kCommitInFlight) {
+                spdlog::warn(
+                    "[Scheduler] Dropping ExtendResult for block-diffusion request {} with no commit pass in flight",
+                    event.request_id);
+                return;
+            }
             if (static_cast<std::int32_t>(event.tokens.size()) > progress.canvas_len) {
                 throw std::invalid_argument(
                     "Scheduler::handleEvent(ExtendResult): commit reported more tokens than the canvas reservation "

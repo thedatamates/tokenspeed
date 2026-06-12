@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include "core/token_container.h"
 #include "fsm/cache_states.h"
 #include "fsm/forward_events.h"
@@ -362,7 +364,7 @@ Denoising ScheduleDenoiseEvent::operator()(PrefillDone&& state) {
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len_,
                      /*steps_taken=*/0,
-                     /*pass_in_flight=*/true};
+                     Denoising::SubState::kPassInFlight};
 }
 
 // Committing -> Denoising: the committed canvas became request history
@@ -384,7 +386,7 @@ Denoising ScheduleDenoiseEvent::operator()(Committing&& state) {
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len_,
                      /*steps_taken=*/0,
-                     /*pass_in_flight=*/true};
+                     Denoising::SubState::kPassInFlight};
 }
 
 // Denoising -> Denoising: one more pass over the same canvas; no allocation.
@@ -403,7 +405,7 @@ Denoising ScheduleDenoiseEvent::operator()(Denoising&& state) {
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len,
                      steps_taken,
-                     /*pass_in_flight=*/true};
+                     Denoising::SubState::kPassInFlight};
 }
 
 // Retracted -> Denoising: recover committed KV via LoadBack (host → device),
@@ -435,13 +437,24 @@ Denoising ScheduleDenoiseFromRetractedEvent::operator()(Retracted&& state) {
                      std::move(req_pool_index),
                      canvas_len_,
                      /*steps_taken=*/0,
-                     /*pass_in_flight=*/true};
+                     Denoising::SubState::kPassInFlight};
 }
 
 // Denoising -> Denoising / Committing: executor reported one finished denoise
 // pass. The scheduler owns the step counter; the backstop fires here even for
 // an executor that never reports convergence.
 std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& state) {
+    switch (state.GetSubState()) {
+        case Denoising::SubState::kPassReady:
+            // Strict one-pass-in-flight: no pass is outstanding, so this
+            // result is a stale duplicate. Drop it without touching the
+            // step counter.
+            spdlog::warn("[fsm] Dropping DenoiseResult with no denoise pass in flight (stale duplicate)");
+            return std::move(state);
+        case Denoising::SubState::kPassInFlight:
+            break;
+    }
+
     const std::int32_t canvas_len = state.GetCanvasLen();
     const std::int32_t steps_taken = state.GetStepsTaken() + 1;
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -466,7 +479,7 @@ std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& s
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len,
                      steps_taken,
-                     /*pass_in_flight=*/false};
+                     Denoising::SubState::kPassReady};
 }
 
 // Decode -> Finish / PrefillDone -> Finish

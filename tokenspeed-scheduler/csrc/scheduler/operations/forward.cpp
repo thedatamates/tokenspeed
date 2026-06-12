@@ -766,38 +766,54 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // Block-diffusion passes follow the decode mixed-batch semantics.
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
-            if (request->Is<fsm::Denoising>() && request->GetDiffusionProgress().pass_in_flight) {
-                // One denoise pass at a time: wait for the DenoiseResult.
-                diffusion_waiting_on_executor = true;
-            } else if (request->Is<fsm::Committing>()) {
-                const auto progress = request->GetDiffusionProgress();
-                if (!progress.commit_done) {
-                    if (progress.commit_scheduled) {
-                        // Exactly one commit pass: wait for its ExtendResult.
-                        diffusion_waiting_on_executor = true;
-                    } else if (progress.canvas_len <= token_budget) {
-                        push_op(applyEventAndGenerateOp(request, fsm::ScheduleCommitEvent{}));
-                    } else {
-                        diffusion_starved = true;
-                    }
-                } else if (request->GeneratedSize() >= request->GetBlockDiffusionParams().max_new_tokens) {
-                    // Scheduler-enforced termination: the executor reported the
-                    // commit without Finish but the generation budget is spent.
-                    // Apply the FSM transition directly — the planner never
-                    // re-enters the outside-event path.
-                    finishForward(request);
-                } else if (auto ev = scheduleDenoise(request, token_budget)) {
-                    // Next canvas (fresh reservation, steps_taken = 0).
+            if (request->Is<fsm::PrefillDone>()) {
+                // First canvas entry.
+                if (auto ev = scheduleDenoise(request, token_budget)) {
                     push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                 } else {
                     diffusion_starved = true;
                 }
-            } else if (auto ev = scheduleDenoise(request, token_budget)) {
-                // PrefillDone → first canvas, or one more pass over the
-                // current canvas.
-                push_op(applyEventAndGenerateOp(request, std::move(*ev)));
             } else {
-                diffusion_starved = true;
+                using Phase = fsm::DiffusionProgress::Phase;
+                const auto progress = request->GetDiffusionProgress();
+                switch (progress.phase) {
+                    case Phase::kDenoisePassInFlight:
+                    case Phase::kCommitInFlight:
+                        // One pass at a time: wait for the DenoiseResult /
+                        // commit ExtendResult.
+                        diffusion_waiting_on_executor = true;
+                        break;
+                    case Phase::kCommitReady:
+                        if (progress.canvas_len <= token_budget) {
+                            push_op(applyEventAndGenerateOp(request, fsm::ScheduleCommitEvent{}));
+                        } else {
+                            diffusion_starved = true;
+                        }
+                        break;
+                    case Phase::kCommitDone:
+                        if (request->GeneratedSize() >= request->GetBlockDiffusionParams().max_new_tokens) {
+                            // Scheduler-enforced termination: the executor
+                            // reported the commit without Finish but the
+                            // generation budget is spent. Apply the FSM
+                            // transition directly — the planner never
+                            // re-enters the outside-event path.
+                            finishForward(request);
+                        } else if (auto ev = scheduleDenoise(request, token_budget)) {
+                            // Next canvas (fresh reservation, steps_taken = 0).
+                            push_op(applyEventAndGenerateOp(request, std::move(*ev)));
+                        } else {
+                            diffusion_starved = true;
+                        }
+                        break;
+                    case Phase::kDenoisePassReady:
+                        // One more pass over the current canvas.
+                        if (auto ev = scheduleDenoise(request, token_budget)) {
+                            push_op(applyEventAndGenerateOp(request, std::move(*ev)));
+                        } else {
+                            diffusion_starved = true;
+                        }
+                        break;
+                }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
             // If mixed-batch is disabled, skip ALL decode if any prefill was scheduled this round.
@@ -843,8 +859,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             if (req->Is<fsm::Denoising>()) return true;  // canvas progress is regenerable
             if (req->Is<fsm::Committing>()) {
                 // Don't discard a commit whose result is already in flight.
-                const auto progress = req->GetDiffusionProgress();
-                return !(progress.commit_scheduled && !progress.commit_done);
+                return req->GetDiffusionProgress().phase != fsm::DiffusionProgress::Phase::kCommitInFlight;
             }
             return false;
         };

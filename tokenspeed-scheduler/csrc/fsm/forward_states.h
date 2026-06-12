@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 
@@ -278,13 +279,21 @@ private:
 };
 
 // Scheduler-facing snapshot of a block-diffusion request's per-canvas progress.
-// Valid while the request is Denoising or Committing.
+// Valid while the request is Denoising or Committing. `phase` flattens the two
+// states' SubState enums into one planner-visible progression so plan-time
+// code can switch exhaustively.
 struct DiffusionProgress {
-    std::int32_t canvas_len{};    // tokens in the current canvas (≤ configured canvas_length)
-    std::int32_t steps_taken{};   // denoise passes completed for this canvas
-    bool pass_in_flight{};        // a denoise pass was scheduled and its DenoiseResult is pending
-    bool commit_scheduled{};      // (Committing) the commit pass was scheduled
-    bool commit_done{};           // (Committing) the commit ExtendResult arrived
+    enum class Phase : std::int8_t {
+        kDenoisePassInFlight,  // (Denoising) a pass was scheduled; DenoiseResult pending
+        kDenoisePassReady,     // (Denoising) the next pass may be scheduled
+        kCommitReady,          // (Committing) converged/backstopped; commit not yet scheduled
+        kCommitInFlight,       // (Committing) the commit pass was scheduled; ExtendResult pending
+        kCommitDone,           // (Committing) commit ExtendResult arrived; next canvas or finish
+    };
+
+    std::int32_t canvas_len{};   // tokens in the current canvas (≤ configured canvas_length)
+    std::int32_t steps_taken{};  // denoise passes completed for this canvas
+    Phase phase{};
 };
 
 // Common base for the block-diffusion states. Beyond the committed-history
@@ -341,27 +350,44 @@ protected:
 // the executor-resident canvas. steps_taken == 0 tells the executor to
 // (re)initialize the canvas (fresh random canvas, zero self-conditioning).
 struct Denoising : public DiffusionState {
+    // Strict one-pass-in-flight protocol within the state.
+    enum class SubState : std::int8_t {
+        kPassInFlight,  // a denoise pass was scheduled; its DenoiseResult is pending
+        kPassReady,     // the previous pass answered (not converged); next pass may be scheduled
+    };
+
     Denoising(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
               std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
               std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken,
-              bool pass_in_flight)
+              SubState sub_state)
         : DiffusionState(token_container, page_size, std::move(host_node_ref), std::move(node_ref),
                          std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken),
-          pass_in_flight_{pass_in_flight} {}
+          sub_state_{sub_state} {}
 
     Denoising(Denoising&&) noexcept = default;
     Denoising& operator=(Denoising&&) noexcept = default;
 
+    SubState GetSubState() const { return sub_state_; }
+
     DiffusionProgress Progress() const {
+        DiffusionProgress::Phase phase{};
+        switch (sub_state_) {
+            case SubState::kPassInFlight:
+                phase = DiffusionProgress::Phase::kDenoisePassInFlight;
+                break;
+            case SubState::kPassReady:
+                phase = DiffusionProgress::Phase::kDenoisePassReady;
+                break;
+        }
         return DiffusionProgress{
             .canvas_len = canvas_len_,
             .steps_taken = steps_taken_,
-            .pass_in_flight = pass_in_flight_,
+            .phase = phase,
         };
     }
 
 private:
-    bool pass_in_flight_{};
+    SubState sub_state_{};
 };
 
 // Block-diffusion: the canvas converged (or hit the step backstop); the next
@@ -369,6 +395,13 @@ private:
 // the kept tokens; the request then finishes or re-enters Denoising with a
 // fresh canvas reservation on the following plan.
 struct Committing : public DiffusionState {
+    // Exactly one commit pass per canvas; entered as kReady.
+    enum class SubState : std::int8_t {
+        kReady,     // commit pass not yet scheduled
+        kInFlight,  // commit pass scheduled; its ExtendResult is pending
+        kDone,      // ExtendResult arrived; next plan re-enters Denoising or finishes
+    };
+
     Committing(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
                std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken)
@@ -378,27 +411,47 @@ struct Committing : public DiffusionState {
     Committing(Committing&&) noexcept = default;
     Committing& operator=(Committing&&) noexcept = default;
 
+    SubState GetSubState() const { return sub_state_; }
+
     DiffusionProgress Progress() const {
+        DiffusionProgress::Phase phase{};
+        switch (sub_state_) {
+            case SubState::kReady:
+                phase = DiffusionProgress::Phase::kCommitReady;
+                break;
+            case SubState::kInFlight:
+                phase = DiffusionProgress::Phase::kCommitInFlight;
+                break;
+            case SubState::kDone:
+                phase = DiffusionProgress::Phase::kCommitDone;
+                break;
+        }
         return DiffusionProgress{
             .canvas_len = canvas_len_,
             .steps_taken = steps_taken_,
-            .commit_scheduled = commit_scheduled_,
-            .commit_done = commit_done_,
+            .phase = phase,
         };
     }
 
-    void MarkCommitScheduled() { commit_scheduled_ = true; }
+    void MarkCommitScheduled() {
+        if (sub_state_ != SubState::kReady) {
+            throw std::logic_error("Committing::MarkCommitScheduled: commit already scheduled for this canvas");
+        }
+        sub_state_ = SubState::kInFlight;
+    }
 
     // Commit ExtendResult: the kept tokens (≤ canvas_len, truncated after the
     // first EOS) become committed request history.
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) {
+        if (sub_state_ != SubState::kInFlight) {
+            throw std::logic_error("Committing::ExtendResultTokens: no commit pass in flight");
+        }
         token_container_->Extend(result_tokens);
-        commit_done_ = true;
+        sub_state_ = SubState::kDone;
     }
 
 private:
-    bool commit_scheduled_{};
-    bool commit_done_{};
+    SubState sub_state_{SubState::kReady};
 };
 
 // Request has finished it's generation, and host pages have been allocated,
