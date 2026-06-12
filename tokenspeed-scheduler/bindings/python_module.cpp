@@ -243,12 +243,26 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mamba_l2", &tokenspeed::SchedulerConfig::enable_mamba_l2)
         .def_rw("mamba_l2_host_slots", &tokenspeed::SchedulerConfig::mamba_l2_host_slots);
 
+    nb::class_<tokenspeed::BlockDiffusionParams>(m, "BlockDiffusionParams")
+        .def(nb::init<>())
+        .def(
+            "__init__",
+            [](tokenspeed::BlockDiffusionParams* self, std::int32_t canvas_length, std::int32_t max_denoising_steps,
+               std::int32_t max_new_tokens) {
+                new (self) tokenspeed::BlockDiffusionParams{canvas_length, max_denoising_steps, max_new_tokens};
+            },
+            nb::arg("canvas_length"), nb::arg("max_denoising_steps"), nb::arg("max_new_tokens"))
+        .def_rw("canvas_length", &tokenspeed::BlockDiffusionParams::canvas_length)
+        .def_rw("max_denoising_steps", &tokenspeed::BlockDiffusionParams::max_denoising_steps)
+        .def_rw("max_new_tokens", &tokenspeed::BlockDiffusionParams::max_new_tokens);
+
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("rolling_hashes", &tokenspeed::RequestSpec::rolling_hashes)
-        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages);
+        .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages)
+        .def_rw("block_diffusion", &tokenspeed::RequestSpec::block_diffusion);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
@@ -269,6 +283,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("request_id", &tokenspeed::forward::UpdateReserveNumTokens::request_id)
         .def_rw("reserve_num_tokens_in_next_schedule_event",
                 &tokenspeed::forward::UpdateReserveNumTokens::reserve_num_tokens_in_next_schedule_event);
+
+    nb::class_<tokenspeed::forward::DenoiseResult>(forward_event, "DenoiseResult")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::DenoiseResult::request_id)
+        .def_rw("converged", &tokenspeed::forward::DenoiseResult::converged);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
@@ -315,6 +334,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::module_ forward = m.def_submodule("Forward");
 
+    nb::enum_<tokenspeed::DiffusionKind>(forward, "DiffusionKind")
+        .value("Denoise", tokenspeed::DiffusionKind::kDenoise)
+        .value("Commit", tokenspeed::DiffusionKind::kCommit);
+
     auto flat_fwd_op = nb::class_<tokenspeed::FlatForwardOperation>(forward, "FlatForwardOp");
     BindForwardCommonFields<tokenspeed::FlatForwardOperation>(flat_fwd_op);
     flat_fwd_op.def_ro("input_ids", &tokenspeed::FlatForwardOperation::input_ids)
@@ -342,6 +365,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::rv_policy::reference_internal)
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
+        .def("num_diffusion", &tokenspeed::FlatForwardOperation::num_diffusion)
+        .def_ro("diffusion_kinds", &tokenspeed::FlatForwardOperation::diffusion_kinds)
+        .def_ro("diffusion_canvas_lens", &tokenspeed::FlatForwardOperation::diffusion_canvas_lens)
+        .def_ro("diffusion_committed_lens", &tokenspeed::FlatForwardOperation::diffusion_committed_lens)
+        .def_ro("diffusion_steps_taken", &tokenspeed::FlatForwardOperation::diffusion_steps_taken)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_track_pool_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
