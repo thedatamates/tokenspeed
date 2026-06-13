@@ -107,7 +107,25 @@ public:
                            const MatchResult::PagedCache& paged_cache_hit = {});
 
     // Owned pages return to the pool via OwnedPages RAII; borrowed ids are dropped.
+    // Also drops any retract pin still held for the request.
     void ReleaseRequest(const std::string& request_id);
+
+    // Block-diffusion retraction retention. Group pools are device-only
+    // (no host tier) and group rows are executor-written — they cannot be
+    // rebuilt from restored primary KV — so retraction must NOT discard them:
+    // the per-request tables stay alive across Retracting/Retracted. This
+    // call (a) trims each table's owned tail back to `committed_raw_tokens`
+    // (the discarded canvas span returns to the pools, so retraction relieves
+    // group pressure too) and (b) pins every snapshot node on the request's
+    // committed-history chain (walked from `device_terminal` to root) so that
+    // admission pruning and device-eviction detach cannot free physical pages
+    // the retained tables borrow while the request holds no DeviceNodeRef.
+    void RetainRequestTablesForRetract(const std::string& request_id, TreeNode* device_terminal,
+                                       std::int32_t committed_raw_tokens);
+
+    // Drops the retract pin on resume (the request's fresh DeviceNodeRef
+    // protects the chain again). Idempotent; ReleaseRequest also drops it.
+    void ReleaseRetractPin(const std::string& request_id);
 
     // Fill op.paged_cache_pages / op.paged_cache_page_base_offsets from the tables.
     void PopulateOp(ForwardOperationBase& op_base) const;
@@ -219,6 +237,12 @@ private:
 
     // TODO(snapshot-lru-perf): O(N log N) per prune; swap in LRU index if profiling shows it matters.
     std::unordered_set<TreeNode*> paged_cache_snapshot_nodes_;
+
+    // Retract pins (RetainRequestTablesForRetract): snapshot nodes whose
+    // physical pages are borrowed by a retracted request's retained tables.
+    // Counted because chains of concurrently retracted requests may overlap.
+    std::unordered_map<std::string, std::vector<TreeNode*>> retract_pinned_nodes_by_request_;
+    std::unordered_map<TreeNode*, std::int32_t> retract_pin_counts_;
 };
 
 }  // namespace tokenspeed

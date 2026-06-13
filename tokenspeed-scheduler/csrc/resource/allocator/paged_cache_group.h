@@ -150,6 +150,15 @@ public:
     // Bumps base_logical_page_; commit cursor untouched. Idempotent.
     std::vector<std::int32_t> ReleaseSkipped(std::int32_t window_lower_bound);
 
+    // Drop owned TAIL pages not needed to cover [0, keep_raw_tokens) and
+    // rewind the raw-token cursor to keep_raw_tokens. Borrowed pages and the
+    // committed prefix are never touched (keep_raw_tokens must be >= the
+    // committed cursor). Used by block-diffusion retraction: the discarded
+    // canvas span returns to the pool while the committed-history coverage —
+    // executor-written group rows with no host tier — stays alive across
+    // Retracting/Retracted. Idempotent; returns the released page ids.
+    std::vector<std::int32_t> TrimTailOwned(std::int32_t keep_raw_tokens);
+
     // Release everything; owned via RAII, borrowed by clearing. Used by finish/abort/retract.
     std::vector<std::int32_t> ReleaseAll();
 

@@ -360,8 +360,18 @@ LoadBackOperation GenerateLoadBackOp(const std::vector<TreeNode*>& diff, const s
 
 std::optional<WriteBackOperation> Scheduler::applyEventAndGenerateOp(Request* request,
                                                                      fsm::ScheduleRetractEvent event) {
+    const MatchResult retract_match = event.GetMatchResult();
     // Event applier builds the (device_page, host_page) pairs.
     request->Apply(std::move(event));
+    // Block-diffusion + paged-cache groups: keep the victim's group tables
+    // alive across Retracting/Retracted (group rows are executor-written
+    // device state with no host tier and cannot be rebuilt), trim the
+    // discarded canvas span back to the pools, and pin the snapshot chain
+    // the tables borrow from until resume re-pins it via a DeviceNodeRef.
+    if (hybrid_prefix_cache_ && request->IsBlockDiffusion()) {
+        hybrid_prefix_cache_->RetainRequestTablesForRetract(request->Id(), retract_match.device.last_node,
+                                                            request->TokenSize());
+    }
 
     const auto& pages_to_transfer = request->GetPagesToTransfer<fsm::Retracting>();
     if (pages_to_transfer.empty()) {
@@ -655,7 +665,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
             if (request->IsBlockDiffusion()) {
-                if (auto ev = scheduleDenoiseFromRetracted(request, token_budget)) {
+                if (auto ev = scheduleDenoiseFromRetracted(request, token_budget, simulated_free)) {
                     std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                     push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                     if (!loadback_diff.empty()) {
@@ -694,20 +704,6 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             Request* victim =
                 *std::max_element(retract_candidates.begin(), retract_candidates.end(),
                                   [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
-            if (victim->IsBlockDiffusion() && hybrid_prefix_cache_) {
-                // Paged-cache groups have no host tier: retraction would demote
-                // the committed KV to host while the group rows beyond the last
-                // snapshot are unrecoverable under the Phase-1 snapshot-only
-                // restore policy, so resume could never be correct. Degrade to
-                // abort (mirrors the lost-Mamba-state and retract-failure
-                // precedents); see contract doc 7b for the exact wall.
-                spdlog::warn(
-                    "[Scheduler] KV pressure: block-diffusion request {} is not retractable with paged-cache groups "
-                    "configured (snapshot-only restore), aborting request",
-                    victim->Id());
-                victim->Apply(fsm::AbortEvent{});
-                return {std::vector<ForwardOperation>{}, std::vector<WriteBackOperation>{}};
-            }
             std::vector<WriteBackOperation> wb_ops;
             if (auto op = newRetractOperation(victim)) {
                 wb_ops.push_back(std::move(*op));

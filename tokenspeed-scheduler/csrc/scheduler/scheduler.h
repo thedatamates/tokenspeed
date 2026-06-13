@@ -114,8 +114,8 @@ private:
     // remaining = forward-token budget left.
     std::optional<fsm::ScheduleDenoiseEvent> scheduleDenoise(Request* request, std::int32_t remaining,
                                                              std::map<std::string, std::int32_t>& simulated_free);
-    std::optional<fsm::ScheduleDenoiseFromRetractedEvent> scheduleDenoiseFromRetracted(Request* request,
-                                                                                       std::int32_t remaining);
+    std::optional<fsm::ScheduleDenoiseFromRetractedEvent> scheduleDenoiseFromRetracted(
+        Request* request, std::int32_t remaining, std::map<std::string, std::int32_t>& simulated_free);
     // One planning attempt for an active diffusion request (PrefillDone /
     // Denoising / Committing); produces at most one row in `op_out`. Policy
     // lives in block_diffusion/planner.cpp.

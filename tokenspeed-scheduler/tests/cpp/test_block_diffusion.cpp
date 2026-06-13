@@ -1061,20 +1061,27 @@ TEST_F(BlockDiffusionPagedCacheTestSuite, MultiCanvas_BlockTables_SlidingRelease
     EXPECT_EQ(scheduler_->ActiveKvPages(), 0u);
 }
 
-// KV pressure with paged-cache groups configured: a diffusion victim is
-// aborted, not retracted — paged-cache group rows beyond the last snapshot
-// cannot be restored under the Phase-1 snapshot-only policy, so a retract
-// could never resume correctly (contract doc §7b). Survivors then proceed.
+// KV pressure with paged-cache groups configured: the diffusion victim
+// retracts and resumes like the vanilla path. Group rows are executor-written
+// device state with no host tier, so retraction RETAINS the victim's
+// per-request group tables (trimming only the discarded canvas span) and pins
+// the snapshot chain they borrow from; on resume the committed primary KV
+// loads back from host while the group lineage is the retained table itself —
+// the block-table page ids covering committed history are bit-identical
+// across retract -> resume.
 class BlockDiffusionPagedCachePressureTestSuite : public BlockDiffusionPagedCacheTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = BlockDiffusionPagedCacheTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;  // 15 usable
+        cfg.disable_l2_cache = false;           // retraction needs the host writeback path
         return cfg;
     }
 };
 
-TEST_F(BlockDiffusionPagedCachePressureTestSuite, KvPressure_DiffusionVictimAbortsInsteadOfRetract) {
+TEST_F(BlockDiffusionPagedCachePressureTestSuite, KvPressure_RetractsAndResumes_GroupLineageRetained) {
+    const auto fh_baseline = scheduler_->PagedCacheGroupAvailablePages("fh");
+    const auto swa_baseline = scheduler_->PagedCacheGroupAvailablePages("swa");
     Submit(MakeDiffusionSpec("r1", 3, /*canvas_length=*/8, /*max_denoising_steps=*/4, /*max_new_tokens=*/16,
                              /*start=*/1));
     Submit(MakeDiffusionSpec("r2", 1, /*canvas_length=*/4, /*max_denoising_steps=*/4, /*max_new_tokens=*/8,
@@ -1084,51 +1091,132 @@ TEST_F(BlockDiffusionPagedCachePressureTestSuite, KvPressure_DiffusionVictimAbor
         auto plan = PlanOnce();  // both enter canvas 1
         EXPECT_EQ(DiffusionRows(*GetForwardOp(plan)).size(), 2u);
     }
-    const std::int64_t r1_in_flight_epoch = last_denoise_epoch_.at("r1");
     SendDenoiseResult("r1", true);
     SendDenoiseResult("r2", true);
     PlanOnce();  // both commit
     SendForwardDone("r1", MakeTokens(8, 100));  // r1 committed = 14
     SendForwardDone("r2", MakeTokens(4, 400));  // r2 committed = 6
 
-    // r1 enters canvas 2 (its pass goes in flight); r2's canvas-2 entry starves.
+    // r1 enters canvas 2 (its pass goes in flight); r2's canvas-2 entry
+    // starves on device pages. Capture r1's group lineage at this point:
+    // tables cover [0, committed 14 + CL 8) = fh 6 pages, swa 8 live pages.
+    std::int64_t in_flight_epoch = 0;
+    std::vector<std::int32_t> fh_pre_retract;
+    std::vector<std::int32_t> swa_pre_retract;
     {
         auto plan = PlanOnce();
         auto rows = DiffusionRows(*GetForwardOp(plan));
         ASSERT_EQ(rows.size(), 1u);
         EXPECT_EQ(rows[0].id, "r1");
+        EXPECT_EQ(rows[0].kind, DiffusionKind::kDenoise);
+        EXPECT_EQ(rows[0].canvas_index, 1);
+        in_flight_epoch = rows[0].pass_epoch;
+        fh_pre_retract = scheduler_->GetRequestPagedCachePageIds("r1", "fh");
+        swa_pre_retract = scheduler_->GetRequestPagedCachePageIds("r1", "swa");
+        ASSERT_EQ(fh_pre_retract.size(), 6u);   // ceil(22/4)
+        ASSERT_EQ(swa_pre_retract.size(), 8u);  // ceil(22/2) - 3 released
+        EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 3);
     }
+    const auto fh_before_retract = scheduler_->PagedCacheGroupAvailablePages("fh");
+    const auto swa_before_retract = scheduler_->PagedCacheGroupAvailablePages("swa");
 
-    // Pressure round: no row schedulable. With paged-cache groups the victim
-    // (r1, the longest) is aborted outright — no retract writeback, nothing
-    // left in Retracted.
+    // Pressure round: r1 is RETRACTED (mid-pass), not aborted. The retract
+    // writeback covers the committed KV; the group tables are retained with
+    // only the discarded canvas span trimmed back to the pools
+    // (fh: 6 -> ceil(14/4) = 4 pages; swa: 8 -> 4 live pages).
+    cache_op_id retract_op_id{};
     {
         auto plan = PlanOnce();
         const auto* fwd = GetForwardOp(plan);
         ASSERT_NE(fwd, nullptr);
         EXPECT_TRUE(fwd->request_ids.empty());
-        EXPECT_EQ(GetWriteBack(plan), nullptr);
-        EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+        const auto* wb = GetWriteBack(plan);
+        ASSERT_NE(wb, nullptr);
+        ASSERT_EQ(wb->op_ids.size(), 1u);
+        retract_op_id = wb->op_ids[0];
+        EXPECT_EQ(scheduler_->RetractedSize(), 1u);
     }
-    // A late result for the aborted in-flight pass is dropped harmlessly.
-    SendDenoiseResult("r1", true, r1_in_flight_epoch);
+    {
+        // Retained lineage: the committed-history coverage survives retraction
+        // bit-identically; only the canvas-span tail was returned to the pool.
+        auto fh_retained = scheduler_->GetRequestPagedCachePageIds("r1", "fh");
+        auto swa_retained = scheduler_->GetRequestPagedCachePageIds("r1", "swa");
+        ASSERT_EQ(fh_retained.size(), 4u);
+        ASSERT_EQ(swa_retained.size(), 4u);
+        EXPECT_TRUE(std::equal(fh_retained.begin(), fh_retained.end(), fh_pre_retract.begin()));
+        EXPECT_TRUE(std::equal(swa_retained.begin(), swa_retained.end(), swa_pre_retract.begin()));
+        EXPECT_EQ(scheduler_->PagedCacheGroupAvailablePages("fh"), fh_before_retract + 2);
+        EXPECT_EQ(scheduler_->PagedCacheGroupAvailablePages("swa"), swa_before_retract + 4);
+    }
+    SendWriteBackDone(retract_op_id);
+    SendAbort("r2");  // clear the field so r1 can resume
 
-    // r1 is gone; its pages fund r2's canvas 2, which runs to completion.
+    // r1 resumes: committed KV loads back from host; the canvas restarts at
+    // step 0 under the SAME canvas index with a fresh pass epoch; the group
+    // block tables re-extend the retained lineage — the page ids covering the
+    // committed history are the very same pages as before the retraction.
+    std::int64_t resume_epoch = 0;
     {
         auto plan = PlanOnce();
-        EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
         auto rows = DiffusionRows(*GetForwardOp(plan));
         ASSERT_EQ(rows.size(), 1u);
-        EXPECT_EQ(rows[0].id, "r2");
-        EXPECT_EQ(rows[0].committed_len, 6);
+        EXPECT_EQ(rows[0].id, "r1");
+        EXPECT_EQ(rows[0].kind, DiffusionKind::kDenoise);
         EXPECT_EQ(rows[0].steps_taken, 0);
+        EXPECT_EQ(rows[0].committed_len, 14);
+        EXPECT_EQ(rows[0].canvas_index, 1);  // sampler identity stable
+        EXPECT_GT(rows[0].pass_epoch, in_flight_epoch);
+        resume_epoch = rows[0].pass_epoch;
+        ASSERT_NE(GetLoadBack(plan), nullptr);  // host -> device recovery copies
+        EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_EQ(fwd->paged_cache_block_tables.count("fh"), 1u);
+        auto fh_resumed = scheduler_->GetRequestPagedCachePageIds("r1", "fh");
+        auto swa_resumed = scheduler_->GetRequestPagedCachePageIds("r1", "swa");
+        ASSERT_EQ(fh_resumed.size(), 6u);
+        ASSERT_EQ(swa_resumed.size(), 8u);
+        EXPECT_TRUE(std::equal(fh_pre_retract.begin(), fh_pre_retract.begin() + 4, fh_resumed.begin()));
+        EXPECT_TRUE(std::equal(swa_pre_retract.begin(), swa_pre_retract.begin() + 4, swa_resumed.begin()));
+        EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 3);
     }
-    SendDenoiseResult("r2", true);
-    PlanOnce();  // commit
-    SendForwardDone("r2", MakeTokens(4, 500));  // committed = 10 → generated 8 = budget
-    PlanOnce();                                 // scheduler-enforced finish
-    PlanOnce();                                 // release + erase
-    EXPECT_EQ(scheduler_->GetRequestTokenSize("r2"), -1);
+
+    // The discarded pass's late result echoes a stale epoch and is dropped.
+    SendDenoiseResult("r1", true, in_flight_epoch);
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), 14);
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_NE(fwd, nullptr);
+        EXPECT_TRUE(fwd->request_ids.empty());
+    }
+
+    // The restarted pass converges; the canvas commits and the request runs
+    // to its max_new_tokens finish.
+    SendDenoiseResult("r1", true, resume_epoch);
+    {
+        auto row = PlanSingleDiffusionRow("r1");
+        EXPECT_EQ(row.kind, DiffusionKind::kCommit);
+        EXPECT_EQ(row.steps_taken, 1);
+        EXPECT_EQ(row.canvas_index, 1);
+    }
+    SendForwardDone("r1", MakeTokens(8, 200));  // committed 22, generated 16 = budget
+    PlanOnce();  // scheduler-enforced finish at max_new_tokens (Draining)
+    {
+        auto plan = PlanOnce();  // drains the finished KV to host
+        const auto* wb = GetWriteBack(plan);
+        ASSERT_NE(wb, nullptr);
+        ASSERT_EQ(wb->op_ids.size(), 1u);
+        SendWriteBackDone(wb->op_ids[0]);
+    }
+    PlanOnce();  // release + erase
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
+    EXPECT_TRUE(scheduler_->GetRequestPagedCachePageIds("r1", "fh").empty());
+    // Snapshots published up to the last canvas-entry insert depth (committed
+    // 14 -> except-last 12 tokens -> boundaries 4/8/12) stay resident for
+    // prefix reuse; everything else returned to the group pools.
+    EXPECT_EQ(scheduler_->PagedCacheGroupAvailablePages("fh"), fh_baseline - 3);   // 12/4
+    EXPECT_EQ(scheduler_->PagedCacheGroupAvailablePages("swa"), swa_baseline - 6);  // 12/2
     EXPECT_EQ(scheduler_->ActiveKvPages(), 0u);
 }
 

@@ -312,6 +312,40 @@ std::vector<std::int32_t> PagedCacheGroupTable::ReleaseSkipped(std::int32_t wind
     return released;
 }
 
+std::vector<std::int32_t> PagedCacheGroupTable::TrimTailOwned(std::int32_t keep_raw_tokens) {
+    if (allocator_ == nullptr) {
+        return {};
+    }
+    if (keep_raw_tokens < 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::TrimTailOwned: keep_raw_tokens must be >= 0");
+    }
+    if (keep_raw_tokens < committed_prefix_len_tokens_) {
+        throw std::logic_error(
+            "PagedCacheGroupTable::TrimTailOwned: cannot trim below the committed prefix; keep=" +
+            std::to_string(keep_raw_tokens) + "; committed=" + std::to_string(committed_prefix_len_tokens_));
+    }
+    if (keep_raw_tokens >= raw_token_cursor_) {
+        return {};
+    }
+
+    const auto& cfg = allocator_->Config();
+    const std::int32_t entries = CeilDivPositive(keep_raw_tokens, cfg.entry_stride_tokens);
+    const std::int32_t pages_needed = (entries + cfg.rows_per_page - 1) / cfg.rows_per_page;
+    const std::int32_t pages_have =
+        base_logical_page_ + static_cast<std::int32_t>(borrowed_page_ids_.size()) + owned_pages_.Size();
+    const std::int32_t to_drop = std::min(std::max(0, pages_have - pages_needed), owned_pages_.Size());
+
+    std::vector<std::int32_t> released;
+    if (to_drop > 0) {
+        OwnedPages dropped = owned_pages_.TakeLast(to_drop);
+        released = dropped.Ids();
+        // dropped dtor returns pages to pool.
+    }
+    raw_token_cursor_ = keep_raw_tokens;
+    RefreshPageIdsView();
+    return released;
+}
+
 std::vector<std::int32_t> PagedCacheGroupTable::ReleaseAll() {
     std::vector<std::int32_t> released;
     released.reserve(borrowed_page_ids_.size() + static_cast<std::size_t>(owned_pages_.Size()));

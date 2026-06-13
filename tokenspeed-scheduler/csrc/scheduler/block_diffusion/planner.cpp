@@ -105,21 +105,17 @@ std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* req
 // Block-diffusion: Retracted → Denoising recovery. Mirrors
 // scheduleDecodeFromRetracted: re-match committed history, LoadBack the
 // host-only pages, and reserve a fresh canvas. The canvas restarts at step 0.
-std::optional<fsm::ScheduleDenoiseFromRetractedEvent> Scheduler::scheduleDenoiseFromRetracted(Request* request,
-                                                                                              std::int32_t remaining) {
-    if (hybrid_prefix_cache_) {
-        // Unreachable in practice: with paged-cache groups configured, the
-        // KV-pressure path aborts diffusion victims instead of retracting
-        // them (Phase-1 snapshot-only restore cannot rebuild group rows over
-        // the full committed history; see contract doc 7b). Defensive guard
-        // mirroring the lost-Mamba-state precedent above.
-        spdlog::warn(
-            "[Scheduler] Retracted block-diffusion request {} cannot be resumed with paged-cache groups configured, "
-            "aborting request",
-            request->Id());
-        request->Apply(fsm::AbortEvent{});
-        return {};
-    }
+//
+// Paged-cache groups: the victim's per-request group tables were RETAINED
+// across retraction (RetainRequestTablesForRetract) — group pools are
+// device-only and group rows are executor-written, so the committed-history
+// rows simply never died; only the discarded canvas span was trimmed. The
+// committed-KV match therefore deliberately bypasses the hybrid augment
+// (which caps recovery at the last snapshot boundary): primary KV restores
+// over the full radix host tier, and the group lineage is the retained table
+// itself, not a snapshot re-import.
+std::optional<fsm::ScheduleDenoiseFromRetractedEvent> Scheduler::scheduleDenoiseFromRetracted(
+    Request* request, std::int32_t remaining, std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
 
     const auto& params = request->GetBlockDiffusionParams();
@@ -141,6 +137,16 @@ std::optional<fsm::ScheduleDenoiseFromRetractedEvent> Scheduler::scheduleDenoise
 
     std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed)) {
+        return {};
+    }
+
+    // Re-admit the fresh canvas span against the group pools (the trimmed
+    // tail must be re-acquired). The retained table keeps its committed
+    // coverage, so only the canvas span counts as new pages; the admission
+    // prune path skips the victim's own retract-pinned snapshots.
+    const std::int32_t first_pos = request->TokenSize();
+    if (hybrid_prefix_cache_ &&
+        !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, first_pos + canvas_len, simulated_free)) {
         return {};
     }
 
@@ -232,6 +238,17 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.pass_epoch = progress.pass_epoch;
     op.canvas_index = request->DiffusionCanvasIndex();  // unchanged: same canvas, restarted
     FillDiffusionWriteSpan(op, config_.page_size);
+    // Paged-cache groups: the resumed request holds a fresh DeviceNodeRef, so
+    // the retract pin can drop. The retained tables only need their trimmed
+    // canvas span re-acquired (committed coverage never died); CommitChunk is
+    // an idempotent no-op here (no new commit boundary appeared since canvas
+    // entry) and only keeps the eager-snapshot invariant explicit.
+    if (hybrid_prefix_cache_) {
+        hybrid_prefix_cache_->ReleaseRetractPin(op.request_id);
+        hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.committed_len, op.committed_len + op.canvas_len);
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 

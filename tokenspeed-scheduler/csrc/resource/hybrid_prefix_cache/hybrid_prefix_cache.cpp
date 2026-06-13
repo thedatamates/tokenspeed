@@ -298,7 +298,11 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
     // Passive paged-cache detach on KV LRU drop: returns OwnedPages via RAII;
     // the chain scan sees the gap because `HasPagedCacheSnapshot()` is false.
     // Route through DetachPagedCacheSnapshotFromNode to keep membership set in sync.
-    if (node->HasPagedCacheSnapshot()) {
+    // Retract-pinned snapshots stay attached: a retracted request's retained
+    // tables borrow their physical pages, and the node survives the device
+    // drop (the retraction writeback left it host-resident, host-pinned by
+    // the request's HostNodeRef).
+    if (node->HasPagedCacheSnapshot() && retract_pin_counts_.find(node) == retract_pin_counts_.end()) {
         DetachPagedCacheSnapshotFromNode(node);
     }
 }
@@ -754,6 +758,7 @@ void HybridPrefixCache::AcquireForRequest(const std::string& request_id, std::in
 }
 
 void HybridPrefixCache::ReleaseRequest(const std::string& request_id) {
+    ReleaseRetractPin(request_id);
     auto it = request_paged_cache_tables_.find(request_id);
     if (it != request_paged_cache_tables_.end()) {
         for (auto& [_, table] : it->second) {
@@ -762,6 +767,44 @@ void HybridPrefixCache::ReleaseRequest(const std::string& request_id) {
         request_paged_cache_tables_.erase(it);
     }
     DemoteIdleMambaDeviceCopiesPresentOnHost();
+}
+
+void HybridPrefixCache::RetainRequestTablesForRetract(const std::string& request_id, TreeNode* device_terminal,
+                                                      std::int32_t committed_raw_tokens) {
+    if (paged_cache_allocators_.empty()) return;
+
+    // (a) Return the discarded canvas span to the pools; the committed
+    // coverage (borrowed + owned) stays alive in the retained tables.
+    auto tables_it = request_paged_cache_tables_.find(request_id);
+    if (tables_it != request_paged_cache_tables_.end()) {
+        for (auto& [_, table] : tables_it->second) {
+            table.TrimTailOwned(committed_raw_tokens);
+        }
+    }
+
+    // (b) Pin the snapshot chain the retained tables borrow from. Idempotent
+    // per request: a duplicate retain (impossible today, defensive) must not
+    // double-count.
+    auto& pinned = retract_pinned_nodes_by_request_[request_id];
+    if (!pinned.empty()) return;
+    for (TreeNode* node = device_terminal; node != nullptr && !node->IsRoot(); node = node->Parent()) {
+        if (!node->HasPagedCacheSnapshot()) continue;
+        pinned.push_back(node);
+        ++retract_pin_counts_[node];
+    }
+}
+
+void HybridPrefixCache::ReleaseRetractPin(const std::string& request_id) {
+    auto it = retract_pinned_nodes_by_request_.find(request_id);
+    if (it == retract_pinned_nodes_by_request_.end()) return;
+    for (TreeNode* node : it->second) {
+        auto count_it = retract_pin_counts_.find(node);
+        if (count_it == retract_pin_counts_.end()) continue;
+        if (--count_it->second <= 0) {
+            retract_pin_counts_.erase(count_it);
+        }
+    }
+    retract_pinned_nodes_by_request_.erase(it);
 }
 
 void HybridPrefixCache::PopulateOp(ForwardOperationBase& op_base) const {
@@ -983,7 +1026,11 @@ bool HybridPrefixCache::tryPrunePagedCacheSnapshot(AdmissionFailureKind kind) {
     if (!HasPagedCacheAdjunct()) return false;
     if (kind == AdmissionFailureKind::kNone) return false;
 
-    auto is_pinned = [](TreeNode* node) {
+    auto is_pinned = [this](TreeNode* node) {
+        // Retract pin: a retracted block-diffusion request's retained tables
+        // borrow this snapshot's physical pages while the request holds no
+        // DeviceNodeRef; pruning would free pages still referenced.
+        if (retract_pin_counts_.find(node) != retract_pin_counts_.end()) return true;
         for (TreeNode* cur = node; cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
             if (!cur->OnDevice()) continue;
             if (cur->Device().RefCount() > 0) return true;
