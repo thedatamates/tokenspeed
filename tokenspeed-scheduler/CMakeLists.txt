@@ -50,6 +50,9 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/fsm/cache_events.cpp
     csrc/fsm/pd_events.cpp
 
+    csrc/scheduler/block_diffusion/lifecycle.cpp
+    csrc/scheduler/block_diffusion/planner.cpp
+
     csrc/scheduler/operations/cache.cpp
     csrc/scheduler/operations/forward.cpp
 

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "resource/types.h"
+#include "scheduler/block_diffusion/planner.h"
 #include "scheduler/types.h"
 #include "scheduler/request.h"
 #include "scheduler/execution_plan.h"
@@ -115,6 +116,12 @@ private:
                                                              std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleDenoiseFromRetractedEvent> scheduleDenoiseFromRetracted(Request* request,
                                                                                        std::int32_t remaining);
+    // One planning attempt for an active diffusion request (PrefillDone /
+    // Denoising / Committing); produces at most one row in `op_out`. Policy
+    // lives in block_diffusion/planner.cpp.
+    block_diffusion::PlanOutcome scheduleDiffusionPass(Request* request, std::int32_t token_budget,
+                                                       std::map<std::string, std::int32_t>& simulated_free,
+                                                       std::optional<DiffusionOperation>& op_out);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
     // Applies fsm::FinishEvent to `request` (terminal prefix-cache insert +
