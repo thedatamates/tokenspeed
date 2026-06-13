@@ -186,6 +186,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;
     op.pass_epoch = progress.pass_epoch;
+    op.canvas_index = request->DiffusionCanvasIndex();
     FillDiffusionWriteSpan(op, config_.page_size);
     // Paged-cache groups. Order: attach, acquire, populate (matches the AR
     // decode path). On canvas entry the event inserted the committed full
@@ -229,6 +230,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;  // 0: executor re-inits the canvas
     op.pass_epoch = progress.pass_epoch;
+    op.canvas_index = request->DiffusionCanvasIndex();  // unchanged: same canvas, restarted
     FillDiffusionWriteSpan(op, config_.page_size);
     return op;
 }
@@ -252,6 +254,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;
     op.pass_epoch = progress.pass_epoch;
+    op.canvas_index = request->DiffusionCanvasIndex();
     FillDiffusionWriteSpan(op, config_.page_size);
     // Paged-cache groups: the canvas span was acquired/admitted at canvas
     // entry; the commit pass only needs the block tables republished.

@@ -44,6 +44,7 @@ struct DiffusionRow {
     std::int32_t committed_len;
     std::int32_t steps_taken;
     std::int64_t pass_epoch;
+    std::int32_t canvas_index;
     std::int32_t write_page_begin;
     std::int32_t write_page_count;
     std::int32_t input_length;
@@ -156,6 +157,7 @@ protected:
                 .committed_len = fwd.diffusion_committed_lens[i],
                 .steps_taken = fwd.diffusion_steps_taken[i],
                 .pass_epoch = fwd.diffusion_pass_epochs[i],
+                .canvas_index = fwd.diffusion_canvas_indices[i],
                 .write_page_begin = fwd.diffusion_write_page_begins[i],
                 .write_page_count = fwd.diffusion_write_page_counts[i],
                 .input_length = fwd.input_lengths[base + i],
@@ -221,6 +223,7 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.committed_len, 4);
         EXPECT_EQ(row.steps_taken, 0);  // executor must init the canvas
         EXPECT_EQ(row.pass_epoch, 1);   // scheduler-issued pass identity
+        EXPECT_EQ(row.canvas_index, 0);  // sampler identity: first canvas
         EXPECT_EQ(row.write_page_begin, 2);  // canvas span = the 4 reservation pages
         EXPECT_EQ(row.write_page_count, 0);  // denoise must not write KV
         EXPECT_EQ(row.input_length, 8);
@@ -250,6 +253,7 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.committed_len, 4);
         EXPECT_EQ(row.steps_taken, 2);
         EXPECT_EQ(row.pass_epoch, 3);  // commit passes consume epochs too
+        EXPECT_EQ(row.canvas_index, 0);  // the commit still belongs to canvas 0
         EXPECT_EQ(row.write_page_begin, 2);  // commit writes exactly the canvas span
         EXPECT_EQ(row.write_page_count, 4);
         EXPECT_EQ(row.size, 0);  // commit writes into the existing reservation
@@ -268,6 +272,7 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.committed_len, 12);
         EXPECT_EQ(row.steps_taken, 0);
         EXPECT_EQ(row.pass_epoch, 4);
+        EXPECT_EQ(row.canvas_index, 1);  // advances only on commit
         EXPECT_EQ(row.write_page_begin, 6);
         EXPECT_EQ(row.write_page_count, 0);
         EXPECT_EQ(row.begin, 6);
@@ -821,6 +826,7 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_MidPass_StaleEpochResultD
         EXPECT_EQ(rows[0].id, "r1");
         EXPECT_EQ(rows[0].kind, DiffusionKind::kDenoise);
         EXPECT_EQ(rows[0].steps_taken, 0);
+        EXPECT_EQ(rows[0].canvas_index, 1);  // second canvas
         in_flight_epoch = rows[0].pass_epoch;
     }
 
@@ -851,6 +857,9 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_MidPass_StaleEpochResultD
         EXPECT_EQ(rows[0].steps_taken, 0);
         EXPECT_EQ(rows[0].committed_len, 14);
         EXPECT_GT(rows[0].pass_epoch, in_flight_epoch);
+        // Sampler identity vs pass identity: the restarted canvas is still
+        // canvas 1 (stable RNG stream) even though the pass epoch moved on.
+        EXPECT_EQ(rows[0].canvas_index, 1);
         resume_epoch = rows[0].pass_epoch;
         EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     }
@@ -987,6 +996,7 @@ TEST_F(BlockDiffusionPagedCacheTestSuite, MultiCanvas_BlockTables_SlidingRelease
         auto rows = DiffusionRows(*fwd);
         ASSERT_EQ(rows.size(), 1u);
         EXPECT_EQ(rows[0].kind, DiffusionKind::kDenoise);
+        EXPECT_EQ(rows[0].canvas_index, 0);
         ASSERT_EQ(fwd->paged_cache_block_tables.count("fh"), 1u);
         ASSERT_EQ(fwd->paged_cache_block_tables.count("swa"), 1u);
         // fh: ceil(12 / 4) = 3 pages; swa: ceil(12 / 2) = 6 live pages, base 0.
@@ -1008,6 +1018,7 @@ TEST_F(BlockDiffusionPagedCacheTestSuite, MultiCanvas_BlockTables_SlidingRelease
         auto rows = DiffusionRows(*GetForwardOp(plan));
         ASSERT_EQ(rows.size(), 1u);
         EXPECT_EQ(rows[0].committed_len, 12);
+        EXPECT_EQ(rows[0].canvas_index, 1);
         EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 2);
         EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "fh").size(), 5u);   // ceil(20/4)
         EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "swa").size(), 8u);  // 10 - 2 released
@@ -1024,6 +1035,7 @@ TEST_F(BlockDiffusionPagedCacheTestSuite, MultiCanvas_BlockTables_SlidingRelease
         auto rows = DiffusionRows(*fwd);
         ASSERT_EQ(rows.size(), 1u);
         EXPECT_EQ(rows[0].committed_len, 20);
+        EXPECT_EQ(rows[0].canvas_index, 2);  // canvas ordinals 0,1,2 across commits
         EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 6);
         ASSERT_EQ(fwd->paged_cache_block_table_base_offsets.count("swa"), 1u);
         EXPECT_EQ(fwd->paged_cache_block_table_base_offsets.at("swa").back(), 6);

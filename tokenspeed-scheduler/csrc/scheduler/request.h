@@ -114,6 +114,16 @@ public:
     // result echoing a pre-retract epoch can never collide with a fresh pass.
     std::int64_t IssueDiffusionPassEpoch() { return ++last_diffusion_pass_epoch_; }
 
+    // 0-based ordinal of the CURRENT canvas — the executor-side sampler
+    // identity (per-canvas RNG stream). Distinct from pass_epoch (the
+    // event-matching identity): the canvas index advances only when a canvas
+    // COMMITS, so it is stable across retraction/resume and canvas restarts,
+    // while pass_epoch changes on every scheduled pass including restarts.
+    std::int32_t DiffusionCanvasIndex() const { return diffusion_canvas_index_; }
+    // Called when a commit's ExtendResult is accepted (the canvas became
+    // committed history); the next canvas gets the next ordinal.
+    void AdvanceDiffusionCanvasIndex() { ++diffusion_canvas_index_; }
+
     fsm::DiffusionProgress GetDiffusionProgress() const {
         return std::visit(Overloaded{
             []<typename T>(const T& s) -> fsm::DiffusionProgress
@@ -317,6 +327,7 @@ private:
     StorageInfo storage_info_;
     std::optional<BlockDiffusionParams> block_diffusion_;
     std::int64_t last_diffusion_pass_epoch_{0};
+    std::int32_t diffusion_canvas_index_{0};
 };
 
 using ConstRequestVector = std::vector<const Request*>;

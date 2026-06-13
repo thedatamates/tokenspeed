@@ -157,6 +157,13 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
             }
         }
         req->Apply(fsm::ExtendResultEvent{event.tokens});
+        if (req->IsBlockDiffusion()) {
+            // The guards above ensured this ExtendResult was the in-flight
+            // commit: the canvas became committed history, so the next canvas
+            // gets the next sampler ordinal. pass_epoch (the event-matching
+            // identity) is issued separately per scheduled pass.
+            req->AdvanceDiffusionCanvasIndex();
+        }
     }
 }
 

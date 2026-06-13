@@ -372,6 +372,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("diffusion_committed_lens", &tokenspeed::FlatForwardOperation::diffusion_committed_lens)
         .def_ro("diffusion_steps_taken", &tokenspeed::FlatForwardOperation::diffusion_steps_taken)
         .def_ro("diffusion_pass_epochs", &tokenspeed::FlatForwardOperation::diffusion_pass_epochs)
+        .def_ro("diffusion_canvas_indices", &tokenspeed::FlatForwardOperation::diffusion_canvas_indices)
         .def_ro("diffusion_write_page_begins", &tokenspeed::FlatForwardOperation::diffusion_write_page_begins)
         .def_ro("diffusion_write_page_counts", &tokenspeed::FlatForwardOperation::diffusion_write_page_counts)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
