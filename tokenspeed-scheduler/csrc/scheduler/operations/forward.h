@@ -98,6 +98,10 @@ struct DiffusionOperation : public ForwardOperationBase {
     // canvas (fresh random canvas, zero self-conditioning — also after
     // retraction).
     std::int32_t steps_taken{};
+    // Scheduler-issued pass identity, strictly increasing per request across
+    // canvases, retractions and restarts. A kDenoise pass's DenoiseResult
+    // must echo it; mismatched (stale) results are dropped by the scheduler.
+    std::int64_t pass_epoch{};
 };
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation, DiffusionOperation>;
@@ -125,6 +129,7 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> diffusion_canvas_lens;
     std::vector<std::int32_t> diffusion_committed_lens;
     std::vector<std::int32_t> diffusion_steps_taken;
+    std::vector<std::int64_t> diffusion_pass_epochs;
 
     // Mamba extension (SoA)
     std::vector<std::int32_t> mamba_working_indices;
@@ -187,6 +192,7 @@ struct FlatForwardOperation {
                 diffusion_canvas_lens.push_back(diffusion->canvas_len);
                 diffusion_committed_lens.push_back(diffusion->committed_len);
                 diffusion_steps_taken.push_back(diffusion->steps_taken);
+                diffusion_pass_epochs.push_back(diffusion->pass_epoch);
             }
         }
         const std::size_t num_reqs = request_ids.size();

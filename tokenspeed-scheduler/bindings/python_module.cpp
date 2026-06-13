@@ -287,7 +287,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::forward::DenoiseResult>(forward_event, "DenoiseResult")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::DenoiseResult::request_id)
-        .def_rw("converged", &tokenspeed::forward::DenoiseResult::converged);
+        .def_rw("converged", &tokenspeed::forward::DenoiseResult::converged)
+        .def_rw("pass_epoch", &tokenspeed::forward::DenoiseResult::pass_epoch);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
@@ -370,6 +371,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("diffusion_canvas_lens", &tokenspeed::FlatForwardOperation::diffusion_canvas_lens)
         .def_ro("diffusion_committed_lens", &tokenspeed::FlatForwardOperation::diffusion_committed_lens)
         .def_ro("diffusion_steps_taken", &tokenspeed::FlatForwardOperation::diffusion_steps_taken)
+        .def_ro("diffusion_pass_epochs", &tokenspeed::FlatForwardOperation::diffusion_pass_epochs)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_track_pool_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)

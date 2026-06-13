@@ -176,7 +176,11 @@ private:
 struct ScheduleDenoiseEvent : InvalidTransitionHandler<ScheduleDenoiseEvent> {
     using InvalidTransitionHandler<ScheduleDenoiseEvent>::operator();
 
-    explicit ScheduleDenoiseEvent(std::int32_t canvas_len) : canvas_len_(canvas_len) {}
+    // `pass_epoch` is the scheduler-issued identity of the pass being
+    // scheduled (Request::IssueDiffusionPassEpoch); the executor must echo it
+    // in the DenoiseResult.
+    ScheduleDenoiseEvent(std::int32_t canvas_len, std::int64_t pass_epoch)
+        : canvas_len_(canvas_len), pass_epoch_(pass_epoch) {}
 
     // Canvas entry: reserve ceil-page coverage for canvas_len tokens so the
     // eventual commit cannot fail, then start at step 0 (executor inits canvas).
@@ -187,6 +191,7 @@ struct ScheduleDenoiseEvent : InvalidTransitionHandler<ScheduleDenoiseEvent> {
 
 private:
     std::int32_t canvas_len_{};
+    std::int64_t pass_epoch_{};
 };
 
 // Block-diffusion: Retracted → Denoising recovery (mirrors
@@ -196,10 +201,12 @@ private:
 struct ScheduleDenoiseFromRetractedEvent : InvalidTransitionHandler<ScheduleDenoiseFromRetractedEvent> {
     using InvalidTransitionHandler<ScheduleDenoiseFromRetractedEvent>::operator();
 
-    ScheduleDenoiseFromRetractedEvent(std::int32_t canvas_len, PageAllocator* device_allocator,
-                                      ReqPoolAllocator* req_pool_allocator, KVPrefixCache* kv_prefix_cache,
-                                      MatchResult match_result, std::vector<TreeNode*> loadback_diff)
+    ScheduleDenoiseFromRetractedEvent(std::int32_t canvas_len, std::int64_t pass_epoch,
+                                      PageAllocator* device_allocator, ReqPoolAllocator* req_pool_allocator,
+                                      KVPrefixCache* kv_prefix_cache, MatchResult match_result,
+                                      std::vector<TreeNode*> loadback_diff)
         : canvas_len_(canvas_len),
+          pass_epoch_(pass_epoch),
           device_allocator_(device_allocator),
           req_pool_allocator_(req_pool_allocator),
           kv_prefix_cache_(kv_prefix_cache),
@@ -212,6 +219,7 @@ struct ScheduleDenoiseFromRetractedEvent : InvalidTransitionHandler<ScheduleDeno
 
 private:
     std::int32_t canvas_len_{};
+    std::int64_t pass_epoch_{};
     PageAllocator* device_allocator_{};
     ReqPoolAllocator* req_pool_allocator_{};
     KVPrefixCache* kv_prefix_cache_{};
@@ -223,27 +231,41 @@ private:
 struct ScheduleCommitEvent : InvalidTransitionHandler<ScheduleCommitEvent> {
     using InvalidTransitionHandler<ScheduleCommitEvent>::operator();
 
+    explicit ScheduleCommitEvent(std::int64_t pass_epoch) : pass_epoch_(pass_epoch) {}
+
     Committing operator()(Committing&& state) {
-        state.MarkCommitScheduled();
+        state.MarkCommitScheduled(pass_epoch_);
         return std::move(state);
     }
+
+private:
+    std::int64_t pass_epoch_{};
 };
 
 // Block-diffusion outside event: the executor finished one denoise pass.
 // converged=false increments steps_taken and stays Denoising unless the
 // scheduler-enforced max_denoising_steps backstop is reached; converged=true
-// (or the backstop) transitions to Committing.
+// (or the backstop) transitions to Committing. `pass_epoch` must echo the
+// epoch the pass was scheduled with; mismatches are stale results from a
+// discarded canvas (retract/restart) and are dropped with a warning.
 struct DenoiseResultEvent : InvalidTransitionHandler<DenoiseResultEvent> {
     using InvalidTransitionHandler<DenoiseResultEvent>::operator();
 
-    DenoiseResultEvent(bool converged, std::int32_t max_denoising_steps)
-        : converged_(converged), max_denoising_steps_(max_denoising_steps) {}
+    DenoiseResultEvent(bool converged, std::int32_t max_denoising_steps, std::int64_t pass_epoch)
+        : converged_(converged), max_denoising_steps_(max_denoising_steps), pass_epoch_(pass_epoch) {}
 
     std::variant<Denoising, Committing> operator()(Denoising&& state);
+
+    // A denoise result can arrive after its pass's canvas was discarded
+    // (retract → resume) and the request has already moved on. The epoch can
+    // never match a commit pass, so any receipt here is stale; drop it.
+    Committing operator()(Committing&& state);
 
     // Overlap scheduling / retraction races: a denoise result can arrive after
     // the canvas was discarded (retract) or the request terminalized. Canvas
     // progress is regenerable, so the stale result is dropped.
+    Draining operator()(Draining&& state) { return std::move(state); }
+    WritingBack operator()(WritingBack&& state) { return std::move(state); }
     Retracting operator()(Retracting&& state) { return std::move(state); }
     Retracted operator()(Retracted&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
@@ -251,6 +273,7 @@ struct DenoiseResultEvent : InvalidTransitionHandler<DenoiseResultEvent> {
 private:
     bool converged_{};
     std::int32_t max_denoising_steps_{};
+    std::int64_t pass_epoch_{};
 };
 
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {

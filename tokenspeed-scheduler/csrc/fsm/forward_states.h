@@ -293,6 +293,10 @@ struct DiffusionProgress {
 
     std::int32_t canvas_len{};   // tokens in the current canvas (≤ configured canvas_length)
     std::int32_t steps_taken{};  // denoise passes completed for this canvas
+    // Scheduler-issued identity of the most recently scheduled pass (denoise
+    // or commit). Strictly increasing per request across canvases, retractions
+    // and canvas restarts; a DenoiseResult must echo it to be accepted.
+    std::int64_t pass_epoch{};
     Phase phase{};
 };
 
@@ -305,18 +309,21 @@ struct DiffusionState : public ForwardState {
     DiffusionState(TokenContainer* token_container, std::int32_t page_size,
                    std::unique_ptr<HostNodeRef>&& host_node_ref, std::unique_ptr<DeviceNodeRef>&& node_ref,
                    std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
-                   std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken)
+                   std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken,
+                   std::int64_t pass_epoch)
         : ForwardState(token_container, page_size, std::move(node_ref), std::move(local_kv_allocator),
                        std::move(req_pool_index)),
           host_node_ref_(std::move(host_node_ref)),
           canvas_len_{canvas_len},
-          steps_taken_{steps_taken} {}
+          steps_taken_{steps_taken},
+          pass_epoch_{pass_epoch} {}
 
     DiffusionState(DiffusionState&&) noexcept = default;
     DiffusionState& operator=(DiffusionState&&) noexcept = default;
 
     std::int32_t GetCanvasLen() const { return canvas_len_; }
     std::int32_t GetStepsTaken() const { return steps_taken_; }
+    std::int64_t GetPassEpoch() const { return pass_epoch_; }
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
@@ -344,6 +351,8 @@ private:
 protected:
     std::int32_t canvas_len_{};
     std::int32_t steps_taken_{};
+    // Identity of the most recently scheduled pass (see DiffusionProgress).
+    std::int64_t pass_epoch_{};
 };
 
 // Block-diffusion: each NextExecutionPlan may schedule one denoise pass over
@@ -359,9 +368,10 @@ struct Denoising : public DiffusionState {
     Denoising(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
               std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
               std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken,
-              SubState sub_state)
+              std::int64_t pass_epoch, SubState sub_state)
         : DiffusionState(token_container, page_size, std::move(host_node_ref), std::move(node_ref),
-                         std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken),
+                         std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken,
+                         pass_epoch),
           sub_state_{sub_state} {}
 
     Denoising(Denoising&&) noexcept = default;
@@ -382,6 +392,7 @@ struct Denoising : public DiffusionState {
         return DiffusionProgress{
             .canvas_len = canvas_len_,
             .steps_taken = steps_taken_,
+            .pass_epoch = pass_epoch_,
             .phase = phase,
         };
     }
@@ -404,9 +415,11 @@ struct Committing : public DiffusionState {
 
     Committing(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
-               std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken)
+               std::unique_ptr<ReqPoolIndex>&& req_pool_index, std::int32_t canvas_len, std::int32_t steps_taken,
+               std::int64_t pass_epoch)
         : DiffusionState(token_container, page_size, std::move(host_node_ref), std::move(node_ref),
-                         std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken) {}
+                         std::move(local_kv_allocator), std::move(req_pool_index), canvas_len, steps_taken,
+                         pass_epoch) {}
 
     Committing(Committing&&) noexcept = default;
     Committing& operator=(Committing&&) noexcept = default;
@@ -429,14 +442,18 @@ struct Committing : public DiffusionState {
         return DiffusionProgress{
             .canvas_len = canvas_len_,
             .steps_taken = steps_taken_,
+            .pass_epoch = pass_epoch_,
             .phase = phase,
         };
     }
 
-    void MarkCommitScheduled() {
+    // `pass_epoch` is the scheduler-issued identity of the commit pass; it
+    // replaces the last denoise pass's epoch carried over from Denoising.
+    void MarkCommitScheduled(std::int64_t pass_epoch) {
         if (sub_state_ != SubState::kReady) {
             throw std::logic_error("Committing::MarkCommitScheduled: commit already scheduled for this canvas");
         }
+        pass_epoch_ = pass_epoch;
         sub_state_ = SubState::kInFlight;
     }
 

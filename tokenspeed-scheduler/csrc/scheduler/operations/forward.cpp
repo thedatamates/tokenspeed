@@ -334,7 +334,7 @@ std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* req
         }
     }
 
-    return fsm::ScheduleDenoiseEvent{canvas_len};
+    return fsm::ScheduleDenoiseEvent{canvas_len, request->IssueDiffusionPassEpoch()};
 }
 
 // Block-diffusion: Retracted → Denoising recovery. Mirrors
@@ -367,7 +367,9 @@ std::optional<fsm::ScheduleDenoiseFromRetractedEvent> Scheduler::scheduleDenoise
     }
 
     return fsm::ScheduleDenoiseFromRetractedEvent{
-        canvas_len,    &device_allocator_, &req_pool_allocator_, &kv_prefix_cache_, std::move(match_result),
+        canvas_len,        request->IssueDiffusionPassEpoch(),
+        &device_allocator_, &req_pool_allocator_,
+        &kv_prefix_cache_,  std::move(match_result),
         loadback_diff,
     };
 }
@@ -635,6 +637,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.canvas_len = progress.canvas_len;
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;
+    op.pass_epoch = progress.pass_epoch;
     return op;
 }
 
@@ -662,6 +665,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.canvas_len = progress.canvas_len;
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;  // 0: executor re-inits the canvas
+    op.pass_epoch = progress.pass_epoch;
     return op;
 }
 
@@ -683,6 +687,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.canvas_len = progress.canvas_len;
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;
+    op.pass_epoch = progress.pass_epoch;
     return op;
 }
 
@@ -785,7 +790,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                         break;
                     case Phase::kCommitReady:
                         if (progress.canvas_len <= token_budget) {
-                            push_op(applyEventAndGenerateOp(request, fsm::ScheduleCommitEvent{}));
+                            push_op(applyEventAndGenerateOp(request,
+                                                            fsm::ScheduleCommitEvent{request->IssueDiffusionPassEpoch()}));
                         } else {
                             diffusion_starved = true;
                         }

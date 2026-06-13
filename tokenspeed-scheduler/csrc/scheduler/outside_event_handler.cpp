@@ -166,7 +166,8 @@ void Scheduler::handleEvent(const forward::DenoiseResult& event) {
             throw std::logic_error("Scheduler::handleEvent(DenoiseResult): request is not block-diffusion; id=" +
                                    event.request_id);
         }
-        req->Apply(fsm::DenoiseResultEvent{event.converged, req->GetBlockDiffusionParams().max_denoising_steps});
+        req->Apply(fsm::DenoiseResultEvent{event.converged, req->GetBlockDiffusionParams().max_denoising_steps,
+                                           event.pass_epoch});
     }
 }
 

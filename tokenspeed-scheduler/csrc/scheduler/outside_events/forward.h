@@ -51,9 +51,13 @@ struct Abort {
 // converged=false increments the scheduler's per-canvas step counter;
 // converged=true (or the max_denoising_steps backstop) moves the request to
 // Committing. Commits report the existing ExtendResult/Finish.
+// `pass_epoch` must echo the diffusion_pass_epochs value of the plan row the
+// pass was scheduled by; results echoing a stale epoch (a pass whose canvas
+// was discarded by retraction/restart) are dropped with a warning.
 struct DenoiseResult {
     std::string request_id;
     bool converged{};
+    std::int64_t pass_epoch{};
 };
 }  // namespace forward
 

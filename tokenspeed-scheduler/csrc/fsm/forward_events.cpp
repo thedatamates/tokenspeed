@@ -364,6 +364,7 @@ Denoising ScheduleDenoiseEvent::operator()(PrefillDone&& state) {
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len_,
                      /*steps_taken=*/0,
+                     pass_epoch_,
                      Denoising::SubState::kPassInFlight};
 }
 
@@ -386,6 +387,7 @@ Denoising ScheduleDenoiseEvent::operator()(Committing&& state) {
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len_,
                      /*steps_taken=*/0,
+                     pass_epoch_,
                      Denoising::SubState::kPassInFlight};
 }
 
@@ -405,6 +407,7 @@ Denoising ScheduleDenoiseEvent::operator()(Denoising&& state) {
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len,
                      steps_taken,
+                     pass_epoch_,
                      Denoising::SubState::kPassInFlight};
 }
 
@@ -437,6 +440,7 @@ Denoising ScheduleDenoiseFromRetractedEvent::operator()(Retracted&& state) {
                      std::move(req_pool_index),
                      canvas_len_,
                      /*steps_taken=*/0,
+                     pass_epoch_,
                      Denoising::SubState::kPassInFlight};
 }
 
@@ -444,6 +448,16 @@ Denoising ScheduleDenoiseFromRetractedEvent::operator()(Retracted&& state) {
 // pass. The scheduler owns the step counter; the backstop fires here even for
 // an executor that never reports convergence.
 std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& state) {
+    // Pass identity: a result must echo the epoch its pass was scheduled
+    // with. A mismatch is a stale in-flight result from a discarded canvas
+    // (retract → resume restarts at a fresh epoch); accepting it would
+    // advance the step counter / convergence of the wrong canvas.
+    if (pass_epoch_ != state.GetPassEpoch()) {
+        spdlog::warn("[fsm] Dropping stale DenoiseResult: echoed pass_epoch={} but current pass_epoch={}", pass_epoch_,
+                     state.GetPassEpoch());
+        return std::move(state);
+    }
+
     switch (state.GetSubState()) {
         case Denoising::SubState::kPassReady:
             // Strict one-pass-in-flight: no pass is outstanding, so this
@@ -457,6 +471,7 @@ std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& s
 
     const std::int32_t canvas_len = state.GetCanvasLen();
     const std::int32_t steps_taken = state.GetStepsTaken() + 1;
+    const std::int64_t pass_epoch = state.GetPassEpoch();
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
     auto host_node_ref = std::move(state).TakeHostNodeRef();
@@ -469,7 +484,8 @@ std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& s
                           std::move(local_kv_allocator),
                           std::move(state).TakeReqPoolIndex(),
                           canvas_len,
-                          steps_taken};
+                          steps_taken,
+                          pass_epoch};
     }
     return Denoising{state.GetTokenContainer(),
                      state.GetPageSize(),
@@ -479,7 +495,17 @@ std::variant<Denoising, Committing> DenoiseResultEvent::operator()(Denoising&& s
                      std::move(state).TakeReqPoolIndex(),
                      canvas_len,
                      steps_taken,
+                     pass_epoch,
                      Denoising::SubState::kPassReady};
+}
+
+// A DenoiseResult can never answer a commit pass (commits answer with
+// ExtendResult), so any receipt in Committing is a stale result from a
+// discarded canvas — e.g. the pre-retract pass arriving after the resumed
+// request already converged again.
+Committing DenoiseResultEvent::operator()(Committing&& state) {
+    spdlog::warn("[fsm] Dropping stale DenoiseResult (pass_epoch={}) received while Committing", pass_epoch_);
+    return std::move(state);
 }
 
 // Decode -> Finish / PrefillDone -> Finish

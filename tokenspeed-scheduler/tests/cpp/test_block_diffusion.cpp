@@ -19,6 +19,8 @@
 // SOFTWARE.
 
 #include <algorithm>
+#include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -41,6 +43,7 @@ struct DiffusionRow {
     std::int32_t canvas_len;
     std::int32_t committed_len;
     std::int32_t steps_taken;
+    std::int64_t pass_epoch;
     std::int32_t input_length;
     std::vector<std::int32_t> occupied_pages;
     std::int32_t begin;
@@ -71,13 +74,35 @@ protected:
         return spec;
     }
 
-    void SendDenoiseResult(const std::string& request_id, bool converged) {
+    // Echo an explicit pass_epoch (used by the staleness tests).
+    void SendDenoiseResult(const std::string& request_id, bool converged, std::int64_t pass_epoch) {
         ExecutionEvent event;
         event.With(ForwardEvent{forward::DenoiseResult{
             .request_id = request_id,
             .converged = converged,
+            .pass_epoch = pass_epoch,
         }});
         scheduler_->Advance(std::move(event));
+    }
+
+    // Behave like a correct executor: echo the epoch of the most recent
+    // denoise row scheduled for this request (tracked by PlanOnce below).
+    void SendDenoiseResult(const std::string& request_id, bool converged) {
+        SendDenoiseResult(request_id, converged, last_denoise_epoch_.at(request_id));
+    }
+
+    // Shadows the base helper to record each scheduled denoise pass's epoch,
+    // so tests can echo it like a real executor would.
+    ExecutionPlan PlanOnce() {
+        auto plan = SchedulerTestSuite::PlanOnce();
+        if (const auto* fwd = GetForwardOp(plan)) {
+            for (const auto& row : DiffusionRows(*fwd)) {
+                if (row.kind == DiffusionKind::kDenoise) {
+                    last_denoise_epoch_[row.id] = row.pass_epoch;
+                }
+            }
+        }
+        return plan;
     }
 
     void SendAbort(const std::string& request_id) {
@@ -128,6 +153,7 @@ protected:
                 .canvas_len = fwd.diffusion_canvas_lens[i],
                 .committed_len = fwd.diffusion_committed_lens[i],
                 .steps_taken = fwd.diffusion_steps_taken[i],
+                .pass_epoch = fwd.diffusion_pass_epochs[i],
                 .input_length = fwd.input_lengths[base + i],
                 .occupied_pages = fwd.occupied_pages[base + i],
                 .begin = fwd.begins[base + i],
@@ -154,6 +180,9 @@ protected:
         EXPECT_EQ(rows[0].id, id);
         return rows[0];
     }
+
+    // Epoch of the most recently scheduled denoise pass, per request.
+    std::map<std::string, std::int64_t> last_denoise_epoch_;
 };
 
 // ------------------------------------------------------------
@@ -187,6 +216,7 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.canvas_len, 8);
         EXPECT_EQ(row.committed_len, 4);
         EXPECT_EQ(row.steps_taken, 0);  // executor must init the canvas
+        EXPECT_EQ(row.pass_epoch, 1);   // scheduler-issued pass identity
         EXPECT_EQ(row.input_length, 8);
         EXPECT_EQ(row.occupied_pages.size(), 6u);
         EXPECT_EQ(row.begin, 2);
@@ -200,6 +230,7 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         auto row = PlanSingleDiffusionRow("r1");
         EXPECT_EQ(row.kind, DiffusionKind::kDenoise);
         EXPECT_EQ(row.steps_taken, 1);
+        EXPECT_EQ(row.pass_epoch, 2);  // strictly increasing per pass
         EXPECT_EQ(row.size, 0);
         EXPECT_EQ(row.occupied_pages.size(), 6u);
     }
@@ -212,6 +243,7 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.canvas_len, 8);
         EXPECT_EQ(row.committed_len, 4);
         EXPECT_EQ(row.steps_taken, 2);
+        EXPECT_EQ(row.pass_epoch, 3);  // commit passes consume epochs too
         EXPECT_EQ(row.size, 0);  // commit writes into the existing reservation
         EXPECT_EQ(scheduler_->AvailableKvPages(), baseline - 6);
     }
@@ -220,12 +252,14 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
     SendForwardDone("r1", MakeTokens(8, 100));
     EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), 12);
 
-    // Next canvas: fresh reservation, steps restart at 0.
+    // Next canvas: fresh reservation, steps restart at 0; the pass epoch
+    // keeps increasing across canvases (it identifies passes, not steps).
     {
         auto row = PlanSingleDiffusionRow("r1");
         EXPECT_EQ(row.kind, DiffusionKind::kDenoise);
         EXPECT_EQ(row.committed_len, 12);
         EXPECT_EQ(row.steps_taken, 0);
+        EXPECT_EQ(row.pass_epoch, 4);
         EXPECT_EQ(row.begin, 6);
         EXPECT_EQ(row.size, 4);
         EXPECT_EQ(row.occupied_pages.size(), 10u);
@@ -616,6 +650,7 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_DiscardsCanvas_ResumesFro
         auto plan = PlanOnce();  // both enter canvas 1
         EXPECT_EQ(DiffusionRows(*GetForwardOp(plan)).size(), 2u);
     }
+    const std::int64_t pre_retract_epoch = last_denoise_epoch_.at("r1");
     SendDenoiseResult("r1", true);
     SendDenoiseResult("r2", true);
     PlanOnce();  // both commit
@@ -665,6 +700,7 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_DiscardsCanvas_ResumesFro
 
     // r1 resumes: committed KV loads back, the canvas restarts at step 0 with
     // a fresh reservation; the discarded canvas progress is regenerated.
+    std::int64_t resume_epoch = 0;
     {
         auto plan = PlanOnce();
         auto rows = DiffusionRows(*GetForwardOp(plan));
@@ -676,13 +712,26 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_DiscardsCanvas_ResumesFro
         EXPECT_EQ(rows[0].canvas_len, 8);
         EXPECT_EQ(rows[0].begin, 0);  // fresh slot: full page table republished
         EXPECT_EQ(rows[0].size, static_cast<std::int32_t>(rows[0].occupied_pages.size()));
+        EXPECT_GT(rows[0].pass_epoch, pre_retract_epoch);  // restart = fresh pass identity
+        resume_epoch = rows[0].pass_epoch;
         ASSERT_NE(GetLoadBack(plan), nullptr);  // host → device recovery copies
         EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     }
 
-    // A late DenoiseResult for the discarded canvas must be ignored — send a
-    // fresh result for the restarted canvas and complete the request.
-    SendDenoiseResult("r1", true);
+    // A late DenoiseResult for the discarded canvas must be ignored: it
+    // echoes the pre-retract epoch, so the FSM drops it and the request keeps
+    // waiting for the restarted pass (next plan schedules nothing for r1).
+    SendDenoiseResult("r1", true, pre_retract_epoch);
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), 14);
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_NE(fwd, nullptr);
+        EXPECT_TRUE(fwd->request_ids.empty());
+    }
+
+    // The fresh pass's result (echoing the restarted epoch) is accepted.
+    SendDenoiseResult("r1", true, resume_epoch);
     {
         auto row = PlanSingleDiffusionRow("r1");
         EXPECT_EQ(row.kind, DiffusionKind::kCommit);
@@ -728,6 +777,101 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_StaleDenoiseResultIsDropp
     SendDenoiseResult("r1", false);
     EXPECT_EQ(scheduler_->RetractedSize(), 1u);
     EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), 14);
+}
+
+// Retract a request whose denoise pass is still IN FLIGHT, resume it, then
+// deliver the discarded pass's result. The pre-retract result echoes a stale
+// pass_epoch and must be dropped; only the restarted pass's result advances
+// the canvas.
+TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_MidPass_StaleEpochResultDroppedAfterResume) {
+    Submit(MakeDiffusionSpec("r1", 3, /*canvas_length=*/8, /*max_denoising_steps=*/4, /*max_new_tokens=*/16,
+                             /*start=*/1));
+    Submit(MakeDiffusionSpec("r2", 1, /*canvas_length=*/4, /*max_denoising_steps=*/4, /*max_new_tokens=*/16,
+                             /*start=*/300));
+    PlanOnce();  // prefills
+    {
+        auto plan = PlanOnce();  // both enter canvas 1
+        EXPECT_EQ(DiffusionRows(*GetForwardOp(plan)).size(), 2u);
+    }
+    SendDenoiseResult("r1", true);
+    SendDenoiseResult("r2", true);
+    PlanOnce();  // both commit
+    SendForwardDone("r1", MakeTokens(8, 100));  // r1 committed = 14
+    SendForwardDone("r2", MakeTokens(4, 400));  // r2 committed = 6
+
+    // r1 enters canvas 2 (its reservation still fits); r2's entry starves.
+    std::int64_t in_flight_epoch = 0;
+    {
+        auto plan = PlanOnce();
+        auto rows = DiffusionRows(*GetForwardOp(plan));
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].id, "r1");
+        EXPECT_EQ(rows[0].kind, DiffusionKind::kDenoise);
+        EXPECT_EQ(rows[0].steps_taken, 0);
+        in_flight_epoch = rows[0].pass_epoch;
+    }
+
+    // r2 still cannot enter its canvas → KV pressure. r1 (the longest) is
+    // retracted while its canvas-2 denoise pass is STILL IN FLIGHT.
+    cache_op_id retract_op_id{};
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_NE(fwd, nullptr);
+        EXPECT_TRUE(fwd->request_ids.empty());
+        const auto* wb = GetWriteBack(plan);
+        ASSERT_NE(wb, nullptr);
+        ASSERT_EQ(wb->op_ids.size(), 1u);
+        retract_op_id = wb->op_ids[0];
+        EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    }
+    SendWriteBackDone(retract_op_id);
+    SendAbort("r2");  // clear the field so r1 can resume
+
+    // r1 resumes with a fresh pass identity for the restarted canvas.
+    std::int64_t resume_epoch = 0;
+    {
+        auto plan = PlanOnce();
+        auto rows = DiffusionRows(*GetForwardOp(plan));
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].id, "r1");
+        EXPECT_EQ(rows[0].steps_taken, 0);
+        EXPECT_EQ(rows[0].committed_len, 14);
+        EXPECT_GT(rows[0].pass_epoch, in_flight_epoch);
+        resume_epoch = rows[0].pass_epoch;
+        EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    }
+
+    // The OLD pass's result (scheduled pre-retract, discarded canvas) arrives
+    // now: stale epoch → dropped; r1 keeps waiting for the restarted pass.
+    SendDenoiseResult("r1", true, in_flight_epoch);
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), 14);
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_NE(fwd, nullptr);
+        EXPECT_TRUE(fwd->request_ids.empty());  // still in flight, nothing to schedule
+    }
+
+    // The NEW pass's result is accepted and the request completes normally.
+    SendDenoiseResult("r1", true, resume_epoch);
+    {
+        auto row = PlanSingleDiffusionRow("r1");
+        EXPECT_EQ(row.kind, DiffusionKind::kCommit);
+        EXPECT_EQ(row.steps_taken, 1);
+        EXPECT_GT(row.pass_epoch, resume_epoch);
+    }
+    SendForwardDone("r1", MakeTokens(8, 200));
+    SendFinish("r1");
+    {
+        auto plan = PlanOnce();
+        const auto* wb = GetWriteBack(plan);
+        ASSERT_NE(wb, nullptr);
+        ASSERT_EQ(wb->op_ids.size(), 1u);
+        SendWriteBackDone(wb->op_ids[0]);
+    }
+    PlanOnce();
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
 }
 
 // ------------------------------------------------------------

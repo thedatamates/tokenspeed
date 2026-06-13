@@ -108,6 +108,12 @@ public:
     // max_new_tokens.
     std::int32_t GeneratedSize() const { return token_container_.Size() - token_container_.PrefillSize(); }
 
+    // Issues the identity for the next diffusion pass (denoise or commit).
+    // Lives on the Request (not the FSM state) so it stays strictly
+    // increasing across retraction/resume and canvas restarts — a stale
+    // result echoing a pre-retract epoch can never collide with a fresh pass.
+    std::int64_t IssueDiffusionPassEpoch() { return ++last_diffusion_pass_epoch_; }
+
     fsm::DiffusionProgress GetDiffusionProgress() const {
         return std::visit(Overloaded{
             []<typename T>(const T& s) -> fsm::DiffusionProgress
@@ -310,6 +316,7 @@ private:
     fsm::State state_;
     StorageInfo storage_info_;
     std::optional<BlockDiffusionParams> block_diffusion_;
+    std::int64_t last_diffusion_pass_epoch_{0};
 };
 
 using ConstRequestVector = std::vector<const Request*>;
