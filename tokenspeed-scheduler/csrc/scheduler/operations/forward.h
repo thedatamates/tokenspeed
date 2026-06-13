@@ -102,6 +102,16 @@ struct DiffusionOperation : public ForwardOperationBase {
     // canvases, retractions and restarts. A kDenoise pass's DenoiseResult
     // must echo it; mismatched (stale) results are dropped by the scheduler.
     std::int64_t pass_epoch{};
+    // Explicit KV write span: occupied_pages[write_page_begin ..
+    // write_page_begin + write_page_count) are the only pages this pass may
+    // write KV into. write_page_begin always indexes the first page of the
+    // canvas span [committed_len, committed_len + canvas_len) — everything
+    // from it onward is the (dark) canvas reservation — and write_page_count
+    // is 0 for kDenoise (KV read-only) and the full span for kCommit. A
+    // consumer that ignores DiffusionKind and honors the span cannot write
+    // reservation pages by accident.
+    std::int32_t write_page_begin{};
+    std::int32_t write_page_count{};
 };
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation, DiffusionOperation>;
@@ -130,6 +140,8 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> diffusion_committed_lens;
     std::vector<std::int32_t> diffusion_steps_taken;
     std::vector<std::int64_t> diffusion_pass_epochs;
+    std::vector<std::int32_t> diffusion_write_page_begins;
+    std::vector<std::int32_t> diffusion_write_page_counts;
 
     // Mamba extension (SoA)
     std::vector<std::int32_t> mamba_working_indices;
@@ -193,6 +205,8 @@ struct FlatForwardOperation {
                 diffusion_committed_lens.push_back(diffusion->committed_len);
                 diffusion_steps_taken.push_back(diffusion->steps_taken);
                 diffusion_pass_epochs.push_back(diffusion->pass_epoch);
+                diffusion_write_page_begins.push_back(diffusion->write_page_begin);
+                diffusion_write_page_counts.push_back(diffusion->write_page_count);
             }
         }
         const std::size_t num_reqs = request_ids.size();

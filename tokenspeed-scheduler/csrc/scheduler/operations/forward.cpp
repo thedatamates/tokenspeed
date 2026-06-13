@@ -617,6 +617,18 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     return op;
 }
 
+// Block-diffusion: fill the explicit per-row KV write span (finding: a
+// consumer must not need DiffusionKind to know which occupied_pages are the
+// dark canvas reservation). The span covers the pages holding canvas
+// positions [committed_len, committed_len + canvas_len); only kCommit may
+// write them.
+static void FillDiffusionWriteSpan(DiffusionOperation& op, std::int32_t page_size) {
+    const std::int32_t first_canvas_page = op.committed_len / page_size;
+    const std::int32_t end_canvas_page = (op.committed_len + op.canvas_len + page_size - 1) / page_size;
+    op.write_page_begin = first_canvas_page;
+    op.write_page_count = op.kind == DiffusionKind::kCommit ? end_canvas_page - first_canvas_page : 0;
+}
+
 DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDenoiseEvent event) {
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(std::move(event));
@@ -638,6 +650,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;
     op.pass_epoch = progress.pass_epoch;
+    FillDiffusionWriteSpan(op, config_.page_size);
     return op;
 }
 
@@ -666,6 +679,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;  // 0: executor re-inits the canvas
     op.pass_epoch = progress.pass_epoch;
+    FillDiffusionWriteSpan(op, config_.page_size);
     return op;
 }
 
@@ -688,6 +702,7 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.committed_len = request->TokenSize();
     op.steps_taken = progress.steps_taken;
     op.pass_epoch = progress.pass_epoch;
+    FillDiffusionWriteSpan(op, config_.page_size);
     return op;
 }
 

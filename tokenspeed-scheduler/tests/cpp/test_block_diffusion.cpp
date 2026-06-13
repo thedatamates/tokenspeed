@@ -44,6 +44,8 @@ struct DiffusionRow {
     std::int32_t committed_len;
     std::int32_t steps_taken;
     std::int64_t pass_epoch;
+    std::int32_t write_page_begin;
+    std::int32_t write_page_count;
     std::int32_t input_length;
     std::vector<std::int32_t> occupied_pages;
     std::int32_t begin;
@@ -154,6 +156,8 @@ protected:
                 .committed_len = fwd.diffusion_committed_lens[i],
                 .steps_taken = fwd.diffusion_steps_taken[i],
                 .pass_epoch = fwd.diffusion_pass_epochs[i],
+                .write_page_begin = fwd.diffusion_write_page_begins[i],
+                .write_page_count = fwd.diffusion_write_page_counts[i],
                 .input_length = fwd.input_lengths[base + i],
                 .occupied_pages = fwd.occupied_pages[base + i],
                 .begin = fwd.begins[base + i],
@@ -217,6 +221,8 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.committed_len, 4);
         EXPECT_EQ(row.steps_taken, 0);  // executor must init the canvas
         EXPECT_EQ(row.pass_epoch, 1);   // scheduler-issued pass identity
+        EXPECT_EQ(row.write_page_begin, 2);  // canvas span = the 4 reservation pages
+        EXPECT_EQ(row.write_page_count, 0);  // denoise must not write KV
         EXPECT_EQ(row.input_length, 8);
         EXPECT_EQ(row.occupied_pages.size(), 6u);
         EXPECT_EQ(row.begin, 2);
@@ -244,6 +250,8 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.committed_len, 4);
         EXPECT_EQ(row.steps_taken, 2);
         EXPECT_EQ(row.pass_epoch, 3);  // commit passes consume epochs too
+        EXPECT_EQ(row.write_page_begin, 2);  // commit writes exactly the canvas span
+        EXPECT_EQ(row.write_page_count, 4);
         EXPECT_EQ(row.size, 0);  // commit writes into the existing reservation
         EXPECT_EQ(scheduler_->AvailableKvPages(), baseline - 6);
     }
@@ -260,6 +268,8 @@ TEST_F(BlockDiffusionTestSuite, SingleRequest_FullLifecycle_TwoCanvases) {
         EXPECT_EQ(row.committed_len, 12);
         EXPECT_EQ(row.steps_taken, 0);
         EXPECT_EQ(row.pass_epoch, 4);
+        EXPECT_EQ(row.write_page_begin, 6);
+        EXPECT_EQ(row.write_page_count, 0);
         EXPECT_EQ(row.begin, 6);
         EXPECT_EQ(row.size, 4);
         EXPECT_EQ(row.occupied_pages.size(), 10u);
@@ -477,6 +487,9 @@ TEST_F(BlockDiffusionTestSuite, StopAndFree_TruncatedLastCanvas) {
         auto row = PlanSingleDiffusionRow("r1");
         EXPECT_EQ(row.kind, DiffusionKind::kCommit);
         EXPECT_EQ(row.canvas_len, 4);
+        // Truncated canvas: the write span shrinks with it (2 pages of 4 tokens).
+        EXPECT_EQ(row.write_page_begin, 6);
+        EXPECT_EQ(row.write_page_count, 2);
     }
     SendForwardDone("r1", MakeTokens(4, 200));
     SendFinish("r1");
@@ -872,6 +885,44 @@ TEST_F(BlockDiffusionBackpressureTestSuite, Retraction_MidPass_StaleEpochResultD
     }
     PlanOnce();
     EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
+}
+
+// ------------------------------------------------------------
+//  Explicit write span with an unaligned prompt: the canvas starts mid-page,
+//  so the commit's write span includes the page shared with committed
+//  history while denoise passes still may not write anything.
+// ------------------------------------------------------------
+
+TEST_F(BlockDiffusionTestSuite, WriteSpan_UnalignedPrompt_CoversSharedTailPage) {
+    RequestSpec spec{.request_id = "r1", .tokens = {1, 2, 3}};  // 3 tokens, page_size 2
+    spec.block_diffusion = BlockDiffusionParams{
+        .canvas_length = 8,
+        .max_denoising_steps = 4,
+        .max_new_tokens = 8,
+    };
+    Submit(spec);
+    PlanOnce();  // prefill
+    {
+        auto row = PlanSingleDiffusionRow("r1");
+        EXPECT_EQ(row.kind, DiffusionKind::kDenoise);
+        EXPECT_EQ(row.committed_len, 3);
+        // Canvas covers positions [3, 11) → pages 1..5 of the 6 occupied.
+        EXPECT_EQ(row.occupied_pages.size(), 6u);
+        EXPECT_EQ(row.write_page_begin, 1);
+        EXPECT_EQ(row.write_page_count, 0);  // dark during denoise
+    }
+    SendDenoiseResult("r1", true);
+    {
+        auto row = PlanSingleDiffusionRow("r1");
+        EXPECT_EQ(row.kind, DiffusionKind::kCommit);
+        EXPECT_EQ(row.write_page_begin, 1);  // includes the shared tail page
+        EXPECT_EQ(row.write_page_count, 5);
+    }
+    SendForwardDone("r1", MakeTokens(8, 100));
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
+    EXPECT_EQ(scheduler_->ActiveKvPages(), 0u);
 }
 
 // ------------------------------------------------------------
