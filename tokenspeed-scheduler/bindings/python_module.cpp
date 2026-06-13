@@ -339,6 +339,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("Denoise", tokenspeed::DiffusionKind::kDenoise)
         .value("Commit", tokenspeed::DiffusionKind::kCommit);
 
+    // Joined per-row view (recommended consumer API): the diffusion SoA
+    // columns plus global_row, the row's index into the per-request columns.
+    nb::class_<tokenspeed::DiffusionRowView>(forward, "DiffusionRowView")
+        .def_ro("kind", &tokenspeed::DiffusionRowView::kind)
+        .def_ro("canvas_len", &tokenspeed::DiffusionRowView::canvas_len)
+        .def_ro("committed_len", &tokenspeed::DiffusionRowView::committed_len)
+        .def_ro("steps_taken", &tokenspeed::DiffusionRowView::steps_taken)
+        .def_ro("pass_epoch", &tokenspeed::DiffusionRowView::pass_epoch)
+        .def_ro("canvas_index", &tokenspeed::DiffusionRowView::canvas_index)
+        .def_ro("write_page_begin", &tokenspeed::DiffusionRowView::write_page_begin)
+        .def_ro("write_page_count", &tokenspeed::DiffusionRowView::write_page_count)
+        .def_ro("global_row", &tokenspeed::DiffusionRowView::global_row);
+
     auto flat_fwd_op = nb::class_<tokenspeed::FlatForwardOperation>(forward, "FlatForwardOp");
     BindForwardCommonFields<tokenspeed::FlatForwardOperation>(flat_fwd_op);
     flat_fwd_op.def_ro("input_ids", &tokenspeed::FlatForwardOperation::input_ids)
@@ -375,6 +388,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("diffusion_canvas_indices", &tokenspeed::FlatForwardOperation::diffusion_canvas_indices)
         .def_ro("diffusion_write_page_begins", &tokenspeed::FlatForwardOperation::diffusion_write_page_begins)
         .def_ro("diffusion_write_page_counts", &tokenspeed::FlatForwardOperation::diffusion_write_page_counts)
+        .def("diffusion_rows_begin", &tokenspeed::FlatForwardOperation::diffusion_rows_begin)
+        .def("diffusion_rows", &tokenspeed::FlatForwardOperation::DiffusionRows)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_track_pool_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)

@@ -121,6 +121,24 @@ struct DiffusionOperation : public ForwardOperationBase {
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation, DiffusionOperation>;
 
+// Joined view over one diffusion row of a FlatForwardOperation: the diffusion
+// SoA columns (indexed 0..num_diffusion()) plus `global_row`, the row's index
+// into the per-request columns (request_ids, request_pool_indices,
+// occupied_pages, begins, sizes, input_lengths, paged_cache_block_tables
+// rows, ...). This is the recommended consumer API — it makes the
+// global-row vs diffusion-tail indexing impossible to confuse.
+struct DiffusionRowView {
+    DiffusionKind kind{};
+    std::int32_t canvas_len{};
+    std::int32_t committed_len{};
+    std::int32_t steps_taken{};
+    std::int64_t pass_epoch{};
+    std::int32_t canvas_index{};
+    std::int32_t write_page_begin{};
+    std::int32_t write_page_count{};
+    std::size_t global_row{};
+};
+
 struct FlatForwardOperation {
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
@@ -243,6 +261,41 @@ struct FlatForwardOperation {
     bool empty() const { return request_ids.empty(); }
     std::size_t num_extends() const { return extend_prefix_lens.size(); }
     std::size_t num_diffusion() const { return diffusion_kinds.size(); }
+
+    // Diffusion rows are the batch tail (partition invariant); this is the
+    // global row index of diffusion row 0.
+    std::size_t diffusion_rows_begin() const { return request_ids.size() - num_diffusion(); }
+
+    // Joined view of diffusion row i (i in [0, num_diffusion())).
+    DiffusionRowView DiffusionRowAt(std::size_t i) const {
+        return DiffusionRowView{
+            .kind = diffusion_kinds[i],
+            .canvas_len = diffusion_canvas_lens[i],
+            .committed_len = diffusion_committed_lens[i],
+            .steps_taken = diffusion_steps_taken[i],
+            .pass_epoch = diffusion_pass_epochs[i],
+            .canvas_index = diffusion_canvas_indices[i],
+            .write_page_begin = diffusion_write_page_begins[i],
+            .write_page_count = diffusion_write_page_counts[i],
+            .global_row = diffusion_rows_begin() + i,
+        };
+    }
+
+    std::vector<DiffusionRowView> DiffusionRows() const {
+        std::vector<DiffusionRowView> rows;
+        rows.reserve(num_diffusion());
+        for (std::size_t i = 0; i < num_diffusion(); ++i) {
+            rows.push_back(DiffusionRowAt(i));
+        }
+        return rows;
+    }
+
+    template <typename Fn>
+    void ForEachDiffusionRow(Fn&& fn) const {
+        for (std::size_t i = 0; i < num_diffusion(); ++i) {
+            fn(DiffusionRowAt(i));
+        }
+    }
 
 private:
     template <typename Key>

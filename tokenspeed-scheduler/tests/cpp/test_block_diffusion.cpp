@@ -141,31 +141,32 @@ protected:
         return nullptr;
     }
 
-    // Joins the diffusion SoA columns with the per-request columns. Also
-    // asserts the row partition invariant: diffusion rows are the batch tail.
+    // Joins the diffusion rows with the per-request columns through the
+    // DiffusionRowView consumer API (global_row indexes the per-request
+    // columns). Also asserts the row partition invariant: diffusion rows are
+    // the batch tail.
     static std::vector<DiffusionRow> DiffusionRows(const FlatForwardOperation& fwd) {
-        const std::size_t num_diffusion = fwd.num_diffusion();
-        const std::size_t base = fwd.request_ids.size() - num_diffusion;
-        EXPECT_GE(fwd.request_ids.size(), num_diffusion);
+        EXPECT_GE(fwd.request_ids.size(), fwd.num_diffusion());
+        EXPECT_EQ(fwd.diffusion_rows_begin(), fwd.request_ids.size() - fwd.num_diffusion());
         std::vector<DiffusionRow> rows;
-        for (std::size_t i = 0; i < num_diffusion; ++i) {
+        fwd.ForEachDiffusionRow([&](const DiffusionRowView& view) {
             rows.push_back(DiffusionRow{
-                .id = fwd.request_ids[base + i],
-                .pool_index = fwd.request_pool_indices[base + i],
-                .kind = fwd.diffusion_kinds[i],
-                .canvas_len = fwd.diffusion_canvas_lens[i],
-                .committed_len = fwd.diffusion_committed_lens[i],
-                .steps_taken = fwd.diffusion_steps_taken[i],
-                .pass_epoch = fwd.diffusion_pass_epochs[i],
-                .canvas_index = fwd.diffusion_canvas_indices[i],
-                .write_page_begin = fwd.diffusion_write_page_begins[i],
-                .write_page_count = fwd.diffusion_write_page_counts[i],
-                .input_length = fwd.input_lengths[base + i],
-                .occupied_pages = fwd.occupied_pages[base + i],
-                .begin = fwd.begins[base + i],
-                .size = fwd.sizes[base + i],
+                .id = fwd.request_ids[view.global_row],
+                .pool_index = fwd.request_pool_indices[view.global_row],
+                .kind = view.kind,
+                .canvas_len = view.canvas_len,
+                .committed_len = view.committed_len,
+                .steps_taken = view.steps_taken,
+                .pass_epoch = view.pass_epoch,
+                .canvas_index = view.canvas_index,
+                .write_page_begin = view.write_page_begin,
+                .write_page_count = view.write_page_count,
+                .input_length = fwd.input_lengths[view.global_row],
+                .occupied_pages = fwd.occupied_pages[view.global_row],
+                .begin = fwd.begins[view.global_row],
+                .size = fwd.sizes[view.global_row],
             });
-        }
+        });
         return rows;
     }
 
