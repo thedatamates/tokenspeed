@@ -178,9 +178,13 @@ struct ScheduleDenoiseEvent : InvalidTransitionHandler<ScheduleDenoiseEvent> {
 
     // `pass_epoch` is the scheduler-issued identity of the pass being
     // scheduled (Request::IssueDiffusionPassEpoch); the executor must echo it
-    // in the DenoiseResult.
-    ScheduleDenoiseEvent(std::int32_t canvas_len, std::int64_t pass_epoch)
-        : canvas_len_(canvas_len), pass_epoch_(pass_epoch) {}
+    // in the DenoiseResult. With the hybrid prefix cache configured
+    // (History-family paged cache groups), canvas entry inserts the committed
+    // full pages (except-last convention) into the radix tree so paged-cache
+    // snapshots can be committed at history-alignment boundaries.
+    ScheduleDenoiseEvent(std::int32_t canvas_len, std::int64_t pass_epoch,
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+        : canvas_len_(canvas_len), pass_epoch_(pass_epoch), hybrid_prefix_cache_(hybrid_prefix_cache) {}
 
     // Canvas entry: reserve ceil-page coverage for canvas_len tokens so the
     // eventual commit cannot fail, then start at step 0 (executor inits canvas).
@@ -192,6 +196,7 @@ struct ScheduleDenoiseEvent : InvalidTransitionHandler<ScheduleDenoiseEvent> {
 private:
     std::int32_t canvas_len_{};
     std::int64_t pass_epoch_{};
+    HybridPrefixCache* hybrid_prefix_cache_{};
 };
 
 // Block-diffusion: Retracted → Denoising recovery (mirrors

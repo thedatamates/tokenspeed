@@ -308,7 +308,8 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 // page-coverage for canvas_len tokens up front so the eventual commit can
 // never fail; a continuing pass allocates nothing. Every diffusion row costs
 // canvas_len forward tokens against max_scheduled_tokens.
-std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* request, std::int32_t remaining) {
+std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* request, std::int32_t remaining,
+                                                                    std::map<std::string, std::int32_t>& simulated_free) {
     const auto& params = request->GetBlockDiffusionParams();
 
     std::int32_t canvas_len = 0;
@@ -332,9 +333,18 @@ std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* req
         if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(pages_needed)) {
             return {};
         }
+        // Paged-cache groups: admit growth to cover the canvas span before
+        // reserving, so a converged canvas can never fail its commit on
+        // group-pool pressure either.
+        const std::int32_t first_pos = request->TokenSize();
+        if (hybrid_prefix_cache_ &&
+            !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, first_pos + canvas_len, simulated_free)) {
+            return {};
+        }
     }
 
-    return fsm::ScheduleDenoiseEvent{canvas_len, request->IssueDiffusionPassEpoch()};
+    return fsm::ScheduleDenoiseEvent{canvas_len, request->IssueDiffusionPassEpoch(),
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
 
 // Block-diffusion: Retracted → Denoising recovery. Mirrors
@@ -342,6 +352,19 @@ std::optional<fsm::ScheduleDenoiseEvent> Scheduler::scheduleDenoise(Request* req
 // host-only pages, and reserve a fresh canvas. The canvas restarts at step 0.
 std::optional<fsm::ScheduleDenoiseFromRetractedEvent> Scheduler::scheduleDenoiseFromRetracted(Request* request,
                                                                                               std::int32_t remaining) {
+    if (hybrid_prefix_cache_) {
+        // Unreachable in practice: with paged-cache groups configured, the
+        // KV-pressure path aborts diffusion victims instead of retracting
+        // them (Phase-1 snapshot-only restore cannot rebuild group rows over
+        // the full committed history; see contract doc 7b). Defensive guard
+        // mirroring the lost-Mamba-state precedent above.
+        spdlog::warn(
+            "[Scheduler] Retracted block-diffusion request {} cannot be resumed with paged-cache groups configured, "
+            "aborting request",
+            request->Id());
+        request->Apply(fsm::AbortEvent{});
+        return {};
+    }
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
 
     const auto& params = request->GetBlockDiffusionParams();
@@ -630,6 +653,7 @@ static void FillDiffusionWriteSpan(DiffusionOperation& op, std::int32_t page_siz
 }
 
 DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDenoiseEvent event) {
+    const bool entering_canvas = !request->Is<fsm::Denoising>();
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(std::move(event));
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
@@ -651,6 +675,20 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.steps_taken = progress.steps_taken;
     op.pass_epoch = progress.pass_epoch;
     FillDiffusionWriteSpan(op, config_.page_size);
+    // Paged-cache groups. Order: attach, acquire, populate (matches the AR
+    // decode path). On canvas entry the event inserted the committed full
+    // pages into the radix tree; CommitChunk publishes snapshots at
+    // history-alignment boundaries over them ("snapshot/insert on commit
+    // boundaries"). AcquireForRequest grows the per-group tables to cover the
+    // canvas span and drives the sliding-window release from the committed
+    // length (first_raw_position_of_op = committed_len).
+    if (hybrid_prefix_cache_) {
+        if (entering_canvas) {
+            hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
+        }
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.committed_len, op.committed_len + op.canvas_len);
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 
@@ -703,6 +741,11 @@ DiffusionOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sch
     op.steps_taken = progress.steps_taken;
     op.pass_epoch = progress.pass_epoch;
     FillDiffusionWriteSpan(op, config_.page_size);
+    // Paged-cache groups: the canvas span was acquired/admitted at canvas
+    // entry; the commit pass only needs the block tables republished.
+    if (hybrid_prefix_cache_) {
+        hybrid_prefix_cache_->PopulateOp(op);
+    }
     return op;
 }
 
@@ -788,7 +831,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
 
             if (request->Is<fsm::PrefillDone>()) {
                 // First canvas entry.
-                if (auto ev = scheduleDenoise(request, token_budget)) {
+                if (auto ev = scheduleDenoise(request, token_budget, simulated_free)) {
                     push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                 } else {
                     diffusion_starved = true;
@@ -819,7 +862,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                             // transition directly — the planner never
                             // re-enters the outside-event path.
                             finishForward(request);
-                        } else if (auto ev = scheduleDenoise(request, token_budget)) {
+                        } else if (auto ev = scheduleDenoise(request, token_budget, simulated_free)) {
                             // Next canvas (fresh reservation, steps_taken = 0).
                             push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                         } else {
@@ -828,7 +871,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                         break;
                     case Phase::kDenoisePassReady:
                         // One more pass over the current canvas.
-                        if (auto ev = scheduleDenoise(request, token_budget)) {
+                        if (auto ev = scheduleDenoise(request, token_budget, simulated_free)) {
                             push_op(applyEventAndGenerateOp(request, std::move(*ev)));
                         } else {
                             diffusion_starved = true;
@@ -896,6 +939,20 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             Request* victim =
                 *std::max_element(retract_candidates.begin(), retract_candidates.end(),
                                   [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
+            if (victim->IsBlockDiffusion() && hybrid_prefix_cache_) {
+                // Paged-cache groups have no host tier: retraction would demote
+                // the committed KV to host while the group rows beyond the last
+                // snapshot are unrecoverable under the Phase-1 snapshot-only
+                // restore policy, so resume could never be correct. Degrade to
+                // abort (mirrors the lost-Mamba-state and retract-failure
+                // precedents); see contract doc 7b for the exact wall.
+                spdlog::warn(
+                    "[Scheduler] KV pressure: block-diffusion request {} is not retractable with paged-cache groups "
+                    "configured (snapshot-only restore), aborting request",
+                    victim->Id());
+                victim->Apply(fsm::AbortEvent{});
+                return {std::vector<ForwardOperation>{}, std::vector<WriteBackOperation>{}};
+            }
             std::vector<WriteBackOperation> wb_ops;
             if (auto op = newRetractOperation(victim)) {
                 wb_ops.push_back(std::move(*op));

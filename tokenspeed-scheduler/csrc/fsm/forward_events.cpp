@@ -345,15 +345,20 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
                     std::move(local_mamba_allocator)};
 }
 
-// PrefillDone -> Denoising: enter the first canvas. The prefill pages stay in
-// the local allocator (vanilla path: radix insert happens at finish/retract,
-// mirroring ScheduleDecodeEvent); the canvas reservation is acquired here so
-// the eventual commit cannot fail.
+// PrefillDone -> Denoising: enter the first canvas. On the vanilla path the
+// prefill pages stay in the local allocator (radix insert happens at
+// finish/retract, mirroring ScheduleDecodeEvent); with the hybrid prefix
+// cache the committed full pages are inserted here (except-last convention:
+// the page holding the final committed token stays local) so paged-cache
+// snapshots can attach at history-alignment boundaries. The canvas
+// reservation is acquired here so the eventual commit cannot fail.
 Denoising ScheduleDenoiseEvent::operator()(PrefillDone&& state) {
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
     auto host_node_ref = std::move(state).TakeHostNodeRef();
 
+    InsertHybridCache(hybrid_prefix_cache_, state.GetFullPagedTokens(true), device_node_ref, local_kv_allocator.get(),
+                      /*local_mamba_allocator=*/nullptr, /*chunk_begin=*/0, /*chunk_size=*/0, state.GetPageSize());
     local_kv_allocator->Acquire(canvas_len_);
 
     return Denoising{state.GetTokenContainer(),
@@ -371,12 +376,17 @@ Denoising ScheduleDenoiseEvent::operator()(PrefillDone&& state) {
 // Committing -> Denoising: the committed canvas became request history
 // (ExtendResult already appended the tokens); reserve the next canvas and
 // restart the step counter. steps_taken == 0 tells the executor to
-// reinitialize its canvas scratch.
+// reinitialize its canvas scratch. With the hybrid prefix cache, the newly
+// committed full pages are inserted into the radix tree (except-last) — this
+// is the "snapshot/insert on commit boundaries" hook: the scheduler-side
+// CommitChunk that follows publishes paged-cache snapshots over them.
 Denoising ScheduleDenoiseEvent::operator()(Committing&& state) {
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
     auto host_node_ref = std::move(state).TakeHostNodeRef();
 
+    InsertHybridCache(hybrid_prefix_cache_, state.GetFullPagedTokens(true), device_node_ref, local_kv_allocator.get(),
+                      /*local_mamba_allocator=*/nullptr, /*chunk_begin=*/0, /*chunk_size=*/0, state.GetPageSize());
     local_kv_allocator->Acquire(canvas_len_);
 
     return Denoising{state.GetTokenContainer(),

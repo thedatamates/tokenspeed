@@ -186,11 +186,28 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
                     "unsupported); id=" +
                     spec.request_id);
             }
-            if (hybrid_prefix_cache_.has_value()) {
+            // Hybrid-prefix-cache compatibility: committed diffusion KV is
+            // ordinary history KV, so History-family paged cache groups
+            // (FullHistory and SlidingWindow retention — e.g. the Gemma
+            // full+sliding layout) are supported. State-family adjuncts are
+            // genuinely incompatible: their executor state is keyed to the
+            // AR decode flow and cannot be discarded/recomputed per canvas.
+            if (hybrid_prefix_cache_.has_value() && hybrid_prefix_cache_->HasMambaAdjunct()) {
                 throw std::invalid_argument(
-                    "Scheduler::SubmitRequests: block_diffusion is unsupported with the hybrid prefix cache "
-                    "(mamba/paged-cache-group adjuncts); id=" +
+                    "Scheduler::SubmitRequests: block_diffusion is unsupported with the Mamba adjunct "
+                    "(recurrent-state checkpoints are coupled to the AR prefill/decode flow); id=" +
                     spec.request_id);
+            }
+            for (const auto& group : config_.paged_cache_groups) {
+                if (group.family == PagedCacheGroupFamily::State) {
+                    throw std::invalid_argument(
+                        "Scheduler::SubmitRequests: block_diffusion is unsupported with State-family paged cache "
+                        "group '" +
+                        group.group_id +
+                        "' (trailing-window executor state cannot be restored across canvas restarts); "
+                        "History-family groups (FullHistory or SlidingWindow retention) are supported; id=" +
+                        spec.request_id);
+                }
             }
         }
         auto req = std::make_unique<Request>(spec, config_.page_size, config_.role);

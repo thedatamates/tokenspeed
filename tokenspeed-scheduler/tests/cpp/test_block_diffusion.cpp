@@ -926,6 +926,240 @@ TEST_F(BlockDiffusionTestSuite, WriteSpan_UnalignedPrompt_CoversSharedTailPage) 
 }
 
 // ------------------------------------------------------------
+//  Paged-cache groups (hybrid prefix cache, History family): per-row block
+//  tables, snapshot publication at canvas commit boundaries, sliding-window
+//  release driven by the committed length, and the Phase-1 KV-pressure
+//  degrade (abort instead of retract; see contract doc §7b).
+// ------------------------------------------------------------
+
+class BlockDiffusionPagedCacheTestSuite : public BlockDiffusionTestSuite {
+protected:
+    static constexpr std::int32_t kLcm = 4;  // lcm(fh raw 4, swa raw 2)
+    static constexpr std::int32_t kSlidingWindow = 8;
+    static constexpr std::int32_t kGroupPages = 32;
+
+    SchedulerConfig MakeConfig() override {
+        auto cfg = BlockDiffusionTestSuite::MakeConfig();  // page_size 2, l2 disabled
+
+        PagedCacheGroupConfig fh{};
+        fh.group_id = "fh";
+        fh.rows_per_page = 4;
+        fh.entry_stride_tokens = 1;
+        fh.total_pages = kGroupPages;
+        fh.retention = PagedCacheGroupConfig::Retention::FullHistory;
+        cfg.paged_cache_groups.push_back(fh);
+
+        PagedCacheGroupConfig swa{};
+        swa.group_id = "swa";
+        swa.rows_per_page = 2;
+        swa.entry_stride_tokens = 1;
+        swa.total_pages = kGroupPages;
+        swa.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        swa.sliding_window_tokens = kSlidingWindow;
+        cfg.paged_cache_groups.push_back(swa);
+
+        PrefixCacheAdjunctSpec spec{};
+        spec.required_groups = {"fh", "swa"};
+        cfg.prefix_cache_adjunct = spec;
+        return cfg;
+    }
+};
+
+// A diffusion request committing multiple canvases against mixed
+// full-history + sliding-window groups: every diffusion row carries the
+// per-group block tables, the sliding group's released-from-front base
+// offset follows the committed length, and finished canvases leave
+// paged-cache snapshots behind (prefix-cache reuse), with everything else
+// returned to the group pools.
+TEST_F(BlockDiffusionPagedCacheTestSuite, MultiCanvas_BlockTables_SlidingRelease_SnapshotsPublished) {
+    const auto fh_baseline = scheduler_->PagedCacheGroupAvailablePages("fh");
+    const auto swa_baseline = scheduler_->PagedCacheGroupAvailablePages("swa");
+    // prompt 4 tokens, CL=8, 3 canvases (max_new_tokens 24).
+    Submit(MakeDiffusionSpec("r1", /*num_prompt_pages=*/2, /*canvas_length=*/8, /*max_denoising_steps=*/4,
+                             /*max_new_tokens=*/24));
+    PlanOnce();  // prefill
+
+    // Canvas 1 entry: group tables cover [0, committed + CL) = [0, 12).
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_NE(fwd, nullptr);
+        auto rows = DiffusionRows(*fwd);
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].kind, DiffusionKind::kDenoise);
+        ASSERT_EQ(fwd->paged_cache_block_tables.count("fh"), 1u);
+        ASSERT_EQ(fwd->paged_cache_block_tables.count("swa"), 1u);
+        // fh: ceil(12 / 4) = 3 pages; swa: ceil(12 / 2) = 6 live pages, base 0.
+        EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "fh").size(), 3u);
+        EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "swa").size(), 6u);
+        EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 0);
+        const auto& fh_table = fwd->paged_cache_block_tables.at("fh");
+        ASSERT_EQ(fh_table.size(), 1u);  // one batch row
+        EXPECT_GE(fh_table[0].size(), 3u);
+    }
+    SendDenoiseResult("r1", true);
+    PlanOnce();                                  // commit pass (block tables republished)
+    SendForwardDone("r1", MakeTokens(8, 100));   // committed = 12
+
+    // Canvas 2 entry: sliding release driven by committed length — window
+    // lower bound 12-8+1=5 → swa drops pages below logical page 2.
+    {
+        auto plan = PlanOnce();
+        auto rows = DiffusionRows(*GetForwardOp(plan));
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].committed_len, 12);
+        EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 2);
+        EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "fh").size(), 5u);   // ceil(20/4)
+        EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "swa").size(), 8u);  // 10 - 2 released
+    }
+    SendDenoiseResult("r1", true);
+    PlanOnce();
+    SendForwardDone("r1", MakeTokens(8, 200));  // committed = 20
+
+    // Canvas 3 entry: lower bound 20-8+1=13 → base logical page 6; the plan
+    // row's compact table pairs with the base offset.
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        auto rows = DiffusionRows(*fwd);
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].committed_len, 20);
+        EXPECT_EQ(scheduler_->GetRequestPagedCacheBaseLogicalPage("r1", "swa"), 6);
+        ASSERT_EQ(fwd->paged_cache_block_table_base_offsets.count("swa"), 1u);
+        EXPECT_EQ(fwd->paged_cache_block_table_base_offsets.at("swa").back(), 6);
+        EXPECT_EQ(scheduler_->GetRequestPagedCachePageIds("r1", "fh").size(), 7u);  // ceil(28/4)
+    }
+    SendDenoiseResult("r1", true);
+    PlanOnce();
+    SendForwardDone("r1", MakeTokens(8, 300));  // committed = 28 → budget spent
+
+    PlanOnce();  // scheduler-enforced finish at max_new_tokens
+    PlanOnce();  // release + erase
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
+    EXPECT_TRUE(scheduler_->GetRequestPagedCachePageIds("r1", "fh").empty());
+
+    // Snapshot/insert on commit boundaries: canvas entries inserted the
+    // committed pages into the radix tree and published paged-cache snapshots
+    // at history-alignment (LCM=4) boundaries up to depth 16 (except-last
+    // keeps the final committed page out of the tree mid-run). Those snapshot
+    // pages stay resident for prefix reuse; every other group page returned.
+    EXPECT_EQ(scheduler_->PagedCacheGroupAvailablePages("fh"), fh_baseline - 4);   // 16/4
+    EXPECT_EQ(scheduler_->PagedCacheGroupAvailablePages("swa"), swa_baseline - 8);  // 16/2
+    EXPECT_EQ(scheduler_->ActiveKvPages(), 0u);
+}
+
+// KV pressure with paged-cache groups configured: a diffusion victim is
+// aborted, not retracted — paged-cache group rows beyond the last snapshot
+// cannot be restored under the Phase-1 snapshot-only policy, so a retract
+// could never resume correctly (contract doc §7b). Survivors then proceed.
+class BlockDiffusionPagedCachePressureTestSuite : public BlockDiffusionPagedCacheTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = BlockDiffusionPagedCacheTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 16;  // 15 usable
+        return cfg;
+    }
+};
+
+TEST_F(BlockDiffusionPagedCachePressureTestSuite, KvPressure_DiffusionVictimAbortsInsteadOfRetract) {
+    Submit(MakeDiffusionSpec("r1", 3, /*canvas_length=*/8, /*max_denoising_steps=*/4, /*max_new_tokens=*/16,
+                             /*start=*/1));
+    Submit(MakeDiffusionSpec("r2", 1, /*canvas_length=*/4, /*max_denoising_steps=*/4, /*max_new_tokens=*/8,
+                             /*start=*/300));
+    PlanOnce();  // prefills
+    {
+        auto plan = PlanOnce();  // both enter canvas 1
+        EXPECT_EQ(DiffusionRows(*GetForwardOp(plan)).size(), 2u);
+    }
+    const std::int64_t r1_in_flight_epoch = last_denoise_epoch_.at("r1");
+    SendDenoiseResult("r1", true);
+    SendDenoiseResult("r2", true);
+    PlanOnce();  // both commit
+    SendForwardDone("r1", MakeTokens(8, 100));  // r1 committed = 14
+    SendForwardDone("r2", MakeTokens(4, 400));  // r2 committed = 6
+
+    // r1 enters canvas 2 (its pass goes in flight); r2's canvas-2 entry starves.
+    {
+        auto plan = PlanOnce();
+        auto rows = DiffusionRows(*GetForwardOp(plan));
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].id, "r1");
+    }
+
+    // Pressure round: no row schedulable. With paged-cache groups the victim
+    // (r1, the longest) is aborted outright — no retract writeback, nothing
+    // left in Retracted.
+    {
+        auto plan = PlanOnce();
+        const auto* fwd = GetForwardOp(plan);
+        ASSERT_NE(fwd, nullptr);
+        EXPECT_TRUE(fwd->request_ids.empty());
+        EXPECT_EQ(GetWriteBack(plan), nullptr);
+        EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    }
+    // A late result for the aborted in-flight pass is dropped harmlessly.
+    SendDenoiseResult("r1", true, r1_in_flight_epoch);
+
+    // r1 is gone; its pages fund r2's canvas 2, which runs to completion.
+    {
+        auto plan = PlanOnce();
+        EXPECT_EQ(scheduler_->GetRequestTokenSize("r1"), -1);
+        auto rows = DiffusionRows(*GetForwardOp(plan));
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0].id, "r2");
+        EXPECT_EQ(rows[0].committed_len, 6);
+        EXPECT_EQ(rows[0].steps_taken, 0);
+    }
+    SendDenoiseResult("r2", true);
+    PlanOnce();  // commit
+    SendForwardDone("r2", MakeTokens(4, 500));  // committed = 10 → generated 8 = budget
+    PlanOnce();                                 // scheduler-enforced finish
+    PlanOnce();                                 // release + erase
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("r2"), -1);
+    EXPECT_EQ(scheduler_->ActiveKvPages(), 0u);
+}
+
+// Submit-time rejection of the genuinely incompatible adjuncts: Mamba and
+// State-family paged cache groups. AR requests stay accepted.
+class BlockDiffusionMambaRejectTestSuite : public BlockDiffusionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = BlockDiffusionTestSuite::MakeConfig();
+        cfg.enable_mamba = true;
+        cfg.mamba_pool_total_chunks = 4;
+        return cfg;
+    }
+};
+
+TEST_F(BlockDiffusionMambaRejectTestSuite, Submit_RejectsMambaAdjunct) {
+    EXPECT_THROW(Submit(MakeDiffusionSpec("d1", 2, 8, 4, 16)), std::invalid_argument);
+    Submit(MakeRequestSpec("a1", 2));  // AR unaffected
+}
+
+class BlockDiffusionStateGroupRejectTestSuite : public BlockDiffusionPagedCacheTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = BlockDiffusionPagedCacheTestSuite::MakeConfig();
+        PagedCacheGroupConfig st{};
+        st.group_id = "st";
+        st.rows_per_page = 2;
+        st.entry_stride_tokens = 1;
+        st.total_pages = kGroupPages;
+        st.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        st.sliding_window_tokens = kSlidingWindow;
+        st.family = PagedCacheGroupFamily::State;
+        cfg.paged_cache_groups.push_back(st);
+        cfg.prefix_cache_adjunct->required_groups.push_back("st");
+        return cfg;
+    }
+};
+
+TEST_F(BlockDiffusionStateGroupRejectTestSuite, Submit_RejectsStateFamilyGroup) {
+    EXPECT_THROW(Submit(MakeDiffusionSpec("d1", 2, 8, 4, 16)), std::invalid_argument);
+    Submit(MakeRequestSpec("a1", 2));  // AR unaffected
+}
+
+// ------------------------------------------------------------
 //  Submit-time validation of BlockDiffusionParams.
 // ------------------------------------------------------------
 

@@ -109,8 +109,10 @@ private:
     std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
         Request* request, std::map<std::string, std::int32_t>& simulated_free);
     // Block-diffusion: schedule one denoise pass (canvas entry acquires the
-    // per-canvas page reservation). remaining = forward-token budget left.
-    std::optional<fsm::ScheduleDenoiseEvent> scheduleDenoise(Request* request, std::int32_t remaining);
+    // per-canvas page reservation and admits the paged-cache-group growth).
+    // remaining = forward-token budget left.
+    std::optional<fsm::ScheduleDenoiseEvent> scheduleDenoise(Request* request, std::int32_t remaining,
+                                                             std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleDenoiseFromRetractedEvent> scheduleDenoiseFromRetracted(Request* request,
                                                                                        std::int32_t remaining);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
