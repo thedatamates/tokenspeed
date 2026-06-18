@@ -268,7 +268,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::ExtendResult::request_id)
-        .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens);
+        .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens)
+        .def_rw("token_logprobs", &tokenspeed::forward::ExtendResult::token_logprobs);
 
     nb::class_<tokenspeed::forward::Finish>(forward_event, "Finish")
         .def(nb::init<>())

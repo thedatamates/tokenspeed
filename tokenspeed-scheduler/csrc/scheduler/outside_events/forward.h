@@ -32,6 +32,9 @@ struct ExtendResult {
     // Tokens whose KV has already become stable request history.
     // token placeholder should be removed in python
     std::vector<std::int32_t> tokens;
+    // Optional sampled-token logprobs aligned with tokens. The scheduler does
+    // not consume them; higher-level API adapters use them for rollout records.
+    std::vector<float> token_logprobs;
 };
 
 struct Finish {
