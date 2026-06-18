@@ -27,6 +27,11 @@
 
 namespace tokenspeed {
 namespace forward {
+struct TopLogprobEntry {
+    std::int32_t token_id{};
+    float logprob{};
+};
+
 struct ExtendResult {
     std::string request_id;
     // Tokens whose KV has already become stable request history.
@@ -35,6 +40,9 @@ struct ExtendResult {
     // Optional sampled-token logprobs aligned with tokens. The scheduler does
     // not consume them; higher-level API adapters use them for rollout records.
     std::vector<float> token_logprobs;
+    // Optional top-logprob payloads aligned with tokens. Each inner vector is
+    // sorted by descending logprob and bounded by the API adapter that emits it.
+    std::vector<std::vector<TopLogprobEntry>> top_logprobs;
 };
 
 struct Finish {
