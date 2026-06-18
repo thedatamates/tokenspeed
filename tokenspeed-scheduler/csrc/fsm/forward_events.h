@@ -393,6 +393,11 @@ struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTo
 
     explicit UpdateReserveNumTokensEvent(std::int32_t new_value) : new_value_(new_value) {}
 
+    PrefillDone operator()(PrefillDone&& state) {
+        state.SetReserveNumTokensInNextScheduleEvent(new_value_);
+        return std::move(state);
+    }
+
     Decoding operator()(Decoding&& state) {
         state.SetReserveNumTokensInNextScheduleEvent(new_value_);
         return std::move(state);

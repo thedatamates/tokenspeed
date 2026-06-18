@@ -221,8 +221,8 @@ struct PrefillDone : public ForwardState {
     PrefillDone(PrefillDone&& state) noexcept = default;
     PrefillDone& operator=(PrefillDone&&) noexcept = default;
 
-    // As a design decision, SetReserveNumTokensInNextScheduleEvent is not allowed
     std::int32_t GetReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    void SetReserveNumTokensInNextScheduleEvent(std::int32_t n) { reserve_num_tokens_in_next_schedule_event_ = n; }
 
     std::span<const std::int32_t> PrefillInputIds() const { return token_container_->GetTokenSlice(window); }
 
