@@ -69,6 +69,15 @@ struct PrefillOperation : public ForwardOperationBase {
 
 struct DecodeOperation : public ForwardOperationBase {
     std::int32_t decode_input_id = -1;
+    // Optional expanded decode inputs, one token per query row. Multi-token
+    // target-verify rows use [previous_token, draft_0, ..., draft_{q-2}].
+    // Empty preserves the legacy scalar decode_input_id contract.
+    std::vector<std::int32_t> decode_input_ids;
+    // Optional MTP draft tokens aligned to this row's target predictions.
+    // For q target rows this carries q draft positions; the executor compares
+    // target_i with draft_i and commits the accepted prefix plus the first
+    // target replacement on rejection.
+    std::vector<std::int32_t> spec_draft_token_ids;
     // For retraction recover
     std::int32_t hist_token_len = -1;
 };
@@ -154,6 +163,7 @@ struct FlatForwardOperation {
     std::vector<std::int32_t> shifted_input_ids;
     std::vector<std::int32_t> extend_prefix_lens;
     std::vector<std::int32_t> decode_input_ids;
+    std::vector<std::int32_t> spec_draft_token_ids;
     std::vector<std::int32_t> hist_token_lens;
 
     // Block-diffusion rows (SoA, len = num_diffusion(), indexed after the
@@ -221,7 +231,16 @@ struct FlatForwardOperation {
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
-                decode_input_ids.push_back(decode->decode_input_id);
+                if (decode->decode_input_ids.empty()) {
+                    decode_input_ids.push_back(decode->decode_input_id);
+                } else {
+                    decode_input_ids.insert(decode_input_ids.end(),
+                                            decode->decode_input_ids.begin(),
+                                            decode->decode_input_ids.end());
+                }
+                spec_draft_token_ids.insert(spec_draft_token_ids.end(),
+                                            decode->spec_draft_token_ids.begin(),
+                                            decode->spec_draft_token_ids.end());
                 hist_token_lens.push_back(decode->hist_token_len);
             } else if (auto* diffusion = std::get_if<DiffusionOperation>(&op)) {
                 diffusion_kinds.push_back(diffusion->kind);
@@ -261,6 +280,7 @@ struct FlatForwardOperation {
     bool empty() const { return request_ids.empty(); }
     std::size_t num_extends() const { return extend_prefix_lens.size(); }
     std::size_t num_diffusion() const { return diffusion_kinds.size(); }
+    std::size_t num_decodes() const { return request_ids.size() - num_extends() - num_diffusion(); }
 
     // Diffusion rows are the batch tail (partition invariant); this is the
     // global row index of diffusion row 0.

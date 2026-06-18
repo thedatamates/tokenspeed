@@ -365,6 +365,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::FlatForwardOperation::decode_input_ids)
+        .def_ro("spec_draft_token_ids", &tokenspeed::FlatForwardOperation::spec_draft_token_ids)
         .def_rw("hist_token_lens", &tokenspeed::FlatForwardOperation::hist_token_lens)
         .def_prop_ro(
             "paged_cache_block_tables",
