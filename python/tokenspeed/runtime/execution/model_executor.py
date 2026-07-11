@@ -31,6 +31,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.engine.scheduler_utils import (
+    flat_block_tables_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
 )
@@ -51,6 +52,9 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.paged_attention import (
+    validate_paged_cache_group_ids,
+)
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -150,7 +154,6 @@ class ModelExecutorConfig:
     # Force the synchronous eager grammar fallback even on CUDA. For
     # parity-testing the captured-grammar path.
     disable_capturable_grammar: bool = False
-    mamba_cache_chunk_size: int = 64
 
     # ====== PREFILL CUDA GRAPH (breakable) =========
     disable_prefill_graph: bool = False
@@ -211,7 +214,6 @@ class ModelExecutorConfig:
             use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
-            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
         )
 
 
@@ -386,6 +388,16 @@ class ModelExecutor:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
                 req_to_page=self.req_to_page,
+            )
+
+        validate_paged_cache_group_ids(
+            model_runner.model,
+            token_to_kv_pool.paged_cache_group_specs,
+        )
+        if draft_model_runner is not None and draft_token_to_kv_pool is not None:
+            validate_paged_cache_group_ids(
+                draft_model_runner.model,
+                draft_token_to_kv_pool.paged_cache_group_specs,
             )
 
         processor = self.model_runner.model.logits_processor
@@ -1120,6 +1132,8 @@ class ModelExecutor:
                 )
                 if rid not in self._seen_prefill_ids
             )
+            if len(self._seen_prefill_ids) > 100_000:
+                self._seen_prefill_ids.clear()  # log-dedup only; bound the growth
             self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
             logger.info(
                 "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "
@@ -1756,6 +1770,11 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
+                    flat_block_tables = flat_block_tables_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
                     (
                         paged_cache_block_table_base_offsets,
                         _paged_cache_block_table_base_offset_max,
@@ -1796,6 +1815,7 @@ class ModelExecutor:
                         paged_cache_block_table_base_offsets=(
                             paged_cache_block_table_base_offsets
                         ),
+                        flat_block_tables=flat_block_tables,
                         **mamba_kwargs,
                     )
                     if timing_enabled:
