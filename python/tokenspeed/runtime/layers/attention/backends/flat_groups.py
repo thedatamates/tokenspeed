@@ -77,6 +77,21 @@ class FlatCacheGroupsMixin:
             layer, metadata.out_cache_locs, "flat write locs"
         )
 
+    @staticmethod
+    def _trim_kv_to_locs(out_cache_loc, k, v):
+        """Slice a padded KV write down to the write-loc count.
+
+        Prefill-graph replay pads k/v rows to the bucket while flat per-group
+        locs cover only the real (leading) rows. Trimming beats padding the
+        locs with the null page: backends that don't scrub tail rows (trtllm)
+        would write garbage into page 0, breaking its stays-zero invariant.
+        No-op off the padded path and for backends without flat locs.
+        """
+        n = out_cache_loc.shape[0]
+        if k is not None and k.shape[0] > n:
+            return k[:n], v[:n]
+        return k, v
+
     def _prewrite_metadata(self, forward_mode):
         """Metadata slot the fused prewrite writes against. Default: the
         decode slot (MHA gates prewrite to decode); backends that prewrite

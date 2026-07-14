@@ -397,6 +397,32 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
+    def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
+        """Capture-time flat per-group tables for the dummy batch: all zeros =
+        the reserved null block 0 (the decode-capture convention), one row,
+        wide enough for num_tokens. Empty for non-flat backends; state groups
+        ride to their own backend and are skipped."""
+        backend = self.attn_backend
+        if not getattr(backend, "uses_flat_cache_groups", False):
+            return {}
+        # Composite wrappers (hybrid) hold the flat KV consumer as a child.
+        if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
+            backend = backend.full_attn_backend
+        # Full width: backends that derive the row stride from max_kv_len
+        # (trtllm) index the whole row even when the bucket is small.
+        width = getattr(backend, "max_num_pages", 0) or -(
+            -num_tokens // backend.page_size
+        )
+        # ALL groups, state included: hybrid wrappers forward the dict to the
+        # mamba child, which requires its state group; KV children shed state
+        # groups themselves (_shed_state_groups).
+        return {
+            str(spec.group_id): torch.zeros(
+                (1, width), dtype=torch.int32, device=self.config.device
+            )
+            for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
+        }
+
     def _make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
@@ -455,6 +481,9 @@ class PrefillGraph:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
+        flat_tables = self._dummy_flat_tables(num_tokens)
+        if flat_tables:
+            extra_metadata_kwargs["flat_block_tables"] = flat_tables
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,
