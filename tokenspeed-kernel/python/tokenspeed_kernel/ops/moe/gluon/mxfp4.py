@@ -99,20 +99,36 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        del topk_weights, topk_ids, num_tokens_global, max_num_tokens_per_gpu
+        del num_tokens_global, max_num_tokens_per_gpu
         del do_finalize, enable_pdl
         top_k = getattr(w, "top_k")
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_precision_config = w.w13_precision_config
         w2_precision_config = w.w2_precision_config
+        # Forward the caller's precomputed top-k whenever it is supplied. The
+        # downstream dispatch picks the tuned kernel by batch size (direct
+        # decode owns M <= _DIRECT_DECODE_MAX_M, precomputed-MFMA decode owns
+        # M >= _PRECOMPUTED_MFMA_MIN_M) and otherwise builds ragged metadata
+        # directly from the forwarded top-k. Dropping it for any M in between
+        # (e.g. M == 3) would silently recompute routing from router_logits,
+        # so we always forward and let the dispatch choose.
+        forward_precomputed_topk = topk_weights is not None and topk_ids is not None
 
         return gluon_mxfp_dynamic_mxfp4_fused_moe(
             x,
             router_logits,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=getattr(w, "w13_weight_bias", None),
-            w2_bias=getattr(w, "w2_weight_bias", None),
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
             w13_mx_scale=w13_precision_config.b_mx_scale,
             w2_mx_scale=w2_precision_config.b_mx_scale,
             out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
@@ -128,6 +144,8 @@ if platform.is_amd:
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
+            precomputed_topk_weights=topk_weights if forward_precomputed_topk else None,
+            precomputed_topk_ids=topk_ids if forward_precomputed_topk else None,
         )
 
     @register_kernel(
@@ -251,8 +269,16 @@ if platform.is_amd:
             router_logits,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=getattr(w, "w13_weight_bias", None),
-            w2_bias=getattr(w, "w2_weight_bias", None),
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
             w13_mx_scale=w13_precision_config.b_mx_scale,
             w2_mx_scale=w2_precision_config.b_mx_scale,
             w13_act_scale=w.w13_act_scale,
