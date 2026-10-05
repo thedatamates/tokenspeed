@@ -1182,6 +1182,47 @@ TEST(CacheCoordinatorAdmissionTest, EndpointIsNotBelowEveryPreviouslyHitBlock) {
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
 }
 
+TEST(CacheCoordinatorAdmissionTest, SlidingEndpointSurvivesNewerProbationaryChunk) {
+    BlockPool pool(2);
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 4},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 1, 2, CacheBoundaryKind::kEndpoint);
+    CacheBoundaryForGroup(coordinator, pool, hashes[1], 0, 2, 6, CacheBoundaryKind::kChunk);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 4));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
+}
+
+TEST(CacheCoordinatorAdmissionTest, OlderFullHistoryYieldsToNewerSlidingEndpoint) {
+    BlockPool pool(2);
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 4},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 1, 0, CacheBoundaryKind::kChunk);
+    CacheBoundaryForGroup(coordinator, pool, hashes[1], 1, 2, 6, CacheBoundaryKind::kEndpoint);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> demands = {
+        {.table = &tables[0], .num_tokens = 4},
+        {.table = &tables[1]},
+    };
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)));
+}
+
 TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistory) {
     BlockPool pool(3);
     const std::vector<CacheGroupSpec> specs = {

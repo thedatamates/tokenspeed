@@ -99,8 +99,9 @@ public:
 private:
     // Current prefix hits are protected before candidates reach this policy.
     // A request-only block with no CacheEntry is reclaimed first. Cached
-    // entries then compare request access epoch, followed within one epoch by
-    // the tier order below. Position keeps the deeper unproven non-closed
+    // probationary boundaries follow, before established boundaries and closed
+    // prefixes. Those useful entries share one LRU class, with tier breaking
+    // ties within an epoch. Position keeps the deeper unproven non-closed
     // boundary, while a closed prefix is reclaimed from its suffix.
     enum class EvictionTier {
         kUncached,  // physically allocated, but owned only by the request table
@@ -118,8 +119,13 @@ private:
     };
 
     static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
-                          candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
+        return std::tuple{std::min(candidate.eviction_tier, EvictionTier::kEstablishedBoundary),
+                          candidate.last_access_epoch,
+                          candidate.eviction_tier,
+                          candidate.position_rank,
+                          candidate.group_id,
+                          candidate.location.lcm_block_id,
+                          candidate.location.slot_index};
     }
 
     static bool evictedAfter(const VictimCandidate& lhs, const VictimCandidate& rhs) {

@@ -507,11 +507,15 @@ occupancy — never mutating the real pool — and answers: *which cached blocks
 must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
 empty parents fit with zero eviction; otherwise pop victims from a heap
-ordered by eviction policy (LRU access epoch, then tier: uncached
-request-only block → probationary boundary → established boundary → suffix of
-a closed prefix) until the plan fits; finally walk the victim list in reverse
-and restore every victim that is not strictly required, yielding a minimal
-eviction set.
+ordered by eviction policy: uncached request-only blocks first, then
+probationary boundaries, then established boundaries and closed prefixes in
+one shared LRU class. Within each class, request access epoch precedes tier
+and position. This protects reusable boundaries from newer unhit chunks
+without letting old closed prefixes displace newer established boundaries.
+Within an epoch, established boundaries precede closed prefixes; closed
+prefixes are reclaimed from the suffix. Pop until the plan fits, then walk
+the victim list in reverse and restore every victim that is not strictly
+required, yielding a minimal eviction set.
 
 ## The cache pipeline: layers → group → pack → bind
 
