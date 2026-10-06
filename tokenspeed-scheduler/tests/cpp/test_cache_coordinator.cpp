@@ -2877,6 +2877,10 @@ TEST(CacheCoordinatorHostReplacement, BatchReusesSameGroupVictimsWithOneScan) {
     EXPECT_EQ(batch.stats.unallocated, 0u);
     EXPECT_EQ(batch.stats.same_group_scans, 1u);
     EXPECT_EQ(batch.stats.cross_group_scans, 0u);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-2", 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-3", 0)));
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) {

@@ -598,8 +598,9 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         }
         ++batch.stats.same_group_scans;
         std::vector<CacheBlockLocation> local_victims = groups_[group_id].Index().EvictableLocations(*host_pool_);
-        std::ranges::sort(local_victims, {}, [&](CacheBlockLocation location) { return value(group_id, location); });
         const std::size_t victim_count = std::min(unresolved.size(), local_victims.size());
+        std::ranges::partial_sort(local_victims, local_victims.begin() + victim_count, {},
+                                  [&](CacheBlockLocation location) { return value(group_id, location); });
         for (std::size_t i = 0; i < victim_count; ++i) {
             _assert(groups_[group_id].Index().Evict(*host_pool_, local_victims[i]).has_value(),
                     "selected Host child is not evictable");

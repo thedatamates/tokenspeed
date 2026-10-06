@@ -492,6 +492,8 @@ Its responsibilities:
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.
+  Host replacement partially sorts same-group eviction candidates through
+  the requested count, preserving victim order without sorting unused entries.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event.
