@@ -22,9 +22,7 @@ import math
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
 
@@ -55,7 +53,9 @@ def _fwd_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -279,7 +279,9 @@ def _fwd_grouped_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -835,25 +837,7 @@ def decode_attention_fwd(
         )
 
 
-@register_kernel(
-    "attention",
-    "mha_decode_with_kvcache",
-    name="triton_mha_decode_with_kvcache_cached",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False}),
-    },
-    tags={"portability"},
-)
-def triton_mha_decode_with_kvcache(
+def _triton_mha_decode_with_kvcache_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,

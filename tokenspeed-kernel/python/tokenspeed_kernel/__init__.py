@@ -29,6 +29,13 @@ from tokenspeed_kernel.ops.activation import (
     situ_and_mul,
 )
 from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.communication import (
+    AllReduceFusionPattern,
+    AllReduceFusionWorkspace,
+    allreduce_fusion,
+    allreduce_fusion_supported,
+    create_allreduce_fusion_workspace,
+)
 from tokenspeed_kernel.ops.gemm import (
     bmm,
     dsv4_grouped_output_projection,
@@ -38,6 +45,9 @@ from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection_warmup_model,
     dsv4_linear_fp32,
     fp8_linear,
+    fp8_linear_accepts_prepacked_input,
+    fp8_linear_into,
+    fp8_linear_prepacked,
     has_flashinfer_cute_dsl_nvfp4_a16,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -49,22 +59,19 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_fp8_linear,
     prepare_nvfp4_a16_weights,
+    prepare_trtllm_cutedsl_fp8_linear,
     warmup_prepared_fp8_linears,
 )
-from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
+from tokenspeed_kernel.ops.layernorm import (
+    gated_residual_combine_norm,
+    grouped_gemma_rmsnorm,
+)
 from tokenspeed_kernel.ops.moe import (
-    dsv4_mega_moe_apply,
-    dsv4_mega_moe_plan,
-    dsv4_mega_moe_process_weights,
-    dsv4_mega_moe_warmup,
-    dsv4_select_experts,
     moe_apply,
     moe_plan,
     moe_process_weights,
-    moe_sigmoid_bias_topk,
-    moe_softmax_topk,
+    moe_topk,
     native_latent_moe_available,
-    pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.quantization import (
     fp8_quantize_dequantize,
@@ -80,15 +87,20 @@ from tokenspeed_kernel.ops.residual import (
     gated_residual_combine,
     gated_residual_mix,
     mhc_fused_hc,
+    mhc_mixes,
     mhc_post,
     mhc_pre,
-    prepare_gated_residual_weight_cache,
 )
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
+    "AllReduceFusionPattern",
+    "AllReduceFusionWorkspace",
+    "allreduce_fusion",
+    "allreduce_fusion_supported",
+    "create_allreduce_fusion_workspace",
     # exceptions
     "NoKernelFoundError",
     # gemm
@@ -100,6 +112,9 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "fp8_linear_accepts_prepacked_input",
+    "fp8_linear_into",
+    "fp8_linear_prepacked",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
@@ -110,17 +125,19 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_trtllm_cutedsl_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
     # residual
     "attn_res_fwd",
     "attn_res_fwd_available",
     "gated_residual_combine",
+    "gated_residual_combine_norm",
     "gated_residual_mix",
     "mhc_fused_hc",
+    "mhc_mixes",
     "mhc_post",
     "mhc_pre",
-    "prepare_gated_residual_weight_cache",
     # layernorm
     "grouped_gemma_rmsnorm",
     # attention
@@ -131,18 +148,11 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     # moe
-    "dsv4_mega_moe_apply",
-    "dsv4_mega_moe_plan",
-    "dsv4_mega_moe_process_weights",
-    "dsv4_mega_moe_warmup",
-    "dsv4_select_experts",
     "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
-    "moe_sigmoid_bias_topk",
-    "pack_topk_router_logits",
-    "moe_softmax_topk",
+    "moe_topk",
     # quantization
     "fp8_quantize_dequantize",
     "quantize_fp8",

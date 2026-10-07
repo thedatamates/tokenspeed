@@ -22,9 +22,7 @@ import math
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.platform import current_platform
 
 
 @triton.jit
@@ -63,7 +61,9 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
@@ -134,7 +134,18 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len, BLOCK_N):
+    begin_n = 0
+    end_n = cur_seq_len
+    if SLIDING_WINDOW_SIZE > 0:
+        # Exclude only tiles that the existing window path would SKIP_TILE.
+        # Preserve the first intersecting tile and the order of all arithmetic.
+        first_query = cur_q_start + cur_block_m * BLOCK_M
+        begin_n = tl.maximum(0, first_query - SLIDING_WINDOW_SIZE) // BLOCK_N * BLOCK_N
+        # A custom mask replaces causal masking, so it may admit future keys.
+        if IS_CAUSAL and not USE_CUSTOM_MASK:
+            end_n = tl.minimum(cur_seq_len, first_query + BLOCK_M)
+
+    for start_n in range(begin_n, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len
 
@@ -454,26 +465,7 @@ def prefill_attention_fwd(
     )
 
 
-@register_kernel(
-    "attention",
-    "mha_prefill",
-    name="triton_mha_prefill",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-        "support_skip_softmax": frozenset({False}),
-    },
-    tags={"portability"},
-)
-def triton_mha_prefill(
+def _triton_mha_prefill_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -524,26 +516,7 @@ def triton_mha_prefill(
     return out
 
 
-@register_kernel(
-    "attention",
-    "mha_extend_with_kvcache",
-    name="triton_mha_extend_with_kvcache",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "is_causal": frozenset({False, True}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
-def triton_mha_extend_with_kvcache(
+def _triton_mha_extend_with_kvcache_impl(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,

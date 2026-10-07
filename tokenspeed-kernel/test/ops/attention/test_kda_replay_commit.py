@@ -23,6 +23,7 @@ What has to hold for that to be lossless:
 
 import pytest
 import torch
+from utils import is_cdna4, is_cdna5
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -40,7 +41,7 @@ requires_registered_replay = pytest.mark.skipif(
     reason="KDA replay ops are not registered on this platform",
 )
 
-from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     _gate_tiling,
     batched_kda_commit_conv_window_kernel,
     batched_recurrent_kda_replay_commit,
@@ -283,11 +284,11 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
 
 
 @pytest.mark.skipif(
-    not current_platform().is_cdna4,
-    reason="AMD CDNA4 is required for GFX950 KDA replay execution",
+    not (is_cdna4() or is_cdna5()),
+    reason="AMD CDNA4 or CDNA5 is required for Gluon KDA replay execution",
 )
 def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
-    """The GFX950 all-layer launch honors each descriptor's cache-group row."""
+    """The Gluon all-layer launch honors each descriptor's cache-group row."""
     layers, n, t, pages, num_heads = 5, 2, 8, 10, 12
     groups = [0, 0, 0, 1, 1]
     source = [
@@ -308,7 +309,8 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
     accepted = torch.tensor([1, t], device=DEV, dtype=torch.int32)
     kernel = resolve_kda_batched_replay_commit()
     assert kernel is not None
-    assert kernel.name == "gluon_kda_fused_replay_gfx950"
+    arch = "gfx950" if is_cdna4() else "gfx1250"
+    assert kernel.name == f"gluon_kda_fused_replay_{arch}"
 
     def launch(xs, group_indices, read_indices, write_indices):
         kernel(
@@ -780,12 +782,12 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
 @requires_registered_replay
 @pytest.mark.parametrize("n", [1, 4])
 def test_split_verify_wrapper_matches_fused_wrapper(n):
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        fused_kda_verify_conv_update,
+    )
     from tokenspeed_kernel.ops.attention.kda.triton import (
         triton_nvidia_kda_fused_paged_verify_no_store,
         triton_nvidia_kda_fused_paged_verify_split,
-    )
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_kda_verify_conv_update,
     )
 
     t = 3

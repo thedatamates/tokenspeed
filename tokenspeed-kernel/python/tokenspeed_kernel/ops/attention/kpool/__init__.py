@@ -21,18 +21,10 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry, Priority
-from tokenspeed_kernel.selection import (
-    NoKernelFoundError,
-    select_kernel,
-    spec_matches_traits,
-)
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -394,14 +386,14 @@ def kpool_decode_topk(
     )
     tokens, num_heads, head_dim = q.shape
     traits = {
+        "q_len": int(q_len_per_req),
         "head_dim": int(head_dim),
-        "pool_size": int(pool_size),
         "page_size": int(page_size),
+        "pool_size": int(pool_size),
+        "topk_pools": int(topk_pools),
         "index_k_format": "fp8_scaled",
         "score_activation": "relu" if apply_relu else "none",
         "topk_layout": "global_slots",
-        "topk_pools": int(topk_pools),
-        "q_len_per_req": int(q_len_per_req),
     }
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(
@@ -534,13 +526,13 @@ def kpool_prefill_topk(
     traits = {
         "index_heads": int(num_heads),
         "head_dim": int(head_dim),
-        "pool_size": int(pool_size),
         "page_size": int(page_size),
+        "pool_size": int(pool_size),
+        "topk_pools": int(topk_pools),
+        "has_prefill_plan": has_prefill_plan,
         "index_k_format": "fp8_scaled",
         "score_activation": "relu" if apply_relu else "none",
         "topk_layout": "global_slots",
-        "topk_pools": int(topk_pools),
-        "prefill_plan": has_prefill_plan,
     }
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(

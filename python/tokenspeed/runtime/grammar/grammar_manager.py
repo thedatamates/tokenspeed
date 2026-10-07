@@ -84,7 +84,9 @@ class GrammarManager:
 
         if len(attn_group) > 1 and pg_manager.has_process_group("gloo", attn_group):
             self.grammar_sync_group = pg_manager.get_process_group("gloo", attn_group)
-            self.grammar_sync_size = len(attn_group)
+            # Sized by the process group: --emulate-rank-zero backs the logical
+            # group with this process alone.
+            self.grammar_sync_size = self.grammar_sync_group.size()
 
         else:
             self.grammar_sync_group = None
@@ -110,7 +112,7 @@ class GrammarManager:
         """
         for spec, state, _ in self.grammar_queue:
             if spec.request_id == rid:
-                logger.debug("Abort grammar queue request. rid=%s", rid)
+                logger.debug(f"Abort grammar queue request. rid={rid!s}")
 
                 # Don't cancel the compile future: it's shared across
                 # every concurrent request for the same grammar key

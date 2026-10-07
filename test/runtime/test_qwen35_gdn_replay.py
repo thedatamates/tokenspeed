@@ -68,7 +68,7 @@ CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 DEVICE = "cuda"
 
 
-def _config(*, replay: bool):
+def _config(*, replay: bool, draft_tree: bool = False):
     """(AttnConfig, primary spec) with replay_ssm on the linear component."""
     return _mamba_config_pair(
         torch,
@@ -77,17 +77,18 @@ def _config(*, replay: bool):
         spec_tokens=DRAFT_TOKENS,
         device=DEVICE,
         replay_ssm=replay,
+        draft_tree=draft_tree,
     )
 
 
-def _make_backend(conv_state, recurrent_state, *, replay: bool):
+def _make_backend(conv_state, recurrent_state, *, replay: bool, draft_tree=False):
     if replay and not gdn_replay_commit_supported(torch.bfloat16):
         pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
     pool = _ContractPool(
         4,
         {0: ("linear_attention", conv_state, recurrent_state)},
     )
-    backend = MambaAttnBackend(*_config(replay=replay))
+    backend = MambaAttnBackend(*_config(replay=replay, draft_tree=draft_tree))
     backend.set_kv_pool(pool)
     # The persistent decode buffers exist from construction, as at the
     # wrapper (the verify refresh writes into them).
@@ -248,8 +249,8 @@ def test_qwen_replay_commit_matches_per_position_scratch_fallback(state_dtype):
     replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
     scratch_out = _prepare_verify(scratch_backend, scratch_pool, inputs)
     accepted = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
-    replay_backend.commit_verified_state(accepted)
-    scratch_backend.commit_verified_state(accepted)
+    replay_backend.commit_verified_state(accepted, accepted_path=None)
+    scratch_backend.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(replay_out, scratch_out, atol=0.0, rtol=0.0)
@@ -271,6 +272,67 @@ def test_qwen_replay_commit_matches_per_position_scratch_fallback(state_dtype):
         rtol=1e-5,
     )
     assert replay_backend._verify_commit_ctx is None
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_qwen_replay_tree_matches_staged_tree(state_dtype):
+    """A ReplaySSM draft tree verifies like the per-node staged tree, never
+    writes the pool during verify, and commits the accepted path's state."""
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
+
+    conv, recurrent = _initial_pools(state_dtype=state_dtype)
+    replay_backend, replay_pool = _make_backend(
+        conv.clone(), recurrent.clone(), replay=True, draft_tree=True
+    )
+    staged_backend, staged_pool = _make_backend(
+        conv.clone(), recurrent.clone(), replay=False
+    )
+    parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device=DEVICE)
+    for backend in (replay_backend, staged_backend):
+        backend.bind_tree_verify(
+            TreeVerifyInputs(
+                torch.zeros(BATCH * DRAFT_TOKENS, dtype=torch.int64, device=DEVICE),
+                DRAFT_TOKENS,
+                parent=parents,
+            )
+        )
+    inputs = _inputs()
+    before = replay_pool.get_component(0, "recurrent_state").clone()
+
+    replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
+    staged_out = _prepare_verify(staged_backend, staged_pool, inputs)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replay_out, staged_out, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        replay_pool.get_component(0, "recurrent_state"), before, atol=0.0, rtol=0.0
+    )
+
+    # Request 0 accepts the branch 0 -> 2; request 1 the whole chain 0 -> 1 -> 2.
+    path = torch.tensor([[0, 2, -1], [0, 1, 2]], dtype=torch.int32, device=DEVICE)
+    accepted = torch.tensor([2, 3], dtype=torch.int32, device=DEVICE)
+    replay_backend.commit_verified_state(accepted, accepted_path=path)
+    staged_backend.commit_verified_state(accepted, accepted_path=path)
+    torch.cuda.synchronize()
+
+    committed_pages = torch.tensor([5, 6], device=DEVICE)
+    torch.testing.assert_close(
+        replay_pool.get_component(0, "conv_state")[committed_pages],
+        staged_pool.get_component(0, "conv_state")[committed_pages],
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        replay_pool.get_component(0, "recurrent_state")[committed_pages],
+        staged_pool.get_component(0, "recurrent_state")[committed_pages],
+        # The staged tree rounds a branch's parent state to the pool dtype; replay carries fp32.
+        **(
+            dict(atol=1e-3, rtol=1.6e-2)
+            if state_dtype == torch.bfloat16
+            else dict(atol=1e-6, rtol=1e-5)
+        ),
+    )
 
 
 def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
@@ -323,7 +385,7 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     recurrent[torch.tensor([5, 6], device=DEVICE)].fill_(float("nan"))
     graph.replay()
     backend.commit_verified_state(
-        torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
+        torch.tensor([1, 3], dtype=torch.int32, device=DEVICE), accepted_path=None
     )
     torch.cuda.synchronize()
 
@@ -387,8 +449,8 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
 
     monkeypatch.setattr(backend_ops, "gdn_replay_commit", counted_commit)
     accepted = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
-    replay_backend.commit_verified_state(accepted)
-    scratch_backend.commit_verified_state(accepted)
+    replay_backend.commit_verified_state(accepted, accepted_path=None)
+    scratch_backend.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
 
     assert launch_calls == 1
@@ -528,36 +590,17 @@ def test_rebinding_a_pool_of_different_state_geometry_is_rejected():
     assert backend._checkpoint_granularity == 4
 
 
-def test_rebinding_a_state_backend_drops_registered_side_state_scratch():
+def test_rebinding_a_state_backend_clears_sparse_metadata():
     backend, _ = _make_backend(*_initial_pools(), replay=False)
-    side = SimpleNamespace(dropped=False, commit_after_mtp_verify=lambda *a, **k: None)
-    side.drop_verify_scratch = lambda: setattr(side, "dropped", True)
-    backend.register_speculative_state_backend(side)
+    share = backend.sparse_topk
+    share.prefill = share.decode = share.qsa_metadata = object()
 
     backend.set_cache_pool(
         _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=31))})
     )
-    assert side.dropped
-
-
-def test_rebinding_the_pool_drops_the_ple_verify_scratch():
-    """The PLE scratch is cut from the bound arena's fields, so a rebind must reissue it."""
-    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-        Qwen4ExpMambaAttnBackend,
-    )
-
-    backend = Qwen4ExpMambaAttnBackend.__new__(Qwen4ExpMambaAttnBackend)
-    backend._init_pool_binding()
-    layer = SimpleNamespace(dropped=False)
-    layer.drop_verify_scratch = lambda: setattr(layer, "dropped", True)
-    backend._ple_layers = (layer,)
-    backend._ple_verify_scratch = {"context": torch.zeros(2)}
-
-    pool = _ContractPool(4, {0: ("linear_attention", *_initial_pools())})
-    backend.set_kv_pool(pool)
-    assert backend.kv_pool is pool
-    assert backend._ple_verify_scratch == {}
-    assert layer.dropped
+    assert share.prefill is None
+    assert share.decode is None
+    assert share.qsa_metadata is None
 
 
 if __name__ == "__main__":

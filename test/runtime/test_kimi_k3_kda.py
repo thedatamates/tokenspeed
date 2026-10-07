@@ -55,10 +55,10 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state import kda, mamba
-from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
 )
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
@@ -119,6 +119,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         scan_boundaries,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
+        D=None,
         a=None,
         b=None,
         g_raw=torch.empty_like(query),
@@ -129,6 +130,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         num_real_tokens=num_tokens,
         lower_bound=-5.0,
         cu_seqlens_cpu=boundaries.to(torch.int64),
+        inputs_packed=False,
     )
     assert captured["initial_state"] is stored
     assert captured["cu_seqlens"] is scan_boundaries
@@ -167,6 +169,7 @@ def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBack
     kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = KdaAttnBackend(
         *_backend_config(device, spec_tokens=spec_tokens),
+        enable_prefill_graph=False,
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
@@ -184,6 +187,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 rows_per_page=prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
+                replayable=False,
             )
             if group_id == "full_attention"
             else CacheGroupSpec(
@@ -192,6 +196,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 sliding_window_tokens=None,
                 family="state",
                 checkpoint_granularity=prefix_granularity,
+                replayable=False,
             )
         )
         for group_id in group_ids
@@ -298,8 +303,6 @@ def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
 
 def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
     """KDA reads committed recurrence directly while GDN keeps full seeding."""
-    from tokenspeed_kernel.ops.kvcache import triton as kvcache_triton
-
     contract = _stub_contract(prefix_granularity=4, usable_pages=8)
     pool = _StubContractPool(
         contract,
@@ -317,7 +320,7 @@ def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
     def record_copy(*_args, **kwargs):
         calls.append(kwargs["row_bytes"])
 
-    monkeypatch.setattr(kvcache_triton, "copy_state_rows", record_copy)
+    monkeypatch.setattr(mamba, "copy_state_rows", record_copy)
 
     kda = _backend("cpu", contract_pool=pool, spec_tokens=4)
     kda._replay_active = False
@@ -560,7 +563,10 @@ class _KDAHarness:
             extend_seq_lens_cpu=new_cpu,
             extend_prefix_lens=prefix_cpu.to(self.device),
             extend_prefix_lens_cpu=prefix_cpu,
+            extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
+            extend_prompt_lens_cpu=prefix_cpu + new_cpu,
             extend_with_prefix=bool(prefix_cpu.any()),
+            query_shard=None,
         )
 
     def decode_metadata(self, tables, seq_lens):
@@ -590,6 +596,7 @@ class _KDAHarness:
             bs=bs,
             forward_mode=ForwardMode.EXTEND,
             mixed_qkv=mixed.clone(),
+            save_kv_cache=True,
             g_raw=g_raw,
             beta_raw=beta_raw,
             seq_len=seq_len,
@@ -969,7 +976,7 @@ def test_kda_cache_pool_component_views_end_to_end(
             h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
         )
 
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
+    from tokenspeed_kernel.ops.attention.kda._triton import recurrent
 
     def _unexpected_megafuse(*args, **kwargs):
         raise AssertionError("AMD cache-group decode must bypass the FLA KDA megafuse")
@@ -983,7 +990,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         return indexed_decode(*args, **kwargs)
 
     monkeypatch.setattr(
-        fla_kda_recurrent,
+        recurrent,
         "fused_recurrent_kda_megafuse",
         _unexpected_megafuse,
     )
@@ -1064,9 +1071,9 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
 @pytest.mark.parametrize("prefix", [0, 1024])
 def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
     """Native KDA outputs and persistent state match the old staging ops."""
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import is_cutedsl_kda_installed
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
-    if not is_cutedsl_kda_installed():
+    if not cutedsl_kda_supported():
         pytest.skip("requires the native CuteDSL KDA prefill package")
 
     contract = _stub_contract(prefix_granularity=1024, usable_pages=8)

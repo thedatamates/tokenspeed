@@ -21,19 +21,12 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
 
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
-from tokenspeed_kernel.selection import (
-    NoKernelFoundError,
-    select_kernel,
-    spec_matches_traits,
-)
+from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -122,8 +115,8 @@ def rel_mha_plan(
 
     traits = {
         "head_dim": head_dim,
-        "sliding_window": window_left >= 0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     signature = format_signature(
         q=dense_tensor_format(dtype),
@@ -197,8 +190,8 @@ def rel_mha_prefill(
 
     traits = {
         "head_dim": q.shape[-1],
-        "sliding_window": window_left >= 0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
@@ -318,8 +311,8 @@ def rel_mha_extend_with_kvcache(
     traits = {
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",
@@ -446,8 +439,8 @@ def rel_mha_decode_with_kvcache(
     traits = {
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
         "return_lse": False,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",

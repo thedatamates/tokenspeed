@@ -40,7 +40,7 @@ _MAX_AMD_GLUON_TOKENS = 65536
 _MAX_N = 12
 
 
-def _select_attn_res_kernel(
+def select_attn_res_fwd_kernel(
     layer_residual,
     block_residual,
     res_weight,
@@ -53,6 +53,15 @@ def _select_attn_res_kernel(
     num_valid_blocks,
     block_write_idx,
 ):
+    """Select the kernel :func:`attn_res_fwd` runs for these inputs.
+
+    Arguments match :func:`attn_res_fwd`, with ``output_eps`` the resolved
+    output RMSNorm epsilon.
+
+    Returns:
+        ``(kernel, valid_blocks)``: the selected kernel and the number of
+        snapshots it mixes.
+    """
     tokens, hidden_size = layer_residual.shape
     valid_blocks = (
         block_residual.shape[0] if num_valid_blocks is None else int(num_valid_blocks)
@@ -174,7 +183,7 @@ def attn_res_fwd(
     output_eps = (
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
-    kernel, valid_blocks = _select_attn_res_kernel(
+    kernel, valid_blocks = select_attn_res_fwd_kernel(
         layer_residual,
         block_residual,
         res_weight,
@@ -235,7 +244,7 @@ def attn_res_fwd_available(
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
     try:
-        kernel, _ = _select_attn_res_kernel(
+        kernel, _ = select_attn_res_fwd_kernel(
             layer_residual,
             block_residual,
             res_weight,
@@ -280,35 +289,6 @@ def _same_tensor_contract(
         )
 
 
-def prepare_gated_residual_weight_cache(up_weight: _torch.Tensor, lowrank: int) -> bool:
-    """Prepare derived mix-up weights after an initial or online weight load.
-
-    CUDA graphs retain the address of backend-specific derived weights. The
-    first call creates that fixed-address allocation outside forward; later
-    calls update it in place after online weight synchronization. It is a no-op
-    when the selected platform does not need a derived weight.
-
-    Args:
-        up_weight: Source mix-up weight shaped ``[wide, lowrank]``.
-        lowrank: Rank of the mix gate bottleneck.
-
-    Returns:
-        Whether a backend-specific derived allocation was prepared.
-    """
-    if lowrank <= 0:
-        raise ValueError("lowrank must be positive")
-    if up_weight.ndim != 2 or int(up_weight.shape[1]) != lowrank:
-        raise ValueError(
-            f"up_weight must have shape [wide, {lowrank}], got "
-            f"{tuple(up_weight.shape)}"
-        )
-    from tokenspeed_kernel.ops.residual.cute_dsl import (
-        _prepare_padded_up_weight,
-    )
-
-    return _prepare_padded_up_weight(up_weight, lowrank)
-
-
 def gated_residual_mix(
     normalized: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -317,6 +297,7 @@ def gated_residual_mix(
     hidden_size: int,
     lowrank: int,
     *,
+    weights_independent: bool,
     projection_scale: float = 1.0,
     override: str | None = None,
     solution: str | None = None,
@@ -338,6 +319,10 @@ def gated_residual_mix(
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
+        weights_independent: Whether both weights are already ready and remain
+            unchanged within forward, permitting weight TMA before the activation
+            producer completes. Pass False when a preceding PDL kernel may write
+            either weight.
         projection_scale: Scale applied to down and inject projection results.
             It is ``1`` when an exact power-of-two scale was folded into the
             checkpoint weight and ``1 / hc_count`` otherwise.
@@ -386,20 +371,25 @@ def gated_residual_mix(
         )
         return mixed, inject
 
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+
     traits = {
+        "weights_independent": weights_independent,
+        "fused_grid_supported": supports_fused_hc(flat.device),
+        "fused_tma_aligned": all(
+            tensor.data_ptr() % 16 == 0
+            for tensor in (flat, projection_weight, up_weight)
+        ),
         "num_tokens": rows,
         "hc_count": hc_count,
         "hidden_size": hidden_size,
         "lowrank": lowrank,
-        "has_inject": has_inject,
         "contiguous": bool(
             flat.is_contiguous()
             and projection_weight.is_contiguous()
             and up_weight.is_contiguous()
         ),
-        "folded_scale": projection_scale == 1.0,
         "deterministic": _torch.are_deterministic_algorithms_enabled(),
-        "capturing": bool(flat.is_cuda and _torch.cuda.is_current_stream_capturing()),
     }
     signature = format_signature(
         normalized=dense_tensor_format(flat.dtype),
@@ -432,6 +422,7 @@ def gated_residual_mix(
             hidden_size,
             lowrank,
             projection_scale,
+            weights_independent,
         )
     mixed = mixed.reshape(*leading_shape, hidden_size)
     if inject is not None:
@@ -519,6 +510,61 @@ def gated_residual_combine(
 # ===-----------------------------------------------------------------------===#
 # DeepSeek V4 mHC
 # ===-----------------------------------------------------------------------===#
+
+
+def mhc_mixes(
+    residual: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
+    """Produce mHC coefficients separately from applying the pre-mix.
+
+    Args:
+        residual: Contiguous BF16 residual streams [T,4,H].
+        weight: Contiguous FP32 mixing projection [24,4*H].
+        scale: FP32 pre/post/combine scales [3].
+        base: FP32 mixing biases [24].
+        rms_eps: Epsilon for residual RMS normalization.
+        hc_eps: Epsilon for pre-mix and Sinkhorn normalization.
+        sinkhorn_iters: Positive number of Sinkhorn iterations.
+
+    Returns:
+        FP32 pre/post coefficients [T,4] and combine coefficients [T,4,4],
+        whose last two axes are input and output residual streams. The caller
+        chooses when to consume pre; no layer input or request state is retained.
+    """
+    if residual.ndim != 3 or residual.shape[1] != 4:
+        raise ValueError("mhc_mixes requires residual [T,4,H]")
+    if (
+        weight.shape != (24, 4 * residual.shape[-1])
+        or scale.shape != (3,)
+        or base.shape != (24,)
+    ):
+        raise ValueError("mhc_mixes projection/scale/base shapes disagree")
+    if residual.dtype != _torch.bfloat16 or any(
+        t.dtype != _torch.float32 for t in (weight, scale, base)
+    ):
+        raise ValueError("mhc_mixes requires BF16 residual and FP32 parameters")
+    if sinkhorn_iters < 1 or any(
+        not t.is_contiguous() or t.device != residual.device
+        for t in (residual, weight, scale, base)
+    ):
+        raise ValueError(
+            "mhc_mixes requires contiguous colocated tensors and positive iterations"
+        )
+    kernel = select_kernel(
+        "residual",
+        "mhc_mixes",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
 
 
 def mhc_pre(
@@ -720,7 +766,7 @@ def mhc_fused_hc(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
-import tokenspeed_kernel.ops.residual.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
@@ -734,8 +780,60 @@ __all__ = [
     "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
-    "prepare_gated_residual_weight_cache",
     "mhc_fused_hc",
+    "mhc_mixes",
     "mhc_post",
     "mhc_pre",
 ]
+
+
+def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps):
+    """Add a shared value to residual streams using a normalized dot gate.
+
+    Args:
+        residual: Contiguous BF16 residual streams [...,C,H].
+        key_value: BF16 [...,(C+1)*H], holding C keys followed by a shared value.
+        query_weight: BF16 query normalization weights [C,H].
+        key_weight: BF16 key normalization weights [C,H].
+        mask: Boolean [...] participation mask; false rows pass through unchanged.
+        eps: Positive epsilon for both RMS normalizations.
+
+    Returns:
+        BF16 [...,C,H]. Each stream uses sigmoid(signed_sqrt(dot)) as its
+        value gate; dot is the weighted normalized dot divided by sqrt(H).
+        The square-root magnitude is floored at sqrt(1e-6), matching Engram.
+    """
+    if residual.ndim < 3 or min(residual.shape[-2:]) < 1:
+        raise ValueError("normalized_dot_gate requires residual [...,C,H]")
+    hc, dim = residual.shape[-2:]
+    shape = residual.shape[:-2]
+    if (
+        key_value.shape != (*shape, (hc + 1) * dim)
+        or query_weight.shape != (hc, dim)
+        or key_weight.shape != (hc, dim)
+        or mask.shape != shape
+        or mask.dtype != _torch.bool
+        or eps <= 0
+    ):
+        raise ValueError("normalized_dot_gate shapes, mask or epsilon are invalid")
+    values = (residual, key_value, query_weight, key_weight)
+    if (
+        not residual.is_cuda
+        or any(t.dtype != _torch.bfloat16 for t in values)
+        or any(
+            not t.is_contiguous() or t.device != residual.device
+            for t in (*values, mask)
+        )
+    ):
+        raise ValueError(
+            "normalized_dot_gate requires contiguous colocated GPU BF16 operands"
+        )
+    kernel = select_kernel(
+        "residual",
+        "normalized_dot_gate",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, key_value, query_weight, key_weight, mask, eps)

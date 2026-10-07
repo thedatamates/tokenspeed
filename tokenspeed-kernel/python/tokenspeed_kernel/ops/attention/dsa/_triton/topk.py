@@ -22,14 +22,85 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.platform import current_platform
 
 _is_nvidia = current_platform().is_nvidia
 
 _RADIX_TOPK_MIN_COLS = 65536
 _RADIX_TOPK_BLOCK_N = 4096
+
+
+@triton.jit
+def _mark_forced_initial_local_logits_kernel(
+    logits_ptr,
+    logits_row_stride,
+    causal_lens_ptr,
+    # Candidate width follows the batch; runtime so every batch shape shares
+    # one binary.
+    num_cols,
+    initial_tokens: tl.constexpr,
+    local_tokens: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    causal_len = tl.load(causal_lens_ptr + row).to(tl.int32)
+    initial_end = tl.minimum(causal_len, initial_tokens)
+    local_start = tl.maximum(initial_end, causal_len - local_tokens)
+    forced = (cols < initial_end) | ((cols >= local_start) & (cols < causal_len))
+    tl.store(
+        logits_ptr + row * logits_row_stride + cols,
+        float("inf"),
+        mask=(cols < num_cols) & forced,
+    )
+
+
+def mark_forced_initial_local_logits(
+    logits: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    initial_tokens: int,
+    local_tokens: int,
+) -> None:
+    """Force sequence-start and causal-tail candidates into the top-k.
+
+    LongCat's DSA selection always keeps the first ``initial_tokens`` and the
+    last ``local_tokens`` visible positions; marking their logits +inf makes
+    any top-k over the marked logits include them.
+
+    Args:
+        logits: ``[rows, candidates]`` scores, unit column stride; mutated.
+        causal_lens: ``[rows]`` visible candidate count per row.
+        initial_tokens: Sequence-start candidates to force.
+        local_tokens: Causal-tail candidates to force.
+    """
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        raise ValueError("logits must be a 2-D tensor with unit column stride")
+    if causal_lens.shape != (logits.shape[0],):
+        raise ValueError(
+            f"causal_lens must have shape ({logits.shape[0]},), got "
+            f"{tuple(causal_lens.shape)}"
+        )
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if logits.numel() == 0 or initial_tokens + local_tokens == 0:
+        return
+    causal_lens = causal_lens.to(device=logits.device, dtype=torch.int32).contiguous()
+    block = 256
+    _mark_forced_initial_local_logits_kernel[
+        (logits.shape[0], triton.cdiv(logits.shape[1], block))
+    ](
+        logits,
+        logits.stride(0),
+        causal_lens,
+        num_cols=logits.shape[1],
+        initial_tokens=int(initial_tokens),
+        local_tokens=int(local_tokens),
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
 
 
 @triton.jit
@@ -43,7 +114,9 @@ def _local_topk_to_global_slots_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_cols: tl.constexpr,
+    # Block-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    block_table_cols,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,
@@ -356,7 +429,15 @@ def combine_topk_weights(
         raise ValueError("combine_topk_weights expects unit-stride weights rows")
     if q_scale.dtype != torch.float32:
         raise TypeError(f"q_scale must be fp32, got {q_scale.dtype}")
-    q_scale = q_scale.reshape(tokens * heads)
+    # The quantizer may pad the per-row scale vector (an alignment multiple of
+    # its launch width); real rows lead, padding trails. 16-head indexers hit
+    # this on every odd token count.
+    q_scale = q_scale.reshape(-1)
+    if q_scale.numel() < tokens * heads:
+        raise ValueError(
+            f"q_scale has {q_scale.numel()} entries for {tokens * heads} rows"
+        )
+    q_scale = q_scale[: tokens * heads]
     out = torch.empty(tokens, heads, dtype=torch.float32, device=weights.device)
     numel = tokens * heads
     if numel == 0:
@@ -388,6 +469,10 @@ def _dsa_decode_logits_fp8_kernel(
     logits,
     block_table_stride,
     logits_stride,
+    query_requests,
+    EXPLICIT_ROWS: tl.constexpr,
+    INITIAL_TOKENS: tl.constexpr,
+    LOCAL_TOKENS: tl.constexpr,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
     page_stride_bytes: tl.constexpr,
@@ -402,10 +487,16 @@ def _dsa_decode_logits_fp8_kernel(
 ):
     token = tl.program_id(0)
     block_id = tl.program_id(1)
-    req = token // q_len_per_req
     offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = tl.load(seq_lens + req).to(tl.int32)
-    seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
+    if EXPLICIT_ROWS:
+        # seq_lens is per token here; indexing it by req would read past the
+        # buffer whenever a request ID exceeds the query-tile length.
+        req = tl.load(query_requests + token)
+        seq_len = tl.load(seq_lens + token)
+    else:
+        req = token // q_len_per_req
+        base = tl.load(seq_lens + req).to(tl.int32)
+        seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
     seq_len = tl.maximum(seq_len, 0)
     valid = offsets < seq_len
     block_idx = offsets // page_size
@@ -416,6 +507,7 @@ def _dsa_decode_logits_fp8_kernel(
         mask=valid,
         other=0,
     ).to(tl.int64)
+    valid = valid & (page >= 0)
     fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
         page * (page_stride_bytes // 4)
@@ -451,7 +543,9 @@ def _dsa_decode_logits_fp8_kernel(
         )
 
     scores *= softmax_scale
-    scores = tl.where(valid, scores, -float("inf"))
+    forced = (offsets < INITIAL_TOKENS) | (offsets >= seq_len - LOCAL_TOKENS)
+    scores = tl.where(forced, float("inf"), scores)
+    scores = tl.where(valid & (scores == scores), scores, -float("inf"))
     tl.store(
         logits + token * logits_stride + offsets,
         scores,
@@ -498,6 +592,7 @@ def _dsa_prefill_logits_fp8_kernel(
     ).to(tl.int64)
     page = slots // page_size
     block_offset = slots - page * page_size
+    valid = valid & (page >= 0)
     fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
         page * (page_stride_bytes // 4)
@@ -1065,6 +1160,10 @@ def dsa_decode_topk_fp8(
         logits,
         block_table.stride(0),
         logits.stride(0),
+        None,
+        EXPLICIT_ROWS=False,
+        INITIAL_TOKENS=0,
+        LOCAL_TOKENS=0,
         page_size=int(page_size),
         row_bytes=row_bytes,
         page_stride_bytes=page_stride_bytes,
@@ -1191,20 +1290,7 @@ def dsa_prefill_topk_fp8(
     return out, lens_out
 
 
-@register_kernel(
-    "attention",
-    "dsa_plan",
-    name="triton_dsa_plan",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature()}),
-    traits={
-        "page_size": frozenset({64}),
-    },
-    priority=Priority.PORTABLE,
-    tags={"portability"},
-)
-def triton_dsa_plan(
+def _triton_dsa_plan_impl(
     *,
     page_size: int,
     seq_lens_2d: torch.Tensor,
@@ -1214,37 +1300,7 @@ def triton_dsa_plan(
     return object() if out is None else out
 
 
-@register_kernel(
-    "attention",
-    "dsa_decode_topk",
-    name="triton_dsa_decode_topk_fp8",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.float32),
-            ),
-            # Raw indexer weights: the wrapper upcasts before scoring.
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.bfloat16),
-            ),
-        }
-    ),
-    traits={
-        "head_dim": frozenset({128}),
-        "topk": frozenset({512, 1024, 2048}),
-        "page_size": frozenset({64}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "index_k_layout": frozenset({"packed", "page_planar"}),
-    },
-    features={"logical_offsets"},
-    priority=Priority.PORTABLE,
-    tags={"portability"},
-)
-def triton_dsa_decode_topk_fp8(
+def _triton_dsa_decode_topk_fp8_impl(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1283,35 +1339,7 @@ def triton_dsa_decode_topk_fp8(
     )
 
 
-@register_kernel(
-    "attention",
-    "dsa_prefill_topk",
-    name="triton_dsa_prefill_topk_fp8",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset(
-        {
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.float32),
-            ),
-            # Raw indexer weights: the wrapper upcasts before scoring.
-            format_signature(
-                q=dense_tensor_format(torch.bfloat16),
-                weights=dense_tensor_format(torch.bfloat16),
-            ),
-        }
-    ),
-    traits={
-        "head_dim": frozenset({128}),
-        "topk": frozenset({512, 1024, 2048}),
-        "index_k_format": frozenset({"fp8_scaled"}),
-        "index_k_layout": frozenset({"packed", "page_planar"}),
-    },
-    priority=Priority.PORTABLE,
-    tags={"portability"},
-)
-def triton_dsa_prefill_topk_fp8(
+def _triton_dsa_prefill_topk_fp8_impl(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -1322,8 +1350,6 @@ def triton_dsa_prefill_topk_fp8(
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -1356,8 +1382,6 @@ __all__ = [
     "dsa_prefill_topk_fp8",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
-    "triton_dsa_plan",
-    "triton_dsa_decode_topk_fp8",
-    "triton_dsa_prefill_topk_fp8",
+    "mark_forced_initial_local_logits",
     "workspace_topk_to_global_slots",
 ]

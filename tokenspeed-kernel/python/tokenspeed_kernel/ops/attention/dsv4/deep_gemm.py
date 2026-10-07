@@ -20,19 +20,29 @@
 
 from __future__ import annotations
 
+import logging
+from math import ceil
+
 import torch
+from tokenspeed_kernel.ops.residual.triton import compute_mhc_num_splits
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
+    prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-_IS_NVIDIA = current_platform().is_nvidia
+_IS_HOPPER_PLUS = current_platform().is_hopper_plus
+logger = logging.getLogger(__name__)
 
-if _IS_NVIDIA:
+if _IS_HOPPER_PLUS:
+    prepare_cuda_toolkit_env()
+    import deep_ep  # noqa: F401
+    import deep_gemm
+    import trtllm_kernel  # noqa: F401
     from tokenspeed_kernel.ops.attention.dsv4.cuda import (
         has_indexer_mxfp4_paged_gather,
         has_indexer_topk_prefill,
@@ -41,8 +51,6 @@ if _IS_NVIDIA:
         indexer_topk_prefill,
         persistent_topk,
     )
-    from tokenspeed_kernel.thirdparty import deep_gemm, trtllm
-    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_prefill_jit
 
 _MXFP4_BLOCK_SIZE = 32
 _MXFP4_VALUE_BYTES_PER_BLOCK = _MXFP4_BLOCK_SIZE // 2
@@ -244,6 +252,16 @@ def _prefill_topk(
     return out
 
 
+def _trtllm_decode_topk(
+    values: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    topk: int,
+) -> None:
+    seq_lens = seq_lens.to(torch.int32).reshape(-1).contiguous()
+    torch.ops.trtllm.indexer_topk_decode(values, seq_lens, indices, 1, topk)
+
+
 def _decode_topk(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -275,7 +293,7 @@ def _decode_topk(
             logits.contiguous(), lengths, out, workspace, topk, logits.shape[1]
         )
         return out
-    trtllm.fast_topk_v2(logits.contiguous(), lengths, out, topk, 1)
+    _trtllm_decode_topk(logits.contiguous(), lengths, out, topk)
     return out
 
 
@@ -344,6 +362,49 @@ def _dsv4_prefill_topk(
     return _prefill_topk(logits, seq_lens, topk, result), gathered_k
 
 
+def _paged_index_logits(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    max_context_len: int,
+    plan: object,
+    index_k_format: str,
+) -> torch.Tensor:
+    q_values, q_scales = index_q
+    kv_cache = _mxfp4_cache_view(index_k_cache, page_size)
+    if index_k_format == "mxfp4":
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            q=(
+                q_values.contiguous().view(torch.int8).unsqueeze(1),
+                q_scales.contiguous().unsqueeze(1),
+            ),
+            kv_cache=kv_cache,
+            weights=weights.contiguous(),
+            context_lens=context_lens,
+            block_table=block_table,
+            schedule_meta=plan,
+            max_context_len=max_context_len,
+            clean_logits=False,
+            logits_dtype=torch.float32,
+        )
+    else:
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_values.contiguous().unsqueeze(1),
+            kv_cache,
+            weights.contiguous(),
+            context_lens,
+            block_table,
+            plan,
+            max_context_len,
+            clean_logits=False,
+        )
+    return logits
+
+
 def _dsv4_decode_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -373,34 +434,80 @@ def _dsv4_decode_topk(
             "DeepSeek V4 decode top-k requires a plan returned by dsv4_plan"
         )
 
-    kv_cache = _mxfp4_cache_view(index_k_cache, page_size)
-    if index_k_format == "mxfp4":
-        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-            q=(
-                q_values.contiguous().view(torch.int8).unsqueeze(1),
-                q_scales.contiguous().unsqueeze(1),
-            ),
-            kv_cache=kv_cache,
-            weights=weights.contiguous(),
-            context_lens=context_lens,
-            block_table=block_table,
-            schedule_meta=plan,
-            max_context_len=max_context_len,
-            clean_logits=False,
-            logits_dtype=torch.float32,
-        )
-    else:
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_values.contiguous().unsqueeze(1),
-            kv_cache,
-            weights.contiguous(),
-            context_lens,
-            block_table,
-            plan,
-            max_context_len,
-            clean_logits=False,
-        )
+    logits = _paged_index_logits(
+        index_q,
+        weights,
+        index_k_cache,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        max_context_len=max_context_len,
+        plan=plan,
+        index_k_format=index_k_format,
+    )
     return _decode_topk(logits, context_lens, topk, result, persistent_topk_workspace)
+
+
+def _dsv4_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    index_k_format: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+        candidate_topk_offsets,
+        compact_index_pages,
+        gather_index_candidates,
+        mask_index_scores,
+    )
+    from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+    pages, positions, lengths = compact_index_pages(
+        local_page_table,
+        query_requests,
+        causal_lens,
+        page_size,
+    )
+    if index_k_format == "fp8_scaled":
+        q = index_q[0].contiguous()
+        values, scales = quantize_fp8_with_scale(
+            q.reshape(-1, q.shape[-1]),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        weights = combine_topk_weights(weights, scales.contiguous(), softmax_scale)
+        index_q = (values.view(q.shape), scales)
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
+    scoring_lengths = lengths.clamp_min(1)
+    plan = deep_gemm.get_paged_mqa_logits_metadata(
+        scoring_lengths,
+        page_size,
+        deep_gemm.get_num_sms(),
+    )
+    logits = _paged_index_logits(
+        index_q,
+        weights,
+        index_k_cache,
+        scoring_lengths,
+        pages,
+        page_size=page_size,
+        max_context_len=pages.shape[1] * page_size,
+        plan=plan,
+        index_k_format=index_k_format,
+    )
+    mask_index_scores(logits, positions, lengths, causal_lens, page_size, 0, 0)
+    offsets = candidate_topk_offsets(logits, topk)
+    return gather_index_candidates(offsets, logits, positions, page_size)
 
 
 _SIGNATURES = {
@@ -432,8 +539,20 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
             "index_k_format": frozenset({format_name}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"nvidia", "sparse", "latency"},
     )
+    candidate_signature = format_signature(
+        q=dense_tensor_format(
+            torch.uint8 if format_name == "mxfp4" else torch.bfloat16
+        ),
+        weights=dense_tensor_format(torch.float32),
+        index_k_cache=dense_tensor_format(torch.uint8),
+    )
+    register_kernel(
+        "attention",
+        "dsv4_index_candidates",
+        name=f"deep_gemm_dsv4_{format_name}_index_candidates",
+        **{**common, "signatures": frozenset({candidate_signature})},
+    )(_dsv4_index_candidates)
     register_kernel(
         "attention",
         "dsv4_prefill_topk",
@@ -454,13 +573,230 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
     )(_dsv4_decode_topk)
 
 
+def _warmup_m_values(max_tokens: int) -> list[int]:
+    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    dense = min(max_tokens, 2048)
+    values: set[int] = set(range(1, dense + 1))
+    values.update(range(dense, max_tokens + 1, 16))
+    values.add(max_tokens)
+    return sorted(values)
+
+
+def _warmup_tf32_hc_prenorm_gemm(
+    shapes: list[dict],
+    max_tokens: int,
+    device: torch.device,
+) -> None:
+    seen: set[tuple[int, ...]] = set()
+    block_k = 64
+    block_m = 64
+
+    for params in shapes:
+        hc_hidden_size = params["hc_hidden_size"]
+        mix_hc = params["mix_hc"]
+        hc_dim = params["hc_dim"]
+
+        if (hc_hidden_size, mix_hc) in seen:
+            continue
+        seen.add((hc_hidden_size, mix_hc))
+
+        fn = torch.ones(mix_hc, hc_dim, dtype=torch.float32, device=device)
+        for num_tokens in _warmup_m_values(max_tokens):
+            grid_size = ceil(num_tokens / block_m)
+            n_splits = compute_mhc_num_splits(
+                device, block_k, hc_hidden_size, grid_size
+            )
+            x = torch.zeros(
+                num_tokens,
+                hc_hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            out_mul = torch.empty(
+                n_splits,
+                num_tokens,
+                mix_hc,
+                dtype=torch.float32,
+                device=device,
+            )
+            out_sqrsum = torch.empty(
+                n_splits,
+                num_tokens,
+                dtype=torch.float32,
+                device=device,
+            )
+            deep_gemm.tf32_hc_prenorm_gemm(x, fn, out_mul, out_sqrsum, n_splits)
+
+
+def _warmup_fp8_fp4_mqa_logits(
+    *,
+    num_heads: int,
+    index_head_dim: int,
+    device: torch.device,
+    max_kv_len: int,
+) -> None:
+    """Pre-compile the ragged prefill sparse-indexer kernel."""
+    head_dim_bytes = index_head_dim // 2
+    for num_tokens in (1, 256):
+        q_vals = torch.zeros(
+            num_tokens, num_heads, head_dim_bytes, dtype=torch.uint8, device=device
+        ).view(torch.int8)
+        q_scales = torch.zeros(num_tokens, num_heads, dtype=torch.int32, device=device)
+        k_vals = torch.zeros(
+            max_kv_len, head_dim_bytes, dtype=torch.uint8, device=device
+        ).view(torch.int8)
+        k_scales = torch.zeros(max_kv_len, dtype=torch.int32, device=device)
+        weights = torch.ones(num_tokens, num_heads, dtype=torch.float32, device=device)
+        cu_start = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        cu_end = torch.full((num_tokens,), max_kv_len, dtype=torch.int32, device=device)
+
+        deep_gemm.fp8_fp4_mqa_logits(
+            q=(q_vals, q_scales),
+            kv=(k_vals, k_scales),
+            weights=weights,
+            cu_seq_len_k_start=cu_start,
+            cu_seq_len_k_end=cu_end,
+            clean_logits=False,
+            max_seqlen_k=max_kv_len,
+            logits_dtype=torch.float32,
+        )
+
+
+def _warmup_fp8_fp4_paged_mqa_logits(
+    *,
+    num_heads: int,
+    index_head_dim: int,
+    cache_block_size: int,
+    max_decode_tokens: int,
+    device: torch.device,
+) -> None:
+    """Pre-compile paged decode indexer and schedule-metadata kernels."""
+    head_dim_bytes = index_head_dim // 2
+    row_bytes = head_dim_bytes + 4
+    num_sms = deep_gemm.get_num_sms()
+    top_bucket = max(32, ((max_decode_tokens + 31) // 32) * 32)
+
+    for num_tokens in range(32, top_bucket + 1, 32):
+        num_blocks = max(1, num_tokens)
+        q_values = torch.zeros(
+            num_tokens, num_heads, head_dim_bytes, dtype=torch.uint8, device=device
+        )
+        q_scales = torch.zeros(num_tokens, num_heads, dtype=torch.int32, device=device)
+        cache_2d = torch.zeros(
+            num_blocks, cache_block_size * row_bytes, dtype=torch.uint8, device=device
+        )
+        kv_cache = torch.as_strided(
+            cache_2d,
+            (num_blocks, cache_block_size, 1, row_bytes),
+            (cache_2d.stride(0), row_bytes, row_bytes, 1),
+        )
+        weights = torch.ones(num_tokens, num_heads, dtype=torch.float32, device=device)
+        context_lens = torch.full(
+            (num_tokens, 1), cache_block_size, dtype=torch.int32, device=device
+        )
+        block_table = torch.arange(num_tokens, dtype=torch.int32, device=device).view(
+            num_tokens, 1
+        )
+        schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, cache_block_size, num_sms
+        )
+        deep_gemm.fp8_fp4_paged_mqa_logits(
+            q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
+            kv_cache=kv_cache,
+            weights=weights,
+            context_lens=context_lens,
+            block_table=block_table,
+            schedule_meta=schedule_meta,
+            max_context_len=cache_block_size,
+            clean_logits=False,
+            logits_dtype=torch.float32,
+        )
+    torch.cuda.synchronize()
+
+
+def warmup_mqa_logits(
+    *,
+    num_heads: int,
+    index_head_dim: int,
+    cache_block_size: int,
+    max_decode_tokens: int,
+    device: torch.device,
+) -> None:
+    """Compile packed MQA scoring and paged metadata kernels before capture."""
+    _warmup_fp8_fp4_mqa_logits(
+        num_heads=num_heads,
+        index_head_dim=index_head_dim,
+        device=device,
+        max_kv_len=4096,
+    )
+    _warmup_fp8_fp4_paged_mqa_logits(
+        num_heads=num_heads,
+        index_head_dim=index_head_dim,
+        cache_block_size=cache_block_size,
+        max_decode_tokens=max_decode_tokens,
+        device=device,
+    )
+
+
+def _warmup_prefill_jit(
+    *,
+    hidden_size: int,
+    num_attention_heads: int,
+    head_dim: int,
+    hc_mult: int,
+    kv_lora_rank: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    indexer_cache_block_size: int,
+    max_decode_tokens: int,
+    mxfp4_block_size: int,
+    tp_size: int,
+    max_tokens: int,
+    device: torch.device,
+) -> None:
+    """Pre-compile DeepSeek V4 compressor and indexer kernel families."""
+    del num_attention_heads, head_dim, kv_lora_rank, mxfp4_block_size, tp_size
+    warmup_count = 0
+
+    if hc_mult and hc_mult > 1:
+        hc_hidden_size = hc_mult * hidden_size
+        mix_hc = (2 + hc_mult) * hc_mult
+        hc_dim = hc_mult * hidden_size
+        _warmup_tf32_hc_prenorm_gemm(
+            [{"hc_hidden_size": hc_hidden_size, "mix_hc": mix_hc, "hc_dim": hc_dim}],
+            max_tokens,
+            device,
+        )
+        warmup_count += 1
+
+    if index_n_heads > 0 and index_head_dim > 0:
+        _warmup_fp8_fp4_mqa_logits(
+            num_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            device=device,
+            max_kv_len=4096,
+        )
+        _warmup_fp8_fp4_paged_mqa_logits(
+            num_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            cache_block_size=indexer_cache_block_size,
+            max_decode_tokens=max_decode_tokens,
+            device=device,
+        )
+        warmup_count += 1
+
+    if warmup_count > 0:
+        logger.info(f"Warmed up {warmup_count:d} deep_gemm prefill kernel families")
+        torch.cuda.synchronize()
+
+
 def deep_gemm_dsv4_warmup(**kwargs) -> None:
     if deep_gemm.get_pdl() != pdl_enabled():
         deep_gemm.set_pdl(pdl_enabled())
-    warmup_prefill_jit(**kwargs)
+    _warmup_prefill_jit(**kwargs)
 
 
-if _IS_NVIDIA:
+if _IS_HOPPER_PLUS:
 
     @register_kernel(
         "attention",

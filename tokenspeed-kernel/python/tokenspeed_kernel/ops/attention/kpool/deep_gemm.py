@@ -54,7 +54,7 @@ def _kpool_cache_views(
     return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
 
 
-if current_platform().is_nvidia:
+if current_platform().is_hopper_plus:
     from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
         deep_gemm_dsa_prefill_topk,
     )
@@ -71,16 +71,15 @@ if current_platform().is_nvidia:
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
         traits={
             "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
             "page_size": frozenset({16, 64}),
+            "pool_size": frozenset({4}),
+            "topk_pools": frozenset({512, 1024, 2048}),
+            "has_prefill_plan": frozenset({True}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
-            "topk_pools": frozenset({512, 1024, 2048}),
-            "prefill_plan": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
-        tags={"deep_gemm", "kpool", "ragged-prefill"},
     )
     def deep_gemm_kpool_prefill_topk(
         q: torch.Tensor,

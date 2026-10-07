@@ -21,14 +21,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     select_kernel,
@@ -258,8 +255,8 @@ def dsv4_swa_cache_insert(
     )
     traits = {
         "head_dim": int(q.shape[-1]),
-        "rope_dim": int(cos_sin_cache.shape[-1]),
         "quant_block_size": 64,
+        "rope_dim": int(cos_sin_cache.shape[-1]),
         "cache_layout": "fp8_swa_page_planar",
         "has_q_out": q_out is not None,
     }
@@ -356,8 +353,8 @@ def dsv4_csa_indexer_fp8_cache_insert(
     )
     traits = {
         "index_head_dim": int(rms_norm_weight.numel()),
-        "compress_ratio": int(compress_ratio),
         "page_size": int(kv_cache_block_size),
+        "compress_ratio": int(compress_ratio),
         "cache_format": "fp8_scaled_page_planar",
     }
     kernel = select_kernel(
@@ -463,11 +460,12 @@ def dsv4_prefill(
 
     signature = _attention_format_signature(q=q, kv=kv)
     traits = {
+        "num_q_heads": int(q.shape[1]),
         "head_dim": int(q.shape[-1]),
-        "cache_layout": "dense_workspace",
-        "support_sink": True,
         "selected_width": int(indices.shape[-1]),
+        "cache_layout": "dense_workspace",
         "metadata_dtypes": frozenset({indices.dtype, lens.dtype}),
+        "sinks": True,
     }
     kernel = select_kernel(
         "attention",
@@ -509,13 +507,40 @@ def dsv4_prefill(
         )
 
 
+_DSV4_PARTIAL_DECODE_TRAITS = {"return_lse": True, "sinks": False}
+
+
+def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
+    """Whether ``platform`` has a decode kernel that can emit a no-sink LSE.
+
+    Decode context parallelism attends to each rank's cache shard separately
+    and merges the partials through their LSE, so it needs a ``dsv4_decode``
+    kernel explicitly registered with ``sinks`` including False and
+    ``return_lse`` including True.
+
+    Args:
+        platform: Hardware the kernel must be registered for.
+
+    Returns:
+        True when at least one registered ``dsv4_decode`` kernel satisfies the
+        platform and both traits.
+    """
+    specs = KernelRegistry.get().get_for_operator(
+        "attention", "dsv4_decode", platform=platform
+    )
+    return any(
+        spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS, require_all_traits=True)
+        for spec in specs
+    )
+
+
 def dsv4_decode(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
     swa_lens: torch.Tensor,
     swa_page_size: int,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     extra_kv_cache: torch.Tensor | None = None,
     extra_slots: torch.Tensor | None = None,
@@ -524,7 +549,8 @@ def dsv4_decode(
     out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
     SWA and optional extra compressed rows form independent selected segments.
@@ -540,21 +566,31 @@ def dsv4_decode(
             prefix must be smaller than ``pages * swa_page_size``.
         swa_lens: Valid SWA selection length for each query token.
         swa_page_size: Number of SWA rows in each cache page.
-        attn_sink: One attention sink logit per query head.
+        attn_sink: One attention sink logit per query head, or None to omit
+            the sink when computing a DCP partial.
         softmax_scale: Scale applied to query-key dot products.
         extra_kv_cache: Optional uint8 page-planar compressed cache.
         extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
             entries in each active prefix must be smaller than
             ``extra_pages * extra_page_size``.
-        extra_lens: Valid extra selection length for each query token.
+        extra_lens: Extra scan length for each query token, including any -1
+            holes inside that prefix. Owner filtering must not shorten it when
+            indices retain their original order.
         extra_page_size: Number of rows in each extra cache page.
-        out: Optional output shaped like ``q``.
+        out: Optional output buffer shaped like ``q``. When provided, the
+            returned output is this same tensor, including with return_lse=True.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-
+        return_lse: Return a partial and its natural-log LSE. The LSE never
+            includes a sink, so ``attn_sink`` must be None; callers combining
+            partials apply the sink once after merging them.
     Returns:
-        BF16 attention output shaped like ``q``.
+        BF16 attention output shaped like ``q``. With return_lse=True, also
+        return natural-log FP32 LSE shaped [tokens, heads, 1], with one query
+        per token.
     """
+    if return_lse and attn_sink is not None:
+        raise ValueError("dsv4_decode returns a no-sink LSE; pass attn_sink=None")
     if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
         raise ValueError(
             f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
@@ -572,10 +608,10 @@ def dsv4_decode(
         raise TypeError("swa_slots must have dtype int32 or int64")
     if swa_lens.dtype not in (torch.int32, torch.int64):
         raise TypeError("swa_lens must have dtype int32 or int64")
-    if attn_sink.numel() < q.shape[1]:
+    if attn_sink is not None and attn_sink.numel() < q.shape[1]:
         raise ValueError("attn_sink must provide one value per query head")
     if any(
-        tensor.device != q.device
+        tensor is not None and tensor.device != q.device
         for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
     ):
         raise ValueError("all paged selected-attention tensors must share a device")
@@ -619,18 +655,15 @@ def dsv4_decode(
     extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
     signature = _attention_format_signature(q=q, swa_kv_cache=swa_kv_cache)
     traits = {
-        "tokens": tokens,
+        "num_tokens": tokens,
+        "num_q_heads": int(q.shape[1]),
         "head_dim": int(q.shape[-1]),
-        "num_heads": int(q.shape[1]),
-        "cache_layout": "fp8_swa_page_planar",
-        "topk_layout": "global_slots",
-        "support_sink": True,
-        "has_extra": has_extra_segment,
-        "has_extra_segment": has_extra_segment,
-        "swa_selected_width": swa_width,
-        "extra_selected_width": extra_width,
         "swa_page_size": int(swa_page_size),
         "extra_page_size": int(extra_page_size or 0),
+        "swa_selected_width": swa_width,
+        "extra_selected_width": extra_width,
+        "cache_layout": "fp8_swa_page_planar",
+        "has_extra_segment": has_extra_segment,
         "metadata_dtypes": frozenset(
             {
                 swa_slots.dtype,
@@ -642,6 +675,9 @@ def dsv4_decode(
                 ),
             }
         ),
+        "return_lse": return_lse,
+        "sinks": attn_sink is not None,
+        "topk_layout": "global_slots",
     }
     kernel = select_kernel(
         "attention",
@@ -651,6 +687,12 @@ def dsv4_decode(
         solution=solution,
         override=override,
     )
+    if return_lse:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is None or True not in spec.traits.get("return_lse", ()):
+            raise RuntimeError(
+                f"kernel {kernel.name!r} does not declare no-sink DSV4 LSE support"
+            )
     shape_params = {
         "tokens": tokens,
         "num_heads": int(q.shape[1]),
@@ -661,6 +703,8 @@ def dsv4_decode(
         "extra_page_size": int(extra_page_size or 0),
         "has_extra_segment": has_extra_segment,
     }
+    if return_lse:
+        shape_params["return_lse"] = True
     ShapeCapture.get().record(
         "attention",
         "dsv4_decode",
@@ -688,6 +732,7 @@ def dsv4_decode(
             extra_lens=extra_lens,
             extra_page_size=extra_page_size,
             out=out,
+            **({"return_lse": True} if return_lse else {}),
         )
 
 
@@ -763,8 +808,8 @@ def dsv4_prefill_topk(
     traits = {
         "index_heads": int(q_values.shape[-2]),
         "head_dim": int(logical_head_dim),
-        "topk": int(topk),
         "page_size": int(page_size),
+        "topk": int(topk),
         "index_k_format": index_k_format,
     }
     if weights.dtype != torch.float32:
@@ -821,9 +866,79 @@ def dsv4_prefill_topk(
             out=out,
         )
         spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is not None and spec.solution == "gluon":
+        if spec is not None and spec.solution in {"gluon", "triton"}:
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         return kernel(**kernel_kwargs)
+
+
+def dsv4_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    index_k_format: str,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score owned V4 Index-K pages for prefill or decode.
+
+    index_q holds prepared query values/scales; FP8-cache queries are BF16,
+    MXFP4 queries are packed uint8. weights holds per-head weights (including
+    query scaling for MXFP4). Cache pages are page-planar uint8. Page-table
+    columns retain global order with -1 for unowned pages. query_requests and
+    causal_lens identify each query's request and global compressed length.
+    page_size/topk select geometry; softmax_scale applies only to FP8 queries.
+    index_k_format selects fp8_scaled or mxfp4; solution=None uses dispatch.
+    Returns global logical offsets and FP32 scores, with (-1, -inf) padding.
+    """
+    if index_k_format not in ("fp8_scaled", "mxfp4"):
+        raise ValueError(f"Unsupported Index-K format: {index_k_format}")
+    q = index_q[0]
+    if q.ndim != 3 or weights.shape != q.shape[:2]:
+        raise ValueError("Index queries and per-head weights must match")
+    if topk <= 0 or topk & (topk - 1):
+        raise ValueError("Index candidate topk must be a positive power of two")
+    if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
+        raise ValueError("Index candidate rows must match queries")
+    if local_page_table.ndim != 2 or 0 in local_page_table.shape:
+        raise ValueError("Index candidates require a nonempty page table")
+    if not q.shape[0]:
+        return (
+            torch.empty((0, topk), device=q.device, dtype=torch.int32),
+            torch.empty((0, topk), device=q.device, dtype=torch.float32),
+        )
+    kernel = select_kernel(
+        "attention",
+        "dsv4_index_candidates",
+        _attention_format_signature(q=q, weights=weights, index_k_cache=index_k_cache),
+        traits={
+            "index_heads": q.shape[1],
+            "head_dim": q.shape[2] * (2 if index_k_format == "mxfp4" else 1),
+            "page_size": page_size,
+            "index_k_format": index_k_format,
+        },
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention", "dsv4_index_candidates", q.dtype, kernel_name=kernel.name
+    ):
+        return kernel(
+            index_q,
+            weights,
+            index_k_cache,
+            local_page_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            index_k_format=index_k_format,
+        )
 
 
 def dsv4_decode_topk(
@@ -889,8 +1004,8 @@ def dsv4_decode_topk(
     traits = {
         "index_heads": int(q_values.shape[-2]),
         "head_dim": int(logical_head_dim),
-        "topk": int(topk),
         "page_size": int(page_size),
+        "topk": int(topk),
         "index_k_format": index_k_format,
     }
     if weights.dtype != torch.float32:
@@ -944,7 +1059,7 @@ def dsv4_decode_topk(
             persistent_topk_workspace=persistent_topk_workspace,
         )
         spec = KernelRegistry.get().get_by_name(kernel.name)
-        if spec is not None and spec.solution == "gluon":
+        if spec is not None and spec.solution in {"gluon", "triton"}:
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         return kernel(**kernel_kwargs)
 
@@ -1074,6 +1189,7 @@ __all__ = [
     "dsv4_csa_indexer_fp8_cache_insert",
     "dsv4_prefill",
     "dsv4_decode",
+    "dsv4_decode_supports_partials",
     "dsv4_prefill_topk",
     "dsv4_decode_topk",
     "dsv4_plan",

@@ -31,6 +31,7 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
+      max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
       prefix_granularity_{prefix_granularity},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
@@ -51,28 +52,25 @@ PrefillInfo Request::CurrentPrefillInfo() const {
         state_);
 }
 
-std::int32_t Request::MaterializedStateBoundaryTokens() const {
-    // Feedback contains accepted tokens plus one not-yet-computed token.
-    // Admission subtracts the whole verify width for conservative retention;
-    // that frontier is not an exact recurrent-state endpoint.
-    std::int32_t endpoint = 0;
-    if (Is<fsm::Decoding>()) {
-        endpoint = TokenSize() - 1;
-    } else if (Is<fsm::PrefillDone>()) {
-        const PrefillInfo info = CurrentPrefillInfo();
-        endpoint = info.already_scheduled_len + info.extend_len;
-    }
-    if (endpoint > 0 && endpoint % prefix_granularity_ == 0) {
-        return endpoint;
-    }
-    return forwardState("MaterializedStateBoundaryTokens").CacheProgressRef().materialized_state_boundary_tokens;
+std::int32_t Request::NumComputedTokens() const {
+    return std::visit(
+        Overloaded{
+            [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
+            [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            [this](const fsm::Decoding&) { return TokenSize() - 1; },
+            [this](const auto&) -> std::int32_t {
+                throw std::logic_error(
+                    "Request::NumComputedTokens: expected Prefilling, PrefillDone or Decoding; got " + StateName());
+            },
+        },
+        state_);
 }
 
-fsm::ForwardState& Request::forwardState(const char* operation) {
-    fsm::ForwardState* result = std::visit(
-        []<typename State>(State& state) -> fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+fsm::ForwardResources& Request::forwardResources(const char* operation) {
+    fsm::ForwardResources* result = std::visit(
+        []<typename State>(State& state) -> fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },
@@ -83,11 +81,11 @@ fsm::ForwardState& Request::forwardState(const char* operation) {
     return *result;
 }
 
-const fsm::ForwardState& Request::forwardState(const char* operation) const {
-    const fsm::ForwardState* result = std::visit(
-        []<typename State>(const State& state) -> const fsm::ForwardState* {
-            if constexpr (std::derived_from<State, fsm::ForwardState>) {
-                return &state;
+const fsm::ForwardResources& Request::forwardResources(const char* operation) const {
+    const fsm::ForwardResources* result = std::visit(
+        []<typename State>(const State& state) -> const fsm::ForwardResources* {
+            if constexpr (fsm::HoldsForwardResources<State>) {
+                return &state.resources;
             }
             return nullptr;
         },

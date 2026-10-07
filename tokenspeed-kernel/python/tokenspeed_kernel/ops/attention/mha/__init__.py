@@ -21,19 +21,12 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
 
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
-from tokenspeed_kernel.selection import (
-    NoKernelFoundError,
-    select_kernel,
-    spec_matches_traits,
-)
+from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -122,18 +115,18 @@ def mha_plan(
     Returns:
         A dict containing:
         - "extend_mode":
-          "postwrite" means run prefill before writing KV cache;
-          "prewrite" means write KV cache first and run cached extend.
+          "postwrite" means prefill attends the new K/V rows directly;
+          "prewrite" means extend attention reads them from the KV cache.
     """
     if dtype == torch.float8_e4m3fn:
         return {"extend_mode": "prewrite"}
 
     traits = {
         "head_dim": head_dim,
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
     }
     signature = format_signature(
         q=dense_tensor_format(dtype),
@@ -216,13 +209,12 @@ def mha_prefill(
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "skip_softmax": skip_softmax_threshold > 0.0,
+        "sliding_window": window_left >= 0,
     }
-    if skip_softmax_threshold > 0.0:
-        traits["support_skip_softmax"] = True
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -351,10 +343,10 @@ def mha_extend_with_kvcache(
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",
@@ -475,10 +467,10 @@ def mha_decode_with_kvcache(
         "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
-        "sliding_window": window_left >= 0,
-        "support_logit_cap": logit_cap != 0.0,
-        "support_sinks": sinks is not None,
+        "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": sinks is not None,
+        "sliding_window": window_left >= 0,
     }
     kernel = select_kernel(
         "attention",
