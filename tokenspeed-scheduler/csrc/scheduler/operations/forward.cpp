@@ -506,7 +506,6 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                                                                   Request* request) {
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
-    fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t num_computed_tokens = 0;
     if (request->Is<fsm::PrefillDone>()) {
         const PrefillInfo previous = request->CurrentPrefillInfo();
@@ -515,8 +514,17 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
     }
 
-    const CompletedPrefixPages completed =
-        updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
+    const fsm::CacheProgress& previous = request->CacheProgress();
+    std::optional<fsm::CacheProgress> updated;
+    CompletedPrefixPages completed{
+        .first_new_prefix_page = static_cast<std::int32_t>(previous.prefix_hashes.size()),
+    };
+    if (num_computed_tokens / coordinator_.PrefixGranularity() > completed.first_new_prefix_page) {
+        updated = previous;
+        completed =
+            updateCompletedPrefixHashes(*request, *updated, num_computed_tokens, coordinator_.PrefixGranularity());
+    }
+    const fsm::CacheProgress& cache_progress = updated ? *updated : previous;
 
     if (completed.first_new_prefix_page == static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -539,7 +547,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         }
     }
 
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(cache_progress)};
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(updated)};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,

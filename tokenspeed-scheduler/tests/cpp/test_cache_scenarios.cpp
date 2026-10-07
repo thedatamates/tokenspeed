@@ -2776,8 +2776,9 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
         /*load_pairs=*/{},
     });
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, std::nullopt});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
+    EXPECT_EQ(request.CacheProgress().access_epoch, admission->access_epoch);
 
     request.Apply(
         fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/true, request.HasGeneratedOutput()});

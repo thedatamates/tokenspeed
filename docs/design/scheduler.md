@@ -171,6 +171,14 @@ must count the entire materialized suffix, not assume that two outputs always
 occupy two adjacent slots. Tests cover small pools that must reject an oversized
 request instead of accepting a request that can never produce a forward.
 
+### 1.3 Decode progress ownership
+
+A decode step that completes no new prefix page transfers its existing
+`CacheProgress` into the next state without copying the prefix hashes.
+When a step completes a page, scheduling builds updated progress separately
+and commits it with the successful transition. A failed admission leaves the
+request's previous progress intact.
+
 ## 2. Retraction: when admission fails
 
 `maybeRetractForCapacity` fires when **no prefill made progress** this round

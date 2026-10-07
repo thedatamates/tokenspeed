@@ -173,7 +173,7 @@ public:
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardState("BlockTablesRef").BlockTables(); }
 
-    fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
+    const fsm::CacheProgress& CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
     std::int32_t MaterializedStateBoundaryTokens() const;
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {

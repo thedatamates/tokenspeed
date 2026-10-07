@@ -126,8 +126,9 @@ Decoding ScheduleDecodeEvent::decode(State&& state) {
     const std::int32_t results_in_flight = state.ResultsInFlight();
     auto req_pool_index = std::move(state).TakeRequestPoolIndex();
     auto block_tables = std::move(state).TakeBlockTables();
+    auto cache_progress = cache_progress_ ? std::move(*cache_progress_) : std::move(state).TakeCacheProgress();
     Decoding decoding{token_container,      prefix_granularity,      std::move(req_pool_index),
-                      decode_input_tokens_, std::move(block_tables), std::move(cache_progress_)};
+                      decode_input_tokens_, std::move(block_tables), std::move(cache_progress)};
     decoding.CarryResultsInFlight(results_in_flight);
     return decoding;
 }

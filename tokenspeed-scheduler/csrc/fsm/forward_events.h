@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -104,7 +105,7 @@ private:
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, CacheProgress cache_progress)
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, std::optional<CacheProgress> cache_progress)
         : decode_input_tokens_{decode_input_tokens}, cache_progress_{std::move(cache_progress)} {}
 
     Decoding operator()(PrefillDone&& state);
@@ -116,7 +117,7 @@ private:
     Decoding decode(State&& state);
 
     std::int32_t decode_input_tokens_{};
-    CacheProgress cache_progress_;
+    std::optional<CacheProgress> cache_progress_;
 };
 
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
