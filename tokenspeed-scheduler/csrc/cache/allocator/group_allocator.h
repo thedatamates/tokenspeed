@@ -113,7 +113,6 @@ public:
             }
         }
         if (plan.suffix_start < 0) {
-            table.blocks_.reserve(table.blocks_.size() + block_refs.size());
             for (CacheBlockRef& block_ref : block_refs) {
                 table.blocks_.push_back(std::move(block_ref));
             }
