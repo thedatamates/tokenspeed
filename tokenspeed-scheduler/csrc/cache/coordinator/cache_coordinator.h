@@ -149,8 +149,8 @@ public:
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
-    // result is passed to Admit. Admit leaves the probe intact when capacity is
-    // unavailable so the caller may perform a hypothetical-release check.
+    // result is passed to Admit. Admit borrows the probe and copies it only
+    // after capacity planning succeeds; failed attempts leave it intact.
     // A missing epoch starts a new request; a supplied epoch continues that
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
@@ -164,7 +164,7 @@ public:
     // what the request completed since its previous admission. Completed
     // pages are published and expired slots reclaimed inside this
     // transaction, before the new pages are acquired.
-    std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+    std::optional<AdmissionResult> Admit(const PrefixProbe& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch);
     // Capacity views for scheduling code, counted in LCM parent blocks. The

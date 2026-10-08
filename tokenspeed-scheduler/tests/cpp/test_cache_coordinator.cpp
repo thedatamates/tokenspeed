@@ -761,7 +761,13 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
     std::vector<GroupDemand> rejected_demands{
         GroupDemand{.table = &rejected_tables[0], .extent = DenseGrowth{4}},
     };
-    EXPECT_FALSE(coordinator.Admit(std::move(probe), rejected_demands, RequestProgress{}, std::nullopt));
+    const auto keys_before = probe.group_keys;
+    const auto hits_before = probe.device.per_group.front().hits;
+    const auto tokens_before = probe.device.num_common_tokens;
+    EXPECT_FALSE(coordinator.Admit(probe, rejected_demands, RequestProgress{}, std::nullopt));
+    EXPECT_EQ(probe.group_keys, keys_before);
+    EXPECT_EQ(probe.device.per_group.front().hits, hits_before);
+    EXPECT_EQ(probe.device.num_common_tokens, tokens_before);
     metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
     EXPECT_EQ(metadata->last_access_epoch, owner->access_epoch);
@@ -772,7 +778,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
         GroupDemand{.table = &hit_tables[0]},
     };
     const std::optional<CacheCoordinator::AdmissionResult> hit =
-        coordinator.Admit(coordinator.ProbePrefix(hashes), hit_demands, RequestProgress{}, std::nullopt);
+        coordinator.Admit(probe, hit_demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(hit);
     EXPECT_EQ(hit->access_epoch, owner->access_epoch + 1);
 }

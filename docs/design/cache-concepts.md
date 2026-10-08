@@ -563,7 +563,9 @@ Its responsibilities:
   sparse private suffix from the replay window's first token
   ([Scheduler §1.3](scheduler.md#13-bounded-replay)). Probe and admit are
   deliberately split so the probe can be taken once and the admission retried
-  against it — the scheduler's same-round retract-and-grant re-runs a failed
+  against it. Admission borrows the probe during capacity planning and copies
+  it only after the plan succeeds, avoiding copies for rejected attempts.
+  The scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
   An L3 Host-prefetch shortage is different: `Admit` may return a shorter
   `host_prefix_tokens` than the probe, rounded down to `prefix_granularity`

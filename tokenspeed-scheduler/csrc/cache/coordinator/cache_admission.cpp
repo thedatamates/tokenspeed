@@ -358,7 +358,8 @@ private:
 
 std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, const BlockPool& pool,
-                                           CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+                                           const CacheCoordinator::PrefixProbe& prefix,
+                                           std::span<const GroupDemand> demands,
                                            std::optional<std::int32_t> num_computed_tokens) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
@@ -367,7 +368,7 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     if (!planner.Plan()) {
         return std::nullopt;
     }
-    return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims)};
+    return AdmissionPlan{.prefix = prefix, .victims = std::move(victims)};
 }
 
 }  // namespace
@@ -380,7 +381,7 @@ std::int32_t CacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix
 }
 
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
-    PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
+    const PrefixProbe& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
     std::optional<std::uint64_t> request_access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (const GroupDemand& demand : demands) {
@@ -417,7 +418,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
 
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, pool_, std::move(prefix), demands, progress.num_computed_tokens);
+        planAdmission(groups_, geometry_, pool_, prefix, demands, progress.num_computed_tokens);
     if (!candidate) {
         return std::nullopt;
     }

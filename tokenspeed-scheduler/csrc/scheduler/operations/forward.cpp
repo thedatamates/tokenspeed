@@ -273,7 +273,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
                                                                   const RequestProgress& progress,
                                                                   std::optional<std::uint64_t> request_access_epoch) {
     std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch);
+        coordinator_.Admit(prefix, demands, progress, request_access_epoch);
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -414,9 +414,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         // Admit here, not through Scheduler::admit: a shortened Host prefix
         // retries after Free(tables), and that helper would leave discarded
         // new_page_ids in plan.pages_to_zero.
-        CacheCoordinator::PrefixProbe probe_for_admit = match.probe;
         // First admission has computed nothing to publish or reclaim.
-        admission = coordinator_.Admit(std::move(probe_for_admit), demands, RequestProgress{},
+        admission = coordinator_.Admit(match.probe, demands, RequestProgress{},
                                        /*request_access_epoch=*/std::nullopt);
         if (!admission) {
             feedback.admission_failed = true;
