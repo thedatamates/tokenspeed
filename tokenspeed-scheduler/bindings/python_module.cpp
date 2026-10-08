@@ -276,6 +276,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  // Zero-copy 2-D int32 views; `self` keeps the backing
                  // ForwardBatch alive for the lifetime of each ndarray.
                  auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                 if (op.block_tables_contig.empty()) {
+                     decltype(op.block_tables_contig) tables;
+                     for (const auto& [gid, table] : op.block_tables) {
+                         auto& contiguous = tables[gid];
+                         const std::size_t columns = table.empty() ? 0 : table.front().size();
+                         contiguous.reserve(table.size() * columns);
+                         for (const auto& row : table) {
+                             contiguous.insert(contiguous.end(), row.begin(), row.end());
+                         }
+                     }
+                     op.block_tables_contig = std::move(tables);
+                 }
                  nb::dict out;
                  for (auto& [gid, buf] : op.block_tables_contig) {
                      const std::size_t rows = op.request_ids.size();

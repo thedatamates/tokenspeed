@@ -80,6 +80,7 @@ TEST(ForwardBatch, MultiRequestPadsRaggedRowsWithMinusOne) {
     ASSERT_EQ(full.size(), 2u);
     EXPECT_EQ(full.at(0), (std::vector<std::int32_t>{10, 11, 12}));
     EXPECT_EQ(full.at(1), (std::vector<std::int32_t>{20, -1, -1}));
+    EXPECT_TRUE(batch.block_tables_contig.empty());
 }
 
 // Cache contract: 0 = real null-block hole, -1 = absent (pad) column.

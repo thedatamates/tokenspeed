@@ -84,7 +84,8 @@ struct ForwardBatch {
     // (null hole = 0, no compaction); there is no base-offset companion.
     std::map<std::string, std::vector<std::vector<std::int32_t>>> block_tables;
     // Contiguous row-major copy of block_tables ([rows * cols], -1
-    // padded), exposed zero-copy to Python as a 2-D ndarray -- the nested
+    // padded), built on Python array access and exposed zero-copy as a 2-D
+    // ndarray -- the nested
     // vectors above cost one PyLong per page id at every attribute access.
     std::map<std::string, std::vector<std::int32_t>> block_tables_contig;
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
@@ -129,16 +130,12 @@ struct ForwardBatch {
             ++row;
         }
         for (auto& [gid, table] : block_tables) {
-            const std::size_t rows = table.size();
             std::size_t columns = 0;
             for (const auto& request_table : table) {
                 columns = std::max(columns, request_table.size());
             }
-            auto& contiguous = block_tables_contig[gid];
-            contiguous.reserve(rows * columns);
             for (auto& request_table : table) {
                 request_table.resize(columns, -1);
-                contiguous.insert(contiguous.end(), request_table.begin(), request_table.end());
             }
         }
     }
