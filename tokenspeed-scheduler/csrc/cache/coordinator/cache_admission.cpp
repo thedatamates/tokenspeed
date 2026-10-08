@@ -44,14 +44,16 @@ struct AdmissionPlan {
 class AdmissionPlanner {
 public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
-                     const BlockPool& pool, std::span<const GroupDemand> demands,
-                     std::optional<std::int32_t> num_computed_tokens, const CacheCoordinator::PrefixProbe& prefix,
+                     const BlockPool& pool, std::span<const GroupDemand> demands, const RequestProgress& progress,
+                     std::int32_t prefix_granularity, const CacheCoordinator::PrefixProbe& prefix,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
           geometry_{geometry},
           pool_{pool},
           demands_{demands},
-          num_computed_tokens_{num_computed_tokens},
+          num_computed_tokens_{progress.num_computed_tokens},
+          progress_{progress},
+          prefix_granularity_{prefix_granularity},
           prefix_{prefix},
           victims_{victims},
           local_free_slots_(groups.size()),
@@ -100,12 +102,14 @@ private:
     // probationary boundaries follow, before established boundaries and closed
     // prefixes. Those useful entries share one LRU class, with tier breaking
     // ties within an epoch. Position keeps the deeper unproven non-closed
-    // boundary, while a closed prefix is reclaimed from its suffix.
+    // boundary, while a closed prefix is reclaimed from its suffix. A prompt
+    // window about to be published is considered last, but remains reclaimable.
     enum class EvictionTier {
         kUncached,  // physically allocated, but owned only by the request table
         kProbationaryBoundary,
         kEstablishedBoundary,
         kClosedPrefix,
+        kPublishingEndpoint,
     };
 
     struct VictimCandidate {
@@ -117,7 +121,8 @@ private:
     };
 
     static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{std::min(candidate.eviction_tier, EvictionTier::kEstablishedBoundary),
+        return std::tuple{candidate.eviction_tier == EvictionTier::kPublishingEndpoint,
+                          std::min(candidate.eviction_tier, EvictionTier::kEstablishedBoundary),
                           candidate.last_access_epoch,
                           candidate.eviction_tier,
                           candidate.position_rank,
@@ -227,8 +232,28 @@ private:
                 if (!first_occurrence) {
                     continue;
                 }
-                request_reclaim_candidates_.push_back(
-                    makeVictimCandidate(group_id, location, groups_[i].Index().MetadataFor(pool_, location)));
+                auto candidate =
+                    makeVictimCandidate(group_id, location, groups_[i].Index().MetadataFor(pool_, location));
+                // Prefer another victim before discarding a window this
+                // transaction is about to publish. It remains reclaimable.
+                if (progress_.completed_pages && progress_.endpoint_tokens &&
+                    *progress_.endpoint_tokens / prefix_granularity_ > 0 &&
+                    static_cast<std::int32_t>(progress_.completed_pages->prefix_hashes.size()) ==
+                        *progress_.endpoint_tokens / prefix_granularity_ &&
+                    groups_[i].Spec().kind == AttnKind::kSlidingWindow && !groups_[i].Spec().replayable) {
+                    const auto boundary = static_cast<std::int32_t>(progress_.completed_pages->prefix_hashes.size()) *
+                                          (prefix_granularity_ / geometry_[i].BlockGranularity());
+                    const auto first = std::max(0, boundary - groups_[i].Matcher().BoundaryLookbackPages());
+                    const auto blocks = demands_[i].table->Blocks();
+                    for (auto block = first; block < boundary && block < static_cast<std::int32_t>(blocks.size());
+                         ++block) {
+                        if (blocks[block] && blocks[block]->Location() == location) {
+                            candidate.eviction_tier = EvictionTier::kPublishingEndpoint;
+                            break;
+                        }
+                    }
+                }
+                request_reclaim_candidates_.push_back(candidate);
             }
         }
         std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
@@ -342,6 +367,8 @@ private:
     const BlockPool& pool_;
     std::span<const GroupDemand> demands_;
     std::optional<std::int32_t> num_computed_tokens_;
+    const RequestProgress& progress_;
+    std::int32_t prefix_granularity_;
     const CacheCoordinator::PrefixProbe& prefix_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
     std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
@@ -359,12 +386,12 @@ private:
 std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, const BlockPool& pool,
                                            const CacheCoordinator::PrefixProbe& prefix,
-                                           std::span<const GroupDemand> demands,
-                                           std::optional<std::int32_t> num_computed_tokens) {
+                                           std::span<const GroupDemand> demands, const RequestProgress& progress,
+                                           std::int32_t prefix_granularity) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, geometry, pool, demands, num_computed_tokens, prefix, victims};
+    AdmissionPlanner planner{groups, geometry, pool, demands, progress, prefix_granularity, prefix, victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -418,7 +445,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
 
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, pool_, prefix, demands, progress.num_computed_tokens);
+        planAdmission(groups_, geometry_, pool_, prefix, demands, progress, prefix_granularity_);
     if (!candidate) {
         return std::nullopt;
     }

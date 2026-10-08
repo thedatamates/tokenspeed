@@ -595,6 +595,10 @@ Its responsibilities:
   retention. Publication fields are request-scoped and therefore live on the
   progress, not replicated onto every group's demand.
 
+  `endpoint_tokens`, when known, identifies the prompt endpoint for eviction
+  priority. It does not change publication eligibility or retention, and is
+  independent of state-checkpoint classification.
+
   Publication rides inside `Admit` on purpose. "Completed" means scheduled
   stream order for prefill (`NumComputedTokens` is the scheduled window end;
   the FIFO data plane orders any hitter's forward after the writer) and
@@ -886,6 +890,12 @@ class. Within each class, request access epoch precedes tier and position.
 Established boundaries precede closed prefixes within an epoch; closed prefixes
 are reclaimed from the suffix. Finally, walk the selected blocks in reverse
 and restore every block not strictly required, yielding a minimal eviction set.
+
+An expired sliding-window block in the last aligned prompt window is selected
+after other victims when this transaction is about to publish that window.
+It remains reclaimable if needed for capacity; no extra pages are reserved.
+Replayable groups never publish and receive no such priority. The preference
+exists only during this planning pass, without changing cache access epochs.
 
 Request-reclaimable candidates are collected and sorted once. Each cache group
 uses a non-owning cursor over its tier's eviction index, ordered by retention

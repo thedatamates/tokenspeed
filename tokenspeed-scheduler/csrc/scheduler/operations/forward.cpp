@@ -161,7 +161,10 @@ RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cac
     if (filled_prefix_pages > first_new_prefix_page) {
         appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
     }
-    RequestProgress progress{.num_computed_tokens = num_computed_tokens};
+    RequestProgress progress{
+        .num_computed_tokens = num_computed_tokens,
+        .endpoint_tokens = request.PrefillSize(),
+    };
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
         progress.completed_pages = CompletedPages{
             .prefix_hashes = cache_progress.prefix_hashes,

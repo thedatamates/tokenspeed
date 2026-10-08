@@ -135,6 +135,101 @@ TEST(FullAttnMatcherTest, ProbeRequiresExplicitL3HitSet) {
     EXPECT_EQ(probe.hits.front(), 1);
 }
 
+TEST(CacheCoordinatorAdmissionTest, EndpointPriorityDoesNotBlockOtherwiseFeasibleGrowth) {
+    BlockPool pool(6, {1});
+    BlockPool host(32, {1});
+    const std::vector<CacheGroupSpec> specs = {{
+        .kind = AttnKind::kSlidingWindow,
+        .sliding_window = 3,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    auto coordinator = MakeCoordinator(specs, 4, pool, false, &host, true);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 11));
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = hashes,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kChunk,
+                .state_boundary_kind = CacheBoundaryKind::kEndpoint,
+                .stream_completed_to_host = true,
+            },
+        .num_computed_tokens = 11,
+        .endpoint_tokens = 11,
+    };
+    std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{8}}};
+    EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt));
+}
+
+TEST(CacheCoordinatorAdmissionTest, EndpointPriorityPreservesWindowBeforeAnotherCachedVictim) {
+    BlockPool pool(7, {1});
+    const std::vector<CacheGroupSpec> specs = {{
+        .kind = AttnKind::kSlidingWindow,
+        .sliding_window = 3,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, false);
+    const auto unrelated = ContentHashes({{9, 9, 9, 9}}).front();
+    CacheForGroup(coordinator, pool, unrelated, 0);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 11));
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = hashes,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kChunk,
+            },
+        .num_computed_tokens = 11,
+        .endpoint_tokens = 11,
+    };
+    std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{8}}};
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt));
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 8);
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(unrelated, 0)));
+}
+
+TEST(CacheCoordinatorAdmissionTest, ReplayableEndpointDoesNotDisplacePublishedHistory) {
+    BlockPool pool(10, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 3,
+         .replayable = true,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 2},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, false);
+    const auto unrelated = ContentHashes({{9, 9, 9, 9}}).front();
+    CacheForGroup(coordinator, pool, unrelated, 0);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    std::vector<GroupDemand> initial = {
+        {.table = &tables[0], .extent = DenseGrowth{11}},
+        {.table = &tables[1], .extent = DenseGrowth{11}},
+    };
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), initial, RequestProgress{}, std::nullopt));
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const RequestProgress progress{
+        .completed_pages = CompletedPages{.prefix_hashes = hashes},
+        .num_computed_tokens = 11,
+        .endpoint_tokens = 11,
+    };
+    std::vector<GroupDemand> demands = {
+        {.table = &tables[0], .extent = DenseGrowth{0}},
+        {.table = &tables[1], .extent = DenseGrowth{8}},
+    };
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, std::nullopt));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(unrelated, 0)));
+}
+
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     BlockPool pool(8, {1});
     auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7, /*shard_count=*/1);

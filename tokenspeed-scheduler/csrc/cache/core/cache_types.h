@@ -164,6 +164,9 @@ struct RequestProgress {
     // request's first admission, whose tables hold nothing to reclaim.
     // Required whenever completed_pages is present.
     std::optional<std::int32_t> num_computed_tokens{};
+    // The prompt endpoint identifies its last aligned history window without
+    // changing publication or retention for any cache group.
+    std::optional<std::int32_t> endpoint_tokens{};
 };
 
 struct PrefixMatch {
