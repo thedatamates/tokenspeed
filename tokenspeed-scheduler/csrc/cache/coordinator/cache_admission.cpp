@@ -120,15 +120,15 @@ private:
         std::int64_t position_rank;
     };
 
+    static auto evictionPriority(EvictionTier tier, std::uint64_t epoch) {
+        return std::tuple{tier == EvictionTier::kPublishingEndpoint, std::min(tier, EvictionTier::kEstablishedBoundary),
+                          epoch};
+    }
+
     static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{candidate.eviction_tier == EvictionTier::kPublishingEndpoint,
-                          std::min(candidate.eviction_tier, EvictionTier::kEstablishedBoundary),
-                          candidate.last_access_epoch,
-                          candidate.eviction_tier,
-                          candidate.position_rank,
-                          candidate.group_id,
-                          candidate.location.lcm_block_id,
-                          candidate.location.slot_index};
+        return std::tuple_cat(evictionPriority(candidate.eviction_tier, candidate.last_access_epoch),
+                              std::tuple{candidate.eviction_tier, candidate.position_rank, candidate.group_id,
+                                         candidate.location.lcm_block_id, candidate.location.slot_index});
     }
 
     static bool shouldEvictFirst(const VictimCandidate& lhs, const VictimCandidate& rhs) {
@@ -163,23 +163,32 @@ private:
         empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
-    VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
-                                        const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
+    EvictionTier evictionTier(std::uint32_t group_id,
+                              const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
         const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
         const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
         const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
         const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
                                               !(metadata && metadata->was_acquired) && logical_block_index >= 0;
-        const EvictionTier eviction_tier = [&] {
-            if (last_access_epoch == 0) {
-                return EvictionTier::kUncached;
-            }
-            if (is_probationary_boundary) {
-                return EvictionTier::kProbationaryBoundary;
-            }
-            return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
-        }();
+        if (last_access_epoch == 0) {
+            return EvictionTier::kUncached;
+        }
+        if (is_probationary_boundary) {
+            return EvictionTier::kProbationaryBoundary;
+        }
+        return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
+    }
+
+    VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
+                                        const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
+        const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
+        const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
+        const EvictionTier eviction_tier = evictionTier(group_id, metadata);
+        const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
+        const bool is_probationary_boundary = !is_prefix_closed && metadata &&
+                                              metadata->boundary_kind == CacheBoundaryKind::kChunk &&
+                                              !metadata->was_acquired && logical_block_index >= 0;
         std::int64_t position_rank = 0;
         if (is_probationary_boundary) {
             // Retain the longer unproven frontier.
@@ -292,28 +301,40 @@ private:
 
     std::optional<VictimCandidate> nextVictimCandidate() {
         CacheGroupVictimCandidates* selected_group = nullptr;
+        const VictimCandidate* selected = next_request_candidate_index_ < request_reclaim_candidates_.size()
+                                              ? &request_reclaim_candidates_[next_request_candidate_index_]
+                                              : nullptr;
         for (CacheGroupVictimCandidates& group : cache_group_candidates_) {
+            if (selected != nullptr) {
+                const auto oldest = groups_[group.group_id].Index().OldestEvictionMetadata(pool_);
+                if (!oldest) {
+                    continue;
+                }
+                // Include pinned entries in this bound. Equal class/epoch must
+                // still be scanned because the remaining policy tie-breaks can win.
+                if (evictionPriority(evictionTier(group.group_id, oldest), oldest->last_access_epoch) >
+                    evictionPriority(selected->eviction_tier, selected->last_access_epoch)) {
+                    continue;
+                }
+            }
             if (!ensureGroupCandidateAvailable(group)) {
                 continue;
             }
-            if (selected_group == nullptr ||
-                shouldEvictFirst(group.CurrentCandidate(), selected_group->CurrentCandidate())) {
+            if (selected == nullptr || shouldEvictFirst(group.CurrentCandidate(), *selected)) {
                 selected_group = &group;
+                selected = &group.CurrentCandidate();
             }
         }
 
-        if (next_request_candidate_index_ < request_reclaim_candidates_.size()) {
-            const VictimCandidate& request_candidate = request_reclaim_candidates_[next_request_candidate_index_];
-            if (selected_group == nullptr || shouldEvictFirst(request_candidate, selected_group->CurrentCandidate())) {
-                ++next_request_candidate_index_;
-                return request_candidate;
-            }
-        }
-        if (selected_group == nullptr) {
+        if (selected == nullptr) {
             return std::nullopt;
         }
-        const VictimCandidate candidate = selected_group->CurrentCandidate();
-        ++selected_group->next_candidate_index;
+        const VictimCandidate candidate = *selected;
+        if (selected_group != nullptr) {
+            ++selected_group->next_candidate_index;
+        } else {
+            ++next_request_candidate_index_;
+        }
         return candidate;
     }
 

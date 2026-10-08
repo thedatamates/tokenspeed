@@ -146,6 +146,10 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) 
     index.Register(pool, pinned, KeyOf("pinned"), /*access_epoch=*/10, /*logical_block_index=*/-1,
                    CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
 
+    // The bound must include a pinned older entry, not just today's victims.
+    ASSERT_TRUE(index.OldestEvictionMetadata(pool).has_value());
+    EXPECT_EQ(index.OldestEvictionMetadata(pool)->last_access_epoch, 10u);
+
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{unpinned}));
 
     pinned.reset();

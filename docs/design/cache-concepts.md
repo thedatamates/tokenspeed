@@ -903,6 +903,10 @@ class and access epoch. It loads and sorts one class/epoch at a time, skipping
 pinned, protected and request-reclaimable entries. Boundary promotion and first
 acquisition re-key entries even when the epoch is unchanged. Selection compares
 the next candidate from each group with the next request-reclaimable candidate.
+The oldest indexed class/epoch, including pinned entries, bounds each group's
+priority. A group is not traversed while that bound is later than an available
+victim; equal bounds still require traversal for the policy's tie-breaks. This
+does not cache pin eligibility or mark a deferred group exhausted.
 Cursors exist only during one read-only planning pass: their index and pool
 must remain alive, and entries must not be inserted, erased or re-keyed during
 traversal. Commit-time mutations happen after the planner is destroyed.

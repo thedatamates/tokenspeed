@@ -194,6 +194,16 @@ public:
         return metadataOf(*entry_it);
     }
 
+    // Includes pinned entries: this bounds eviction priority without promising
+    // that the oldest entry is evictable.
+    std::optional<CachedBlockMetadata> OldestEvictionMetadata(const BlockPool& pool) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr || cache_index->by_eviction_order.empty()) {
+            return std::nullopt;
+        }
+        return metadataOf(*cache_index->by_eviction_order.begin()->second);
+    }
+
     // Appends unpinned entries of the next retention class/epoch with candidates.
     // Skips fully pinned epochs and returns false at exhaustion. The cursor
     // advances continuously, without a tree lookup for each skipped epoch.

@@ -1471,6 +1471,33 @@ TEST(CacheCoordinatorAdmissionTest, OlderFullHistoryYieldsToNewerSlidingEndpoint
     EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)));
 }
 
+TEST(CacheCoordinatorAdmissionTest, DeferredHistoryIsRevisitedWhenMoreCapacityIsNeeded) {
+    for (const std::int32_t tokens : {4, 8}) {
+        SCOPED_TRACE(tokens);
+        BlockPool pool(2, {1, 1});
+        const std::vector<CacheGroupSpec> specs = {
+            {.kind = AttnKind::kSlidingWindow,
+             .sliding_window = 8,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 4},
+            {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        };
+        CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false,
+                                                       /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+        const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+        CacheBoundaryForGroup(coordinator, pool, hashes[0], 0, 20, 0, CacheBoundaryKind::kChunk);
+        CacheBoundaryForGroup(coordinator, pool, hashes[1], 1, 10, 0, CacheBoundaryKind::kChunk);
+        std::vector<BlockTable> tables(coordinator.NumGroups());
+        std::vector<GroupDemand> demands = {
+            {.table = &tables[0], .extent = DenseGrowth{tokens}},
+            {.table = &tables[1]},
+        };
+        ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt));
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
+        EXPECT_EQ(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)), tokens == 4);
+    }
+}
+
 TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistory) {
     BlockPool pool(3, {1, 1, 1});
     const std::vector<CacheGroupSpec> specs = {
