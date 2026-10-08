@@ -40,6 +40,7 @@ public:
     }
 
     const std::vector<Operation>& Operations() const { return operations_; }
+    std::vector<Operation> TakeOperations() && { return std::move(operations_); }
 
     // Cache child pages newly assigned in this plan. Group identity is
     // required because one LCM parent can still contain live sibling children.

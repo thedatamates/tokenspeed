@@ -658,6 +658,10 @@ no victim and nothing could free that page.
 
 ## 5. Invariants a change must preserve
 
+Native consumers may take a plan's operation list with
+`std::move(plan).TakeOperations()`. The returned operations own their buffers;
+`pages_to_zero` and the remote streams remain with the plan.
+
 - Admission never grants pages for tokens beyond the chunk being scheduled,
   except the decode reserve on the completing chunk (1), the snapshot-state
   growth block banked by the admission that finishes shaping a state group

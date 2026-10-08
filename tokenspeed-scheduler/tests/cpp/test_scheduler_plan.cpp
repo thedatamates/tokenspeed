@@ -24,8 +24,35 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace tokenspeed::test {
+
+TEST(ExecutionPlan, TakenOperationsOwnPageTablesAfterPlanDestruction) {
+    std::vector<Operation> operations;
+    const std::int32_t* page_storage = nullptr;
+    {
+        DecodeOperation decode;
+        decode.request_id = "request";
+        decode.block_tables["history"] = {0, 3, 7};
+        std::vector<ForwardOperation> rows;
+        rows.emplace_back(std::move(decode));
+        ExecutionPlan plan;
+        plan.With(ForwardBatch{std::move(rows)});
+        plan.pages_to_zero["history"] = {7};
+        page_storage = std::get<ForwardBatch>(plan.Operations().front()).block_tables.at("history").front().data();
+        operations = std::move(plan).TakeOperations();
+        EXPECT_EQ(plan.pages_to_zero.at("history"), (std::vector<std::int32_t>{7}));
+    }
+    ASSERT_EQ(operations.size(), 1u);
+    auto& batch = std::get<ForwardBatch>(operations.front());
+    auto pages = std::move(batch.block_tables.at("history").front());
+    EXPECT_EQ(pages.data(), page_storage);
+    operations.clear();
+    EXPECT_EQ(pages, (std::vector<std::int32_t>{0, 3, 7}));
+}
 
 class LoadBackViaCacheTestSuite : public SchedulerTestSuite {
 protected:
