@@ -79,8 +79,8 @@ struct ForwardBatch {
     // candidates hold an empty vector.
     std::vector<std::vector<std::int32_t>> spec_candidate_ids;
 
-    // Per-group block tables: dict[group_id] =
-    // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
+    // Per-group block tables, with one logical-length row per request.
+    // Each row is absolute
     // (null hole = 0, no compaction); there is no base-offset companion.
     std::map<std::string, std::vector<std::vector<std::int32_t>>> block_tables;
     // Contiguous row-major copy of block_tables ([rows * cols], -1
@@ -128,15 +128,6 @@ struct ForwardBatch {
                 },
                 op);
             ++row;
-        }
-        for (auto& [gid, table] : block_tables) {
-            std::size_t columns = 0;
-            for (const auto& request_table : table) {
-                columns = std::max(columns, request_table.size());
-            }
-            for (auto& request_table : table) {
-                request_table.resize(columns, -1);
-            }
         }
     }
 

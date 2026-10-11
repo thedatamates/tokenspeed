@@ -192,6 +192,11 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+C++ forward batches retain each request's logical table length. Python's
+`block_tables` and `block_tables_arrays()` exports pad rows to the group's
+maximum width with `-1`; this rectangular padding is an export concern, not
+cache residency or a logical null hole (`0`).
+
 With DCP virtual-block placement, `CacheBatchMetadata` validates exported IDs
 against each group's **virtual** block count. The physical page count bounds
 local arena storage only; applying it to the scheduler table would reject valid

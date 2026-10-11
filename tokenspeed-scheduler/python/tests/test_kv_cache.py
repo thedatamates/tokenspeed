@@ -133,6 +133,34 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
     assert not hasattr(op, "sizes")
 
 
+def test_ragged_block_tables_export_rectangular_lists_and_arrays():
+    import numpy as np
+
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests(
+        [
+            _make_spec("short", num_pages=1),
+            _make_spec("long", num_pages=3, start=20),
+        ]
+    )
+    op = _find_forward_op(scheduler.next_execution_plan())
+    assert op is not None
+    # Exercise array access before list access and repeated access afterward.
+    arrays = op.block_tables_arrays()
+    tables = op.block_tables
+    short = list(op.request_ids).index("short")
+    for group, array in arrays.items():
+        assert array.dtype == np.int32
+        # Each prompt also reserves its continuation page.
+        assert array.shape == (2, 4)
+        assert array.tolist() == tables[group]
+        assert array[short, 2:].tolist() == [-1, -1]
+        assert op.block_tables_arrays()[group].tolist() == tables[group]
+    expected = arrays["full"].tolist()
+    del op
+    assert arrays["full"].tolist() == expected
+
+
 def test_pages_to_zero_arrays_view_the_plan_without_python_ints():
     import numpy as np
 

@@ -28,6 +28,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "scheduler/outside_events/inc.h"
@@ -266,11 +267,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
         .def_ro("spec_candidate_ids", &tokenspeed::ForwardBatch::spec_candidate_ids)
-        .def_prop_ro(
-            "block_tables",
-            [](const tokenspeed::ForwardBatch& op)
-                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& { return op.block_tables; },
-            nb::rv_policy::reference_internal)
+        .def_prop_ro("block_tables",
+                     [](const tokenspeed::ForwardBatch& op) {
+                         auto tables = op.block_tables;
+                         for (auto& [gid, table] : tables) {
+                             std::size_t columns = 0;
+                             for (const auto& row : table) columns = std::max(columns, row.size());
+                             for (auto& row : table) row.resize(columns, -1);
+                         }
+                         return tables;
+                     })
         .def("block_tables_arrays",
              [](nb::handle self) {
                  // Zero-copy 2-D int32 views; `self` keeps the backing
@@ -280,10 +286,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                      decltype(op.block_tables_contig) tables;
                      for (const auto& [gid, table] : op.block_tables) {
                          auto& contiguous = tables[gid];
-                         const std::size_t columns = table.empty() ? 0 : table.front().size();
-                         contiguous.reserve(table.size() * columns);
-                         for (const auto& row : table) {
-                             contiguous.insert(contiguous.end(), row.begin(), row.end());
+                         std::size_t columns = 0;
+                         for (const auto& row : table) columns = std::max(columns, row.size());
+                         contiguous.assign(table.size() * columns, -1);
+                         for (std::size_t row = 0; row < table.size(); ++row) {
+                             std::copy(table[row].begin(), table[row].end(), contiguous.begin() + row * columns);
                          }
                      }
                      op.block_tables_contig = std::move(tables);

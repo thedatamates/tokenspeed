@@ -178,11 +178,10 @@ TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {
     ASSERT_EQ(full.size(), 2u);
     ASSERT_EQ(swa.size(), 2u);
 
-    EXPECT_EQ(full.at(0).size(), full.at(1).size());
-    EXPECT_EQ(swa.at(0).size(), swa.at(1).size());
-    const bool any_pad = std::any_of(full.at(0).begin(), full.at(0).end(), [](std::int32_t id) { return id == -1; }) ||
-                         std::any_of(full.at(1).begin(), full.at(1).end(), [](std::int32_t id) { return id == -1; });
-    EXPECT_TRUE(any_pad) << "unequal prompt lengths should force -1 padding in one full row";
+    EXPECT_EQ(full.at(0).size(), 3u);
+    EXPECT_EQ(full.at(1).size(), 4u);
+    EXPECT_EQ(swa.at(0).size(), 3u);
+    EXPECT_EQ(swa.at(1).size(), 4u);
 
     // Two requests must not be handed the same physical page within a group.
     std::set<std::int32_t> full_pages;
