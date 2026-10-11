@@ -515,6 +515,10 @@ page ids, and executes retention (`ReclaimExpired` punches the first *N*
 slots to null holes). It is deliberately token-free: every token quantity is
 converted to block counts before it reaches the manager.
 
+Kernel ID export preserves the table's absolute width and zero-filled holes.
+It resolves references only at or beyond the table's reclaimed-prefix frontier;
+slots before that frontier have already released their references.
+
 The conversion is `GroupGeometry` in the coordinator layer:
 
 * `PlanAcquire(table, demand)` turns a token demand into a token-free

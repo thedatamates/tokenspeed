@@ -71,10 +71,13 @@ public:
         return static_cast<std::int32_t>(page_id);
     }
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
-        std::vector<std::int32_t> ids;
-        ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        for (const CacheBlockRef& block_ref : table.Blocks()) {
-            ids.push_back(block_ref ? ResolveCacheBlockId(block_ref->Location()) : 0);
+        std::vector<std::int32_t> ids(static_cast<std::size_t>(table.NumBlocks()), 0);
+        const auto blocks = table.Blocks();
+        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < table.NumBlocks(); ++i) {
+            const auto slot = static_cast<std::size_t>(i);
+            if (blocks[slot]) {
+                ids[slot] = ResolveCacheBlockId(blocks[slot]->Location());
+            }
         }
         return ids;
     }
