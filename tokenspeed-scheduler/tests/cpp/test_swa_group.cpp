@@ -329,22 +329,24 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
 }
 
 TEST(SwaManagerTest, PageIdsPreserveReclaimedPrefixAndSparseHoles) {
-    BlockPool pool(32, {1});
+    BlockPool pool(64, {1});
     SwaManager mgr(/*block_granularity=*/2, /*sliding_window=*/4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(pool, table, 10));
+    ASSERT_TRUE(mgr.Acquire(pool, table, 66));
     auto expected = mgr.BlockTablePageIds(table);
 
     mgr.ReclaimExpired(pool, table, 7);
     ASSERT_EQ(table.ReclaimedPrefixBlocks(), 2);
     table.EvictToNull(3).reset();
+    table.EvictToNull(18).reset();
     expected[0] = 0;
     expected[1] = 0;
     expected[3] = 0;
+    expected[18] = 0;
     EXPECT_EQ(mgr.BlockTablePageIds(table), expected);
 
     mgr.ReclaimExpired(pool, table, 1000);
-    EXPECT_EQ(mgr.BlockTablePageIds(table), std::vector<std::int32_t>(5, 0));
+    EXPECT_EQ(mgr.BlockTablePageIds(table), std::vector<std::int32_t>(33, 0));
 }
 
 TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {

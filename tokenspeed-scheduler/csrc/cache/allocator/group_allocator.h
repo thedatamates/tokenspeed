@@ -75,6 +75,10 @@ public:
         const auto blocks = table.Blocks();
         for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < table.NumBlocks(); ++i) {
             const auto slot = static_cast<std::size_t>(i);
+            // Hide metadata lookup latency while walking long block tables.
+            if (slot + 16 < blocks.size() && blocks[slot + 16]) {
+                __builtin_prefetch(blocks[slot + 16].operator->(), 0, 1);
+            }
             if (blocks[slot]) {
                 ids[slot] = ResolveCacheBlockId(blocks[slot]->Location());
             }
