@@ -102,14 +102,14 @@ private:
     // probationary boundaries follow, before established boundaries and closed
     // prefixes. Those useful entries share one LRU class, with tier breaking
     // ties within an epoch. Position keeps the deeper unproven non-closed
-    // boundary, while a closed prefix is reclaimed from its suffix. A prompt
+    // boundary, while a closed prefix is reclaimed from its suffix. A sliding
     // window about to be published is considered last, but remains reclaimable.
     enum class EvictionTier {
         kUncached,  // physically allocated, but owned only by the request table
         kProbationaryBoundary,
         kEstablishedBoundary,
         kClosedPrefix,
-        kPublishingEndpoint,
+        kPublishingWindow,
     };
 
     struct VictimCandidate {
@@ -121,7 +121,7 @@ private:
     };
 
     static auto evictionPriority(EvictionTier tier, std::uint64_t epoch) {
-        return std::tuple{tier == EvictionTier::kPublishingEndpoint, std::min(tier, EvictionTier::kEstablishedBoundary),
+        return std::tuple{tier == EvictionTier::kPublishingWindow, std::min(tier, EvictionTier::kEstablishedBoundary),
                           epoch};
     }
 
@@ -245,11 +245,8 @@ private:
                     makeVictimCandidate(group_id, location, groups_[i].Index().MetadataFor(pool_, location));
                 // Prefer another victim before discarding a window this
                 // transaction is about to publish. It remains reclaimable.
-                if (progress_.completed_pages && progress_.endpoint_tokens &&
-                    *progress_.endpoint_tokens / prefix_granularity_ > 0 &&
-                    static_cast<std::int32_t>(progress_.completed_pages->prefix_hashes.size()) ==
-                        *progress_.endpoint_tokens / prefix_granularity_ &&
-                    groups_[i].Spec().kind == AttnKind::kSlidingWindow && !groups_[i].Spec().replayable) {
+                if (progress_.completed_pages && groups_[i].Spec().kind == AttnKind::kSlidingWindow &&
+                    !groups_[i].Spec().replayable) {
                     const auto boundary = static_cast<std::int32_t>(progress_.completed_pages->prefix_hashes.size()) *
                                           (prefix_granularity_ / geometry_[i].BlockGranularity());
                     const auto first = std::max(0, boundary - groups_[i].Matcher().BoundaryLookbackPages());
@@ -257,7 +254,7 @@ private:
                     for (auto block = first; block < boundary && block < static_cast<std::int32_t>(blocks.size());
                          ++block) {
                         if (blocks[block] && blocks[block]->Location() == location) {
-                            candidate.eviction_tier = EvictionTier::kPublishingEndpoint;
+                            candidate.eviction_tier = EvictionTier::kPublishingWindow;
                             break;
                         }
                     }

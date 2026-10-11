@@ -900,8 +900,10 @@ Established boundaries precede closed prefixes within an epoch; closed prefixes
 are reclaimed from the suffix. Finally, walk the selected blocks in reverse
 and restore every block not strictly required, yielding a minimal eviction set.
 
-An expired sliding-window block in the last aligned prompt window is selected
-after other victims when this transaction is about to publish that window.
+An expired sliding-window block in the newest completed prefix window is
+selected after other victims when this transaction is about to publish that
+window, including intermediate prefill chunks. Otherwise the same admission
+can publish and evict the block before its queued Host store acquires it.
 It remains reclaimable if needed for capacity; no extra pages are reserved.
 Replayable groups never publish and receive no such priority. The preference
 exists only during this planning pass, without changing cache access epochs.
