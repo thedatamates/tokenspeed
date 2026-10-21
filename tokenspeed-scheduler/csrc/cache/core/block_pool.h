@@ -64,6 +64,8 @@ public:
     std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
 
     // Unoccupied child slots in parents already bound to this group.
+    std::int32_t SlotsPerParent(std::uint32_t group_id) const { return group_availability_.at(group_id).packing; }
+
     std::int32_t NumFreeSlots(std::uint32_t group_id) const noexcept {
         return static_cast<std::int32_t>(placement(group_id).free_slots);
     }

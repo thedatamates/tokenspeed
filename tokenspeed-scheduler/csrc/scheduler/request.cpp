@@ -59,9 +59,19 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
       max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
+      cache_anchor_tokens_{spec.cache_anchor_tokens},
+      cache_anchor_host_only_{spec.cache_anchor_host_only},
       prefix_granularity_{prefix_granularity},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {
+    if (cache_anchor_host_only_ && !cache_anchor_tokens_) {
+        throw std::invalid_argument("Host-only cache policy requires an explicit anchor");
+    }
+    if (cache_anchor_tokens_ && (*cache_anchor_tokens_ < 0 || *cache_anchor_tokens_ >= submitted_prompt_size_ ||
+                                 *cache_anchor_tokens_ % prefix_granularity != 0)) {
+        throw std::invalid_argument("cache anchor must be prefix-aligned and inside the submitted prompt");
+    }
+}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(

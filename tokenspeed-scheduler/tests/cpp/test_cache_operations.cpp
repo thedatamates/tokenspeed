@@ -1042,6 +1042,48 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     coordinator.Free(tables);
 }
 
+TEST(CacheOperationTest, TieredAnchorHostShortageRetryNeverExceedsAnchor) {
+    BlockPool device_pool{8, {1}};
+    BlockPool host_pool{2, {1}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*stream_device_cache_to_host=*/true);
+    CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
+    ASSERT_TRUE(pinned);
+
+    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1, CacheKey{.group_id = 0, .content_hash = "h2"},
+                                               CacheKey{.group_id = 0, .content_hash = "h3"}});
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 4>{"h0", "h1", "h2", "h3"}, 4);
+    EXPECT_EQ(probe.host.num_common_tokens, 4);
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
+    auto admission =
+        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->host_prefix_tokens, 2)
+        << "a pinned Host pool must shorten the L3 prefix instead of admitting stale KV";
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
+
+    admission.reset();
+    coordinator.Free(tables);
+    pinned.reset();
+    auto retry = coordinator.Admit(coordinator.ProbePrefix(std::array<std::string, 4>{"h0", "h1", "h2", "h3"}, 4),
+                                   demands, RequestProgress{}, std::nullopt);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(retry->host_prefix_tokens, 4);
+    EXPECT_EQ(retry->load_pairs.size(), 2);
+}
+
 TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};

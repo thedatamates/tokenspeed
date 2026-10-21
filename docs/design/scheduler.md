@@ -709,3 +709,33 @@ Native consumers may take a plan's operation list with
   (or is undeclared). Spending a partial reserve never makes it qualify: the
   exemption is judged against the budget open at admission, not the current
   remainder (4).
+
+### Fixed reconstruction anchors
+
+A model may supply `RequestSpec::cache_anchor_tokens`, a prefix-aligned endpoint
+inside the original prompt. This differs from the prompt-logprob bound: it never
+relaxes on retraction. Both prefill admission paths stop at the anchor when they
+cross it, making that endpoint materialized rather than inferring it from later
+state. Sliding-window publication stops at this endpoint, including completion
+and retraction publication. Full-history groups retain their ordinary Device publication.
+A later request probes no farther than the anchor and reconstructs the remaining
+suffix through normal prefill, with private suffix pages and ordinary final-logit
+rules. No cache match reports the later endpoint as valid before reconstruction.
+
+The model must give incompatible anchor/storage formats distinct cache namespaces.
+An absent anchor preserves the existing scheduling path. An anchor at zero permits
+no reuse and is useful for short prompts that have no earlier aligned checkpoint.
+
+With `RequestSpec::cache_anchor_host_only` explicitly enabled, the same fixed
+anchor bounds Host publication and restoration while Device publication and
+prefix matching retain the full computed history. Prefill still materializes
+the anchor. Admission probes Device first and independently bounds the Host
+extension; a Device hit beyond the anchor requires no reconstruction. A shorter
+Device hit may combine with Host pages up to the anchor, preserving the ordinary
+cross-tier window matching and transfer leases. Capacity retries may shorten
+that Host hit but cannot extend it beyond the original bound.
+
+Automatic History publication splits its Host enqueue range at the anchor while
+registering all Device keys. Sliding-window Host enqueues, and the explicit
+finish/retraction store queues, obey the same bound. Models must separate this
+policy and its Host format from conservative anchor namespaces.

@@ -110,6 +110,14 @@ public:
     // unbounded. A readmission after retraction relaxes it to the positions
     // whose results had landed before (fsm::Retracted::LandedTokens).
     std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
+    std::optional<std::int32_t> CacheAnchorTokens() const {
+        return cache_anchor_host_only_ ? std::nullopt : cache_anchor_tokens_;
+    }
+    std::optional<std::int32_t> HostCacheAnchorTokens() const { return cache_anchor_tokens_; }
+    std::int32_t ClampChunkAtCacheAnchor(std::int32_t begin, std::int32_t rows) const {
+        return cache_anchor_tokens_ && begin < *cache_anchor_tokens_ ? std::min(rows, *cache_anchor_tokens_ - begin)
+                                                                     : rows;
+    }
 
     template <typename Event>
     void Apply(Event&& event) {
@@ -253,6 +261,8 @@ private:
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
+    std::optional<std::int32_t> cache_anchor_tokens_;
+    bool cache_anchor_host_only_{false};
     std::int32_t retraction_count_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};

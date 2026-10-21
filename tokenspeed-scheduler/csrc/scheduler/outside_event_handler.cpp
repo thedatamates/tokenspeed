@@ -120,6 +120,8 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                         .boundary_kind = CacheBoundaryKind::kEndpoint,
                         .stream_completed_to_host = false,
                         .materialized_state_boundaries = progress.materialized_state_boundaries,
+                        .sliding_window_publication_limit = request.CacheAnchorTokens(),
+                        .sliding_window_host_publication_limit = request.HostCacheAnchorTokens(),
                     },
                 .num_computed_tokens = request.TokenSize() - 1,
             },
@@ -128,10 +130,13 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
-    coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
-        std::min(progress.prefix_hashes.size(),
-                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
+    const auto host_hashes = std::span<const std::string>{progress.prefix_hashes}.first(std::min(
+        progress.prefix_hashes.size(),
+        static_cast<std::size_t>(request.HostCacheAnchorTokens().value_or(std::numeric_limits<std::int32_t>::max()) /
+                                 coordinator_.PrefixGranularity())));
+    coordinator_.QueueCachedBlocksForStore(host_hashes);
+    const auto prefill_hashes = host_hashes.first(std::min(
+        host_hashes.size(), static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
     coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.

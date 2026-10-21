@@ -78,7 +78,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         transfers.push_back(CacheTransfer{
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
-            .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
+            .destination_page = coordinator_.ResolveHostBlockId(keys[i].group_id, host_block_ref->Location()),
             .content_hash = keys[i].content_hash,
             .page_offset = keys[i].page_offset,
         });
@@ -177,7 +177,7 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
         const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(block_transfer.group_id));
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
-            .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),
+            .source_page = coordinator_.ResolveHostBlockId(block_transfer.group_id, block_transfer.source->Location()),
             .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
             .content_hash = block_transfer.key.content_hash,
             .page_offset = block_transfer.key.page_offset,

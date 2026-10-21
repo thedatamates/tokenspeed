@@ -1676,3 +1676,18 @@ Different floors cannot alias any cache group, even their full encoder state;
 this conservative restriction avoids restoring incompatible consumer history.
 A future numerical-policy change must advance the epoch. Model instances own
 separate runtime caches. This does not implement cross-floor hidden anchors.
+
+### Different host and device packing
+
+`CacheGroupConfig::host_cache_blocks_per_lcm_block` optionally overrides the
+host pool's physical children per parent. Omitting it preserves device geometry.
+Token granularity and prefix identity do not change. The host pool owns its
+packing, and host eviction and transfer page-ID resolution use that pool's
+geometry. Device page tables continue to use the device group allocator.
+
+The runtime must enforce the host payload format promised by this configuration.
+For example, a host parent holding two producer-only snapshots cannot accept a
+full producer-plus-consumer snapshot. The storage owner must reject an incompatible
+payload before submitting any copy, and namespaces must separate formats.
+Transfer source/destination references and success acknowledgements retain their
+existing lifetime rules; additional child slots do not weaken those leases.

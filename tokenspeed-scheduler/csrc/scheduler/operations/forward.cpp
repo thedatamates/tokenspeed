@@ -173,6 +173,8 @@ RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cac
             .boundary_kind = consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize()),
             .stream_completed_to_host = stream_completed_to_host,
             .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
+            .sliding_window_publication_limit = request.CacheAnchorTokens(),
+            .sliding_window_host_publication_limit = request.HostCacheAnchorTokens(),
         };
         classifyCompletedStateBoundaries(*progress.completed_pages, request.PrefillSize(), prefix_granularity);
     }
@@ -220,7 +222,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         if (config_.role == Role::kD && !request->Is<fsm::Retracted>()) {
             return coordinator_.ProbeDecodeDevicePrefix(hashes);
         }
-        return coordinator_.ProbePrefix(hashes);
+        return coordinator_.ProbePrefix(hashes, request->HostCacheAnchorTokens());
     };
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     // The final prompt token is always recomputed to produce logits. Some
@@ -242,7 +244,9 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
                                            ? request->MaxCachedPrefixTokens()
                                            : std::max(request->MaxCachedPrefixTokens(), retracted->LandedTokens());
     const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request_bound), 0);
+        std::max(std::min({request->PrefillSize() - replay_tokens, request_bound,
+                           request->CacheAnchorTokens().value_or(std::numeric_limits<std::int32_t>::max())}),
+                 0);
     const std::int32_t probe_prefix_pages = max_cacheable_tokens / prefix_granularity;
     const std::int32_t candidate_prefix_pages = std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
     std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
@@ -366,6 +370,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
         tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
                                                promotion_boundary_tokens);
+        tokens_this_round = request->ClampChunkAtCacheAnchor(hit_tokens, tokens_this_round);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
@@ -498,8 +503,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    const std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                           remaining, cache_progress.promotion_boundary_tokens);
+    const std::int32_t prefill_tokens = request->ClampChunkAtCacheAnchor(
+        first_pos, PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining,
+                                      cache_progress.promotion_boundary_tokens));
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -686,11 +692,14 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
                                              coordinator_.PrefixGranularity());
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
         }
-        coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
+        const auto host_hashes = std::span<const std::string>{cache_progress.prefix_hashes}.first(std::min(
+            cache_progress.prefix_hashes.size(),
+            static_cast<std::size_t>(victim.HostCacheAnchorTokens().value_or(std::numeric_limits<std::int32_t>::max()) /
+                                     coordinator_.PrefixGranularity())));
+        coordinator_.QueueCachedBlocksForStore(host_hashes);
         // Recover from a prefill checkpoint and recompute the generated suffix.
-        const auto prefill_hashes = std::span<const std::string>{cache_progress.prefix_hashes}.first(
-            std::min(cache_progress.prefix_hashes.size(),
-                     static_cast<std::size_t>(victim.PrefillSize() / coordinator_.PrefixGranularity())));
+        const auto prefill_hashes = host_hashes.first(std::min(
+            host_hashes.size(), static_cast<std::size_t>(victim.PrefillSize() / coordinator_.PrefixGranularity())));
         coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
         // The victim's pages are granted away in this very round, so the
         // ticket cannot pin them: the runtime orders the copy on the forward

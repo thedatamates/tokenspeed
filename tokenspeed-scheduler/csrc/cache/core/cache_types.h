@@ -146,6 +146,9 @@ struct CompletedPages {
     // Exact prefill checkpoint provenance. Allocation and token progress are
     // not proof. An empty span disables state publication for this range.
     std::span<const std::int32_t> materialized_state_boundaries{};
+    // Model-owned fixed bound for sliding-window snapshots; no bound for history.
+    std::optional<std::int32_t> sliding_window_publication_limit;
+    std::optional<std::int32_t> sliding_window_host_publication_limit;
 };
 
 // Per-request facts about the past that ride along with one admission:

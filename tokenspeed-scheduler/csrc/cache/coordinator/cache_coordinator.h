@@ -154,7 +154,8 @@ public:
     // A missing epoch starts a new request; a supplied epoch continues that
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
-    PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+    PrefixProbe ProbePrefix(std::span<const std::string> content_hashes,
+                            std::optional<std::int32_t> host_token_limit = std::nullopt) const;
     // Decode-side PD reuses local history pages, while final-state groups are
     // restored from the remote endpoint snapshot. Their aligned null holes do
     // not count as cache hits.
@@ -233,6 +234,16 @@ public:
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
+    std::int32_t ResolveHostBlockId(std::uint32_t group, CacheBlockLocation location) const {
+        _assert(host_pool_ != nullptr, "host page resolution needs host pool");
+        const auto packing = host_pool_->SlotsPerParent(group);
+        _assert(location.lcm_block_id > 0 && location.slot_index >= 0 && location.slot_index < packing,
+                "host block location exceeds packing");
+        const auto page = 1 + (static_cast<std::int64_t>(location.lcm_block_id) - 1) * packing + location.slot_index;
+        _assert(page <= std::numeric_limits<std::int32_t>::max(), "host page id exceeds int32");
+        return static_cast<std::int32_t>(page);
+    }
+
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
     bool IsHostCachedBlock(CacheBlockLocation location) const;
@@ -302,7 +313,8 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host,
+                                 bool allow_host_stream);
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);

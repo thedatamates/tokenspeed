@@ -4663,5 +4663,109 @@ TEST(BoundedReplayCoordinator, RetentionStillReclaimsReplayablePages) {
     }
 }
 
+TEST(CacheCoordinatorTest, TieredAnchorPreservesDeviceAndBoundsHostProbe) {
+    BlockPool device(16, {1, 1});
+    BlockPool host(16, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 4,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, true);
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+    for (const auto& hash : hashes) {
+        CacheForGroup(coordinator, device, hash, 0);
+        CacheForGroup(coordinator, host, hash, 0);
+        CacheForGroup(coordinator, device, hash, 1);
+        CacheForGroup(coordinator, host, hash, 1);
+    }
+    const auto resident = coordinator.ProbePrefix(hashes, 4);
+    EXPECT_EQ(resident.device.num_common_tokens, 12);
+    EXPECT_TRUE(resident.host.per_group.empty());
+    ASSERT_TRUE(coordinator.ClearDeviceCache());
+    EXPECT_EQ(coordinator.ProbePrefix(hashes, 4).host.num_common_tokens, 4);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 12);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes, 0).host.num_common_tokens, 0);
+}
+
+TEST(CacheCoordinatorTest, TieredAnchorPublishesFullDeviceWindowWithoutHostStore) {
+    BlockPool device(16, {1});
+    BlockPool host(16, {1});
+    const std::vector<CacheGroupSpec> specs = {{.kind = AttnKind::kSlidingWindow,
+                                                .sliding_window = 4,
+                                                .cache_blocks_per_lcm_block = 1,
+                                                .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, true);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 12));
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+    coordinator.CacheCompletedBlocks(
+        tables,
+        RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                                          .first_new_prefix_page = 0,
+                                                          .boundary_kind = CacheBoundaryKind::kEndpoint,
+                                                          .stream_completed_to_host = true,
+                                                          .sliding_window_host_publication_limit = 4},
+                        .num_computed_tokens = 12},
+        NextTestAccessEpoch());
+    EXPECT_TRUE(coordinator.TakePendingStores().empty());
+    coordinator.Free(tables);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes, 4).device.num_common_tokens, 12);
+}
+
+TEST(CacheCoordinatorTest, TieredAnchorPublishesFullDeviceHistoryAndStoresOnlyAnchorPrefix) {
+    BlockPool device(16, {1});
+    BlockPool host(16, {1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, true);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 12));
+    const auto hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+    coordinator.CacheCompletedBlocks(
+        tables,
+        RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                                          .first_new_prefix_page = 0,
+                                                          .boundary_kind = CacheBoundaryKind::kEndpoint,
+                                                          .stream_completed_to_host = true,
+                                                          .sliding_window_host_publication_limit = 4},
+                        .num_computed_tokens = 12},
+        NextTestAccessEpoch());
+    auto stores = coordinator.TakePendingStores();
+    ASSERT_EQ(stores.size(), 1);
+    EXPECT_EQ(stores[0].key.content_hash, hashes[0]);
+    coordinator.Free(tables);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes, 4).device.num_common_tokens, 12);
+}
+
+TEST(CacheCoordinatorHostExtension, TieredAnchorMixedAdmissionKeepsCrossTierWindow) {
+    BlockPool device(16, {1, 1});
+    BlockPool host(16, {1, 1});
+    auto specs = HostExtSpecs();
+    auto coordinator = MakeCoordinator(specs, 2, device, false, &host, true);
+    const auto hashes = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
+    SeedDeviceFloor(device, coordinator, hashes, 2);
+    auto device_window = coordinator.AcquireDeviceCachedBlock(Key(hashes[1], 1));
+    ASSERT_TRUE(device_window);
+    for (int i = 2; i < 4; ++i)
+        for (int group = 0; group < 2; ++group) HostPut(coordinator, host, hashes[i], group);
+    auto probe = coordinator.ProbePrefix(hashes, 6);
+    ASSERT_EQ(probe.device.num_common_tokens, 4);
+    ASSERT_EQ(probe.host.num_common_tokens, 6);
+    std::vector<BlockTable> tables(2);
+    const std::array<std::int32_t, 2> tokens{0, 0};
+    auto demands = FreshDemands(tables, tokens);
+    auto result = coordinator.Admit(probe, demands, RequestProgress{}, std::nullopt);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->device_prefix_tokens, 4);
+    EXPECT_EQ(result->host_prefix_tokens, 6);
+    EXPECT_EQ(result->load_pairs.size(), 2);
+    ASSERT_EQ(tables[1].NumBlocks(), 3);
+    ASSERT_TRUE(tables[1].Blocks()[1]);
+    ASSERT_TRUE(tables[1].Blocks()[2]);
+    EXPECT_EQ(tables[1].Blocks()[1]->Location(), device_window->Location());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

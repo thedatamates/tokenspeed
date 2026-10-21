@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -43,6 +44,12 @@ struct RequestSpec {
     // Stable numerical/model identity for reusable cache contents. Empty preserves
     // the legacy global token identity; nonempty scopes every cache group.
     std::string cache_namespace;
+    // Optional fixed reconstruction anchor. Unlike the logprob probe bound,
+    // this remains fixed across retraction. Sliding windows are published only
+    // through this endpoint; later state is reconstructed by ordinary prefill.
+    std::optional<std::int32_t> cache_anchor_tokens;
+    // Preserve full device hits; restrict only Host snapshots/restoration.
+    bool cache_anchor_host_only{false};
 };
 
 // One prefill chunk's model inputs. The input covers `extend_len` tokens
