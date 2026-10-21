@@ -44,6 +44,11 @@ public:
 
     const std::string& Id() const { return id_; }
 
+    // Stable for this lifetime, including retraction; never derived from a reusable request ID.
+    const std::string& CacheSeed(bool private_cache) const {
+        return private_cache ? private_cache_seed_ : shared_cache_seed_;
+    }
+
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
     // -- being retracted means the previous admission was still too
@@ -242,6 +247,8 @@ private:
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
+    std::string private_cache_seed_;
+    std::string shared_cache_seed_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};

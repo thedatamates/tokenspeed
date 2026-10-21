@@ -103,7 +103,8 @@ public:
     // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
     // backend for existing objects, then registers the matching CacheKeys so
     // ProbePrefix can treat them as Host hits that require prefetch.
-    std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
+    std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens,
+                                                   const std::string& cache_namespace = "") const;
     // Prefix hashes of Submitted/Retracted requests the scheduler can admit
     // this round. The event loop revalidates these against L3 immediately
     // before NextExecutionPlan so a queued hit cannot survive deletion.

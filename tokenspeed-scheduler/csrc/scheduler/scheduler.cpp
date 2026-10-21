@@ -360,7 +360,8 @@ std::int32_t Scheduler::CacheGroupAvailablePages(const std::string& group_id) co
     return coordinator_.GroupAvailablePages(static_cast<std::int32_t>(groupIndex(group_id)));
 }
 
-std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const {
+std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std::int32_t>& tokens,
+                                                          const std::string& cache_namespace) const {
     TokenContainer container(tokens);
     std::vector<std::span<const std::int32_t>> prefix_pages =
         container.FullPrefixPages(config_.prefix_granularity, false);
@@ -369,7 +370,10 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
     const std::int32_t candidate_prefix_pages =
         std::max((static_cast<std::int32_t>(tokens.size()) - 1) / config_.prefix_granularity, 0);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    return ComputePrefixHashes(prefix_pages, "");
+    const auto seed = cache_namespace.empty()
+                          ? std::string{}
+                          : HashPrefixPage({}, "", std::span<const std::string>(&cache_namespace, 1));
+    return ComputePrefixHashes(prefix_pages, seed);
 }
 
 std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
@@ -401,7 +405,8 @@ std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
         const std::int32_t candidate_prefix_pages =
             std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
         prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
+        for (std::string& content_hash :
+             ComputePrefixHashes(prefix_pages, request.CacheSeed(config_.disable_prefix_cache))) {
             if (seen.insert(content_hash).second) {
                 hashes.push_back(std::move(content_hash));
             }

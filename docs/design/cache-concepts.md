@@ -1645,3 +1645,34 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
 × {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
 (accuracy equal or better; speculative accept length within noise).
+
+### Disabled prefix caching and request identity
+
+With `disable_prefix_cache`, token equality does not authorize sharing physical
+pages: request-local model state can depend on a prompt boundary absent from
+the token-prefix hash. Admission, completed-page publication and waiting-prefix
+queries therefore use a private hash-chain seed owned by each Request lifetime.
+Retraction retains that seed and can recover the request's own host snapshot.
+Reusing a textual request ID creates a new identity. Enabled prefix caching
+retains the ordinary unsalted token hash chain. Private seeds are random so
+separate scheduler processes cannot accidentally alias private cache contents.
+
+### Explicit reusable cache namespaces
+
+`RequestSpec.cache_namespace` is an optional caller-supplied numerical/model
+identity. Empty retains the original unsalted token hashes byte for byte. A
+nonempty value deterministically seeds the hash chain for all cache groups,
+including admission, completed publication, Host/L3 queries and retraction.
+The namespace is captured at submission and never rebuilt from rebased prompt
+length. `PrefixHashesForTokens(tokens, namespace)` computes the same identity;
+callers using explicit namespaces must supply it to out-of-band queries too.
+Disabled prefix caching still uses private lifetime identity, even when an
+explicit namespace was supplied.
+
+DSV4.1 bounded inference supplies its numerical epoch and the fixed original
+consumer floor `max(0, prompt_tokens - 140)`. Equal-floor requests may reuse
+token-identical prefixes under the existing complete-state restoration rules.
+Different floors cannot alias any cache group, even their full encoder state;
+this conservative restriction avoids restoring incompatible consumer history.
+A future numerical-policy change must advance the epoch. Model instances own
+separate runtime caches. This does not implement cross-floor hidden anchors.

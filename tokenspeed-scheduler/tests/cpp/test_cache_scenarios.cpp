@@ -2147,9 +2147,11 @@ protected:
     // Drives "a" (6-token prompt) and "b" (4-token prompt) into the exact-fit
     // capacity block that retracts "a".
     // Post: "a" Submitted with 9 tokens, "b" Decoding with 7 tokens, free = 8.
-    void DriveToRetractOfA() {
+    void DriveToRetractOfA(const std::string& cache_namespace = "") {
         ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
-        Submit(MakeRequestSpec("a", /*num_pages=*/3));
+        auto a = MakeRequestSpec("a", /*num_pages=*/3);
+        a.cache_namespace = cache_namespace;
+        Submit(a);
         Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
 
         ExecutionPlan prefill = PlanOnce();
@@ -2187,6 +2189,30 @@ protected:
         ASSERT_EQ(scheduler_->DecodingSize(), 1u);
     }
 };
+
+class NamespacedRetractSuite : public RetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = RetractSuite::MakeConfig();
+        cfg.disable_prefix_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(NamespacedRetractSuite, OriginalNamespaceSurvivesGeneratedHistoryRebase) {
+    const std::string identity = "dsv41f:epoch1:floor=1";
+    DriveToRetractOfA(identity);
+    auto rebased = MakeRequestSpec("a", 3).tokens;
+    rebased.insert(rebased.end(), {42, 43, 44});
+    EXPECT_EQ(scheduler_->WaitingPrefixHashes(), scheduler_->PrefixHashesForTokens(rebased, identity));
+    EXPECT_NE(scheduler_->WaitingPrefixHashes(), scheduler_->PrefixHashesForTokens(rebased));
+    SendFinish("b");
+    const auto readmit = PlanOnce();
+    const auto* forward = FindForwardBatch(readmit);
+    ASSERT_NE(forward, nullptr);
+    ASSERT_EQ(forward->request_ids, (std::vector<std::string>{"a"}));
+    EXPECT_EQ(forward->extend_prefix_lens.at(0) + forward->input_lengths.at(0), 9);
+}
 
 TEST_F(RetractSuite, DecodingRequestReleasesPagesAndRequeues) {
     DriveToRetractOfA();
@@ -4769,19 +4795,27 @@ TEST_F(StreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
 }
 
 TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
+    // Cross-request deduplication requires shared cache identity; Disabled is private.
+    config_.disable_prefix_cache = false;
+    scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
-    ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    // Start both cold prefills before either publishes. Deliver their results in
+    // separate rounds so the second publication encounters already-indexed keys.
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    PlanOnce();
+    SendForwardDone("r1", {9001});
+    ExecutionPlan finalize1 = PlanOnce();
     auto stream_wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(stream_wb1.has_value());
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
     SendWriteBackDone(stream_wb1->op_ids.at(0));
-    PlanOnce();
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
-    ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
+    SendForwardDone("r2", {9001});
+    ExecutionPlan finalize2 = PlanOnce();
     EXPECT_FALSE(FindWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
+    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
     ExecutionPlan finish2 = FinishAndReap("r2");
     EXPECT_FALSE(FindWriteBack(finish2).has_value()) << "finish must also dedupe already-indexed keys";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
@@ -4833,6 +4867,8 @@ TEST_F(StreamingSinkSuite, CommittedColdEntriesAreReplacedWhenHostPoolIsFull) {
 }
 
 TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
+    // Cross-request deduplication requires shared cache identity; Disabled is private.
+    config_.disable_prefix_cache = false;
     // Host pool with headroom (12 usable) so duplicates are dropped by the drain's batch
     // dedupe, NOT by pool exhaustion: two IDENTICAL prompts registering in one round drain
     // 12 candidates into 6 pairs.

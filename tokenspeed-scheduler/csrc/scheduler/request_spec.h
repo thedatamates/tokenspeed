@@ -40,6 +40,9 @@ struct RequestSpec {
     // after retraction relaxes it to the positions whose forward results had
     // landed before the retraction: their logits already exist.
     std::int32_t max_cached_prefix_tokens{std::numeric_limits<std::int32_t>::max()};
+    // Stable numerical/model identity for reusable cache contents. Empty preserves
+    // the legacy global token identity; nonempty scopes every cache group.
+    std::string cache_namespace;
 };
 
 // One prefill chunk's model inputs. The input covers `extend_len` tokens

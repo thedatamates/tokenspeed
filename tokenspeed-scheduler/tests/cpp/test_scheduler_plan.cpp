@@ -154,6 +154,127 @@ TEST_F(DisablePrefixCacheTestSuite, SamePromptDoesNotReuseDevicePrefix) {
     EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty());
 }
 
+TEST_F(DisablePrefixCacheTestSuite, PublishingEqualTokensKeepsLiveRequestPagesPrivate) {
+    Submit({MakeRequestSpec("a", 2), MakeRequestSpec("b", 2)});
+    const auto initial = PlanOnce();
+    const auto* first = FindForwardBatch(initial);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids.size(), 2u);
+    const auto original = first->block_tables.at("full_attention");
+    ASSERT_NE(original[0][0], original[1][0]);
+    SendForwardDone("a", {100});
+    SendForwardDone("b", {100});
+    const auto next = PlanOnce();
+    const auto* decode = FindForwardBatch(next);
+    ASSERT_NE(decode, nullptr);
+    const auto& published = decode->block_tables.at("full_attention");
+    ASSERT_EQ(published.size(), 2u);
+    EXPECT_EQ(published[0][0], original[0][0]);
+    EXPECT_EQ(published[1][0], original[1][0]);
+    EXPECT_NE(published[0][0], published[1][0]);
+}
+
+TEST_F(DisablePrefixCacheTestSuite, ReusedTextualRequestIdHasNewPrivateHashIdentity) {
+    const auto spec = MakeRequestSpec("same-id", 2);
+    Submit(spec);
+    const auto first_hashes = scheduler_->WaitingPrefixHashes();
+    ASSERT_FALSE(first_hashes.empty());
+    PlanOnce();
+    SendForwardDone("same-id", {100});
+    SendFinish("same-id");
+    AckWriteBacks(PlanOnce());
+    PlanOnce();
+    Submit(spec);
+    const auto second_hashes = scheduler_->WaitingPrefixHashes();
+    ASSERT_EQ(first_hashes.size(), second_hashes.size());
+    EXPECT_NE(first_hashes, second_hashes);
+    EXPECT_EQ(second_hashes, scheduler_->WaitingPrefixHashes());
+}
+
+TEST_F(SchedulerTestSuite, ExplicitCacheNamespaceScopesAdmissionAndWaitingHashes) {
+    auto seed = MakeRequestSpec("seed", 2);
+    seed.cache_namespace = "dsv41f:epoch1:floor=1";
+    Submit(seed);
+    EXPECT_EQ(scheduler_->WaitingPrefixHashes(), scheduler_->PrefixHashesForTokens(seed.tokens, seed.cache_namespace));
+    EXPECT_NE(scheduler_->WaitingPrefixHashes(), scheduler_->PrefixHashesForTokens(seed.tokens));
+    PlanOnce();
+    SendForwardDone("seed", {100});
+    AckWriteBacks(PlanOnce());
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+
+    auto match = seed;
+    match.request_id = "match";
+    Submit(match);
+    const auto reused = PlanOnce();
+    const auto* hit = FindForwardBatch(reused);
+    ASSERT_NE(hit, nullptr);
+    ASSERT_EQ(hit->request_ids, (std::vector<std::string>{"match"}));
+    EXPECT_GT(hit->extend_prefix_lens.at(0), 0);
+    SendAbortEvent("match");
+    PlanOnce();
+
+    auto other = seed;
+    other.request_id = "other";
+    other.cache_namespace = "dsv41f:epoch1:floor=2";
+    Submit(other);
+    EXPECT_EQ(scheduler_->WaitingPrefixHashes(),
+              scheduler_->PrefixHashesForTokens(other.tokens, other.cache_namespace));
+    const auto missed = PlanOnce();
+    const auto* miss = FindForwardBatch(missed);
+    ASSERT_NE(miss, nullptr);
+    EXPECT_EQ(miss->extend_prefix_lens.at(0), 0);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(missed).empty());
+}
+
+TEST_F(SchedulerTestSuite, DifferentNamespacesCannotCanonicalizeLivePages) {
+    auto a = MakeRequestSpec("a", 2);
+    auto b = MakeRequestSpec("b", 2);
+    a.cache_namespace = "dsv41f:epoch1:floor=1";
+    b.cache_namespace = "dsv41f:epoch1:floor=2";
+    Submit({a, b});
+    const auto initial = PlanOnce();
+    const auto* first = FindForwardBatch(initial);
+    ASSERT_NE(first, nullptr);
+    const auto original = first->block_tables.at("full_attention");
+    ASSERT_EQ(original.size(), 2u);
+    ASSERT_NE(original[0][0], original[1][0]);
+    SendForwardDone("a", {100});
+    SendForwardDone("b", {100});
+    const auto next = PlanOnce();
+    const auto* decode = FindForwardBatch(next);
+    ASSERT_NE(decode, nullptr);
+    const auto& published = decode->block_tables.at("full_attention");
+    EXPECT_EQ(published[0][0], original[0][0]);
+    EXPECT_EQ(published[1][0], original[1][0]);
+}
+
+TEST_F(LoadBackViaCacheTestSuite, ExplicitNamespaceSurvivesHostWriteBackAndReload) {
+    auto seed = MakeRequestSpec("seed", 2);
+    seed.cache_namespace = "dsv41f:epoch1:floor=1";
+    Submit(seed);
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    AckWriteBacks(PlanOnce());
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    PlanOnce();
+    // Overwrite the device capacity with unrelated tokens; the original survives on Host.
+    Submit(MakeRequestSpec("fill", 3, 100));
+    PlanOnce();
+    SendForwardDone("fill", {200});
+    AckWriteBacks(PlanOnce());
+    SendFinish("fill");
+    AckWriteBacks(PlanOnce());
+    PlanOnce();
+    ASSERT_GT(scheduler_->HostPoolCachedBlocks(), 0);
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    seed.request_id = "reload";
+    Submit(seed);
+    const auto plan = PlanOnce();
+    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(plan).empty());
+}
+
 class StableCandidateOrderingSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

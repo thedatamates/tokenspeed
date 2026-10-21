@@ -101,8 +101,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     const std::int32_t num_stable_prefix_pages = static_cast<std::int32_t>(stable_prefix_pages.size());
     _assert(first_new_prefix_page <= num_stable_prefix_pages, "cache progress exceeds completed request pages");
     if (first_new_prefix_page != num_stable_prefix_pages) {
-        const std::string previous_hash =
-            progress.prefix_hashes.empty() ? std::string{} : progress.prefix_hashes.back();
+        const std::string previous_hash = progress.prefix_hashes.empty()
+                                              ? (request.CacheSeed(config_.disable_prefix_cache))
+                                              : progress.prefix_hashes.back();
         std::vector<std::string> new_hashes =
             AdvancePrefixHashes(stable_prefix_pages, first_new_prefix_page, previous_hash, num_stable_prefix_pages);
         progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),

@@ -20,14 +20,41 @@
 
 #include "scheduler/request.h"
 
+#include <array>
 #include <stdexcept>
 
+#include <openssl/rand.h>
+
 #include "fsm/forward_events.h"
+#include "cache/prefix/prefix_hasher.h"
 
 namespace tokenspeed {
+namespace {
+
+std::string MakePrivateCacheSeed() {
+    // Random bytes also separate request lifetimes across processes sharing storage.
+    std::array<unsigned char, 32> bytes;
+    if (RAND_bytes(bytes.data(), bytes.size()) != 1) {
+        throw std::runtime_error("cannot generate private request cache identity");
+    }
+    constexpr char digits[] = "0123456789abcdef";
+    std::string seed;
+    seed.reserve(bytes.size() * 2);
+    for (const auto byte : bytes) {
+        seed.push_back(digits[byte >> 4]);
+        seed.push_back(digits[byte & 15]);
+    }
+    return seed;
+}
+
+}  // namespace
 
 Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
+      private_cache_seed_{MakePrivateCacheSeed()},
+      shared_cache_seed_{spec.cache_namespace.empty()
+                             ? std::string{}
+                             : HashPrefixPage({}, "", std::span<const std::string>(&spec.cache_namespace, 1))},
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
