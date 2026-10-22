@@ -23,6 +23,7 @@
 #include <concepts>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -43,6 +44,15 @@ public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
+    std::optional<std::int32_t> SelectedDecodeWidth() const { return selected_decode_width_; }
+    std::int32_t DecodeWidth(std::int32_t configured) const { return selected_decode_width_.value_or(configured); }
+    void SelectDecodeWidth(std::int32_t width, std::int32_t fallback) {
+        selected_decode_width_ = width;
+        fallback_decode_width_ = fallback;
+    }
+    void InvalidateDecodeWidth() {
+        if (selected_decode_width_) selected_decode_width_ = fallback_decode_width_;
+    }
 
     // Stable for this lifetime, including retraction; never derived from a reusable request ID.
     const std::string& CacheSeed(bool private_cache) const {
@@ -69,7 +79,10 @@ public:
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
         return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
-    void NoteRetracted() { ++retraction_count_; }
+    void NoteRetracted() {
+        ++retraction_count_;
+        InvalidateDecodeWidth();
+    }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
@@ -254,6 +267,9 @@ private:
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
+    // No override preserves the configured decode width and legacy reserve feedback.
+    std::optional<std::int32_t> selected_decode_width_;
+    std::int32_t fallback_decode_width_{};
     std::string id_;
     std::string private_cache_seed_;
     std::string shared_cache_seed_;

@@ -203,6 +203,7 @@ private:
     void handleEvent(const forward::Retract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
+    void handleEvent(const forward::UpdateDecodeWidth& event);
 
     // Mutable state of one plan-building pass: the output plan, the model
     // batch under construction, the transfer peer's two streams, and the

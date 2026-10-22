@@ -542,7 +542,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
+    const std::int32_t reserve_tokens =
+        request->SelectedDecodeWidth().value_or(request->ReserveNumTokensInNextScheduleEvent());
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
     const fsm::CacheProgress& previous = request->CacheProgress();
     std::optional<fsm::CacheProgress> updated;
@@ -570,7 +571,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         request->CacheProgressRef() = std::move(*updated);
     }
     request->CacheProgressRef().DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
+    return fsm::ScheduleDecodeEvent{request->DecodeWidth(config_.decode_input_tokens)};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -601,8 +602,8 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     const std::int32_t bootstrap_token = needs_bootstrap_token ? request->LastToken() : -1;
     std::vector<std::int32_t> spec_candidate_ids =
         config_.role == Role::kP && needs_bootstrap_token ? request->TakeSpecCandidates() : std::vector<std::int32_t>{};
-    DecodeOperation operation =
-        applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens, coordinator_, cache_group_ids_);
+    DecodeOperation operation = applyDecodeEvent(
+        *request, std::move(event), request->DecodeWidth(config_.decode_input_tokens), coordinator_, cache_group_ids_);
     if (needs_bootstrap_token) {
         operation.decode_input_id = bootstrap_token;
         operation.spec_candidate_ids = std::move(spec_candidate_ids);
@@ -614,6 +615,7 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
                                                                     Request* request, std::int32_t token_budget,
                                                                     std::int32_t decode_reserve,
                                                                     std::vector<LoadBackOperation>& load_backs) {
+    decode_reserve = request->DecodeWidth(decode_reserve);
     if (request->Is<fsm::Prefilling>()) {
         if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
             return applyEventAndBuildOperation(request, std::move(*event));
@@ -919,10 +921,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
 void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
     for (Request* request : candidates) {
-        if (build.Full(config_.max_batch_size) ||
-            build.token_budget < build.state_prefill_reserve + config_.decode_input_tokens) {
-            return;
-        }
+        if (build.Full(config_.max_batch_size)) return;
+        if (build.token_budget < build.state_prefill_reserve + request->DecodeWidth(config_.decode_input_tokens))
+            continue;
         if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
             continue;
         }

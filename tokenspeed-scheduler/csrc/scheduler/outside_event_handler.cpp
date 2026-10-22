@@ -143,6 +143,17 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
 }
 
+void Scheduler::handleEvent(const forward::UpdateDecodeWidth& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr) throw std::invalid_argument("decode width request not found");
+    if (event.input_tokens < 1 || event.input_tokens > config_.decode_input_tokens || event.fallback_input_tokens < 1 ||
+        event.fallback_input_tokens > event.input_tokens)
+        throw std::invalid_argument("decode width outside explicit capability");
+    if (request->ResultsInFlight() != 0 || request->Is<fsm::Finished>())
+        throw std::invalid_argument("decode width requires drained live request");
+    request->SelectDecodeWidth(event.input_tokens, event.fallback_input_tokens);
+}
+
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
@@ -170,6 +181,7 @@ void Scheduler::handleEvent(const forward::Retract& event) {
     if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
         return;
     }
+    request->InvalidateDecodeWidth();
     // Snapshot-less: dest pages were not filled. Publishing would cache empty
     // KV. The request re-prefills through ordinary admission.
     request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,

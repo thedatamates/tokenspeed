@@ -48,6 +48,14 @@ struct UpdateReserveNumTokens {
     std::int32_t reserve_num_tokens_in_next_schedule_event;
 };
 
+// Select actual execution width only after prior results have landed. The
+// fallback is used after retraction until the executor restores its state.
+struct UpdateDecodeWidth {
+    std::string request_id;
+    std::int32_t input_tokens;
+    std::int32_t fallback_input_tokens;
+};
+
 struct Abort {
     std::string request_id;
 };
@@ -61,6 +69,6 @@ struct Retract {
 }  // namespace forward
 
 using ForwardEvent = std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::Retract,
-                                  forward::UpdateReserveNumTokens>;
+                                  forward::UpdateReserveNumTokens, forward::UpdateDecodeWidth>;
 
 }  // namespace tokenspeed
