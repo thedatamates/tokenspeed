@@ -174,4 +174,119 @@ TEST(AnchorCache, TieredAnchorPreservesResidentWindowHit) {
     ASSERT_TRUE(anchor_forward(replay).extend_prefix_lens[0] > 6);
     anchor_done(scheduler, "replay", {42});
 }
+TEST(AnchorCache, ProducerNamespaceCrossFloorLifecycle) {
+    // The toy geometry scales the model's aligned producer anchor down to two
+    // tokens. Every request retains its own anchor, even in one source namespace.
+    for (int host = 0; host != 2; ++host)
+        for (int terminal = 0; terminal != 3; ++terminal) {
+            SchedulerConfig config{};
+            config.prefix_granularity = 2;
+            config.device_allocator.total_pages = 128;
+            config.host_allocator.total_pages = host ? 128 : 0;
+            config.max_scheduled_tokens = 64;
+            config.max_batch_size = 1;
+            config.disable_l2_cache = !host;
+            config.enable_l3_storage = false;
+            config.cache_groups.push_back(CacheGroupConfig{.group_id = "source-history",
+                                                           .block_granularity = 2,
+                                                           .total_pages = 128,
+                                                           .retention = CacheGroupConfig::Retention::FullHistory,
+                                                           .family = CacheGroupFamily::History});
+            config.cache_groups.push_back(CacheGroupConfig{.group_id = "source-window",
+                                                           .block_granularity = 2,
+                                                           .total_pages = 128,
+                                                           .retention = CacheGroupConfig::Retention::SlidingWindow,
+                                                           .sliding_window_tokens = 4,
+                                                           .family = CacheGroupFamily::History});
+            config.cache_groups.push_back(CacheGroupConfig{.group_id = "source-tail",
+                                                           .block_granularity = 2,
+                                                           .total_pages = 128,
+                                                           .retention = CacheGroupConfig::Retention::SlidingWindow,
+                                                           .sliding_window_tokens = 2,
+                                                           .family = CacheGroupFamily::History});
+            Scheduler scheduler(config);
+            RequestSpec donor{};
+            donor.request_id = "donor";
+            donor.tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+            donor.max_new_tokens = 4;
+            donor.cache_namespace = "producer-only:epoch1";
+            donor.cache_anchor_tokens = 6;
+            donor.cache_anchor_host_only = false;
+            const auto donor_hashes = scheduler.PrefixHashesForTokens(donor.tokens, donor.cache_namespace);
+            int loaded = 0;
+            auto acknowledge = [&](const ExecutionPlan& plan) {
+                for (const auto& op : plan.Operations()) {
+                    const auto* cache_op = std::get_if<CacheOperation>(&op);
+                    if (!cache_op) continue;
+                    if (const auto* stores = std::get_if<WriteBackBatch>(cache_op)) {
+                        for (std::size_t i = 0; i < stores->op_ids.size(); ++i) {
+                            for (const auto& hash : stores->content_hashes[i]) {
+                                // Host publication of every physical group is bounded.
+                                ASSERT_NE(std::find(donor_hashes.begin(), donor_hashes.begin() + 3, hash),
+                                          donor_hashes.begin() + 3);
+                            }
+                            ExecutionEvent done;
+                            done.With(cache::WriteBackDone{.op_id = stores->op_ids[i]});
+                            scheduler.Advance(std::move(done));
+                        }
+                    }
+                    if (const auto* loads = std::get_if<LoadBackBatch>(cache_op)) {
+                        for (auto id : loads->op_ids) {
+                            ++loaded;
+                            ExecutionEvent done;
+                            done.With(cache::LoadBackDone(id, true));
+                            scheduler.Advance(std::move(done));
+                        }
+                    }
+                }
+            };
+            scheduler.SubmitRequests({donor});
+            auto first = scheduler.NextExecutionPlan();
+            acknowledge(first);
+            ASSERT_EQ(anchor_forward(first).input_lengths[0], 6);
+            anchor_done(scheduler, "donor", {});
+            auto suffix = scheduler.NextExecutionPlan();
+            acknowledge(suffix);
+            ASSERT_EQ(anchor_forward(suffix).extend_prefix_lens[0], 6);
+            anchor_done(scheduler, "donor", {42});
+            ExecutionEvent end;
+            if (terminal == 0) end.With(forward::Finish{.request_id = "donor"});
+            if (terminal == 1) end.With(forward::Abort{.request_id = "donor"});
+            if (terminal == 2) end.With(forward::Retract{.request_id = "donor"});
+            scheduler.Advance(std::move(end));
+            if (terminal == 2) {
+                auto recovery = scheduler.NextExecutionPlan();
+                acknowledge(recovery);
+                ASSERT_LE(anchor_forward(recovery).extend_prefix_lens[0], 6);
+                ExecutionEvent abort;
+                abort.With(forward::Abort{.request_id = "donor"});
+                scheduler.Advance(std::move(abort));
+            }
+            acknowledge(scheduler.NextExecutionPlan());
+            if (host) ASSERT_TRUE(scheduler.ClearL1Cache());
+            auto target = donor;
+            target.request_id = "different-floor";
+            target.tokens.push_back(13);
+            target.tokens.push_back(14);
+            target.cache_anchor_tokens = 8;
+            scheduler.SubmitRequests({target});
+            auto hit = scheduler.NextExecutionPlan();
+            acknowledge(hit);
+            if (host) ASSERT_GT(loaded, 0);
+            // The donor computed past 6, but no consumer-bearing window at 8/10/12
+            // may have been published by finish, abort, or retraction.
+            ASSERT_EQ(anchor_forward(hit).extend_prefix_lens[0], 6);
+            ASSERT_EQ(anchor_forward(hit).input_lengths[0], 2);
+            ExecutionEvent abort;
+            abort.With(forward::Abort{.request_id = "different-floor"});
+            scheduler.Advance(std::move(abort));
+            scheduler.NextExecutionPlan();
+            target.request_id = "earlier-floor";
+            target.cache_anchor_tokens = 4;
+            scheduler.SubmitRequests({target});
+            auto earlier = scheduler.NextExecutionPlan();
+            ASSERT_LE(anchor_forward(earlier).extend_prefix_lens[0], 4);
+        }
+}
+
 }  // namespace tokenspeed::test
