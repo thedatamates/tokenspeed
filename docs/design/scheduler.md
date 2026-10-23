@@ -764,3 +764,26 @@ width, and never mutate width after a plan has allocated its input rows. Events
 identify the current request lifetime by its ordinary request ID: the caller
 must retire outstanding event receipts before reusing that ID. Per-request
 native state and sampling identity must not be inferred from batch row order.
+
+Each successfully scheduled local forward records an optional selected-decode
+reservation in its `ForwardResources`, in result order. Prefill and legacy
+reservation feedback record no debit. An explicitly selected decode records
+the width actually charged to every cache group. When its `ExtendResult`
+lands, retained output cannot exceed that debit; the coordinator refunds the
+unused positions to each table's available tail capacity before the next
+admission. The blocks stay owned and sparse holes stay unchanged. Without this
+settlement, rejected proposals consume prepaid generation headroom repeatedly,
+invalidating the generation-covered exemption from retraction.
+
+The result records move with the page-owning resources across FSM transitions
+and are discarded with those resources on retirement. Multiple in-flight
+forwards retain separate records; a current width is not evidence of an older
+forward's debit. Missing or inconsistent result records fail closed. Ordinary
+legacy reserve feedback keeps its existing pipelined meaning and is not
+refunded automatically.
+
+Executors must also fit verification input positions inside the generation
+headroom they declared. An executor selecting six inputs with fewer than six
+output slots left must select its safe single-input fallback, or explicitly
+secure additional lookahead capacity. Refunding rejected positions after the
+forward does not supply capacity before it executes.

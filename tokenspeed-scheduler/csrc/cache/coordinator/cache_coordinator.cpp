@@ -994,6 +994,22 @@ void CacheCoordinator::ConsumeReservedTokens(std::span<BlockTable> tables, std::
     }
 }
 
+void CacheCoordinator::RefundReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens) {
+    FatalCheck(tables.size() == groups_.size() && num_tokens >= 0, "invalid reservation refund shape");
+    // Validate every group before mutation. Sparse prefix holes retain their
+    // absolute slots; refunding the tail must not materialize or reclaim them.
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int64_t available = static_cast<std::int64_t>(tables[i].AvailableTokens()) + num_tokens;
+        const std::int64_t capacity =
+            static_cast<std::int64_t>(tables[i].NumBlocks()) * geometry_[i].BlockGranularity();
+        FatalCheck(available <= capacity && available <= std::numeric_limits<std::int32_t>::max(),
+                   "reservation refund exceeds logical table capacity");
+    }
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        groups_[i].Allocator().RefundReservedTokens(tables[i], num_tokens);
+    }
+}
+
 void CacheCoordinator::Free(std::span<BlockTable> tables) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {

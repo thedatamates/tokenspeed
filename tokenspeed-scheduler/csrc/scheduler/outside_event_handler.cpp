@@ -162,7 +162,12 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
-        request->NoteResultLanded();
+        if (const auto reservation = request->NoteResultLanded()) {
+            FatalCheck(event.tokens.size() <= static_cast<std::size_t>(*reservation),
+                       "decode retained more tokens than its reservation");
+            coordinator_.RefundReservedTokens(request->BlockTablesRef(),
+                                              *reservation - static_cast<std::int32_t>(event.tokens.size()));
+        }
         request->Apply(fsm::ExtendResultEvent{event.tokens});
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);

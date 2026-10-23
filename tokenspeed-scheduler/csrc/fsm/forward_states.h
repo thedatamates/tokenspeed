@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -119,12 +121,25 @@ struct ForwardResources {
     // still writes KV into this request's tables -- retract it mid-flight
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
+    // Paired with every local forward, including empty prefill results. Only
+    // explicitly selected decodes debit their input width; legacy reserve
+    // feedback retains its pipeline semantics. Keep this with the page owner.
+    std::deque<std::optional<std::int32_t>> decode_reservations;
 
     std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
-    void TrackScheduledForward() { ++results_in_flight; }
-    void ResultLanded() {
+    void TrackScheduledForward(std::optional<std::int32_t> decode_reservation) {
+        FatalCheck(!decode_reservation || *decode_reservation > 0, "decode reservation must be positive");
+        decode_reservations.push_back(decode_reservation);
+        ++results_in_flight;
+    }
+    std::optional<std::int32_t> ResultLanded() {
         FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
+        FatalCheck(decode_reservations.size() == static_cast<std::size_t>(results_in_flight),
+                   "forward reservation records do not match in-flight results");
+        const auto reservation = decode_reservations.front();
+        decode_reservations.pop_front();
         --results_in_flight;
+        return reservation;
     }
     void ExtendTokens(const std::vector<std::int32_t>& tokens) { token_container->Extend(tokens); }
 };

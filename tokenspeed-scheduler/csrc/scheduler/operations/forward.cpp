@@ -802,7 +802,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (blocked_on_decode) {
             if (auto event = scheduleDecode(build.plan, feedback, blocker)) {
                 pushOperation(build, *blocker, applyEventAndBuildOperation(blocker, std::move(*event)));
-                blocker->TrackScheduledForward();
+                blocker->TrackScheduledForward(blocker->SelectedDecodeWidth());
                 return;
             }
         } else {
@@ -930,7 +930,7 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
         feedback.admission_failed = false;
         if (auto event = scheduleDecode(build.plan, feedback, request)) {
             pushOperation(build, *request, applyEventAndBuildOperation(request, std::move(*event)));
-            request->TrackScheduledForward();
+            request->TrackScheduledForward(request->SelectedDecodeWidth());
         } else if (feedback.admission_failed && feedback.capacity_blocker == nullptr) {
             feedback.capacity_blocker = request;
         }

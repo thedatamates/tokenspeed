@@ -219,6 +219,14 @@ public:
         table.available_tokens_ -= num_tokens;
     }
 
+    // The completed speculative forward did not retain these reserved rows.
+    // Keep their blocks owned: only restore reusable logical tail capacity.
+    void RefundReservedTokens(BlockTable& table, std::int32_t num_tokens) {
+        FatalCheck(num_tokens >= 0 && num_tokens <= std::numeric_limits<std::int32_t>::max() - table.available_tokens_,
+                   "invalid reservation refund");
+        table.available_tokens_ += num_tokens;
+    }
+
     void Free(BlockTable& table) {
         // Release the logical suffix first so newly emptied LCM parents enter
         // the FIFO free queue in deterministic table order.

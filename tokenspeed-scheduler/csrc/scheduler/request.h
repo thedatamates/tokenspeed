@@ -175,20 +175,24 @@ public:
                           state_);
     }
 
-    void TrackScheduledForward() {
+    void TrackScheduledForward() { TrackScheduledForward(std::nullopt); }
+
+    void TrackScheduledForward(std::optional<std::int32_t> decode_reservation) {
         std::visit(Overloaded{
-                       [](fsm::HoldsForwardResources auto& s) { s.resources.TrackScheduledForward(); },
+                       [decode_reservation](fsm::HoldsForwardResources auto& s) {
+                           s.resources.TrackScheduledForward(decode_reservation);
+                       },
                        [](auto&) {},
                    },
                    state_);
     }
 
-    void NoteResultLanded() {
-        std::visit(Overloaded{
-                       [](fsm::HoldsForwardResources auto& s) { s.resources.ResultLanded(); },
-                       [](auto&) {},
-                   },
-                   state_);
+    std::optional<std::int32_t> NoteResultLanded() {
+        return std::visit(Overloaded{
+                              [](fsm::HoldsForwardResources auto& s) { return s.resources.ResultLanded(); },
+                              [](auto&) -> std::optional<std::int32_t> { return std::nullopt; },
+                          },
+                          state_);
     }
 
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {

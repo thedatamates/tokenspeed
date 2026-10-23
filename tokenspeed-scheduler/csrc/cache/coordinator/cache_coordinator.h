@@ -199,6 +199,7 @@ public:
                               std::uint64_t access_epoch);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
+    void RefundReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
     // Clears only the Device prefix index. Returns false without mutation when
     // any cached block still has an owner outside its prefix index.
