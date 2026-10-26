@@ -45,8 +45,8 @@ def _world_size() -> int:
 
 
 pytestmark = pytest.mark.skipif(
-    _world_size() not in {2, 4, 8},
-    reason="launch with torchrun world size 2, 4 or 8",
+    _world_size() not in {2, 4, 8, 16},
+    reason="launch with torchrun world size 2, 4, 8 or 16",
 )
 
 
@@ -81,6 +81,7 @@ def _get_workspaces():
     individually; mnnvl-only tests still run.
     """
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        MNNVL_TWOSHOT_MAX_TOKEN,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
     )
@@ -96,7 +97,14 @@ def _get_workspaces():
         mnnvl_ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
             rank, world, MAXTOK, H + L, group=dist.group.WORLD
         )
-        _workspaces.update(rank=rank, dev=dev, world=world, ipc=ipc_ws, mnnvl=mnnvl_ws)
+        # Allocate all WORLD workspaces before subgroup tests advance symmetric
+        # allocation counters on only their participating ranks.
+        mhc_ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+            rank, world, MNNVL_TWOSHOT_MAX_TOKEN, 5120, group=dist.group.WORLD
+        )
+        _workspaces.update(
+            rank=rank, dev=dev, world=world, ipc=ipc_ws, mnnvl=mnnvl_ws, mhc=mhc_ws
+        )
     return _workspaces
 
 
@@ -156,6 +164,43 @@ def test_plain_allreduce_matches_nccl(token_num):
     torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("token_num", [8, 147, 288, 1024, 2048])
+def test_trtllm_workspace_allreduce_fp32_acc_is_the_rank_ordered_fold(token_num):
+    """With fp32_acc every strategy (one-shot at 8 tokens, two-shot past it,
+    and payloads the plain all-reduce sends through the IPC workspace) folds
+    ranks 0..n-1 from rank 0's value in fp32 and rounds once: the
+    batch-invariant rank-ordered fold, bit for bit."""
+    from tokenspeed_kernel.ops.communication.triton import rank_ordered_fold
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        ensure_workspace_initialized,
+        trtllm_workspace_allreduce,
+    )
+
+    rank, dev = _setup()
+    try:
+        armed = ensure_workspace_initialized(
+            rank=rank, group=dist.group.WORLD, max_token_num=2048, hidden_dim=H
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"trtllm fusion workspace unavailable: {exc}")
+    if not armed:
+        pytest.skip("trtllm fusion workspace unavailable")
+    torch.manual_seed(500 + rank)
+    # Magnitudes spanning six decades make the association order visible.
+    scale = torch.logspace(-3, 3, H, device=dev)
+    x = (torch.randn(token_num, H, device=dev) * scale).to(torch.bfloat16)
+    x[0, :64] = -0.0
+    out = trtllm_workspace_allreduce(x, dist.group.WORLD, fp32_acc=True)
+    if out is None:
+        pytest.skip("no armed workspace serves this shape on this fabric")
+    world = dist.get_world_size()
+    parts = torch.empty((world, token_num, H), dtype=x.dtype, device=dev)
+    dist.all_gather_into_tensor(parts, x)
+    expected = rank_ordered_fold(parts, torch.empty_like(x))
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("token_num", [8, 147, 288, 576])
 def test_trtllm_workspace_allreduce(token_num):
     """The backend-facing plain AR serves the workspace's full token range.
@@ -180,7 +225,7 @@ def test_trtllm_workspace_allreduce(token_num):
         pytest.skip("trtllm fusion workspace unavailable")
     torch.manual_seed(300 + rank)
     x = (torch.randn(token_num, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
-    out = trtllm_workspace_allreduce(x, dist.group.WORLD)
+    out = trtllm_workspace_allreduce(x, dist.group.WORLD, fp32_acc=False)
     if out is None:
         pytest.skip("no armed workspace serves this shape on this fabric")
     torch.cuda.synchronize()
@@ -193,12 +238,17 @@ def test_trtllm_workspace_allreduce(token_num):
 
     cap = comm._manager_for_group(dist.group.WORLD).max_token_num
     oversized = torch.randn(cap + 1, H, dtype=torch.bfloat16, device=dev)
-    assert trtllm_workspace_allreduce(oversized, dist.group.WORLD) is None
+    assert (
+        trtllm_workspace_allreduce(oversized, dist.group.WORLD, fp32_acc=False) is None
+    )
 
     # Non-contiguous input is served through a contiguous copy, never mutated.
-    strided = torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev)[:, ::2]
+    # Scaled like x: at 8+ ranks the bf16 sum's rounding of unit-scale inputs exceeds the tolerance.
+    strided = (torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev) * 0.1)[
+        :, ::2
+    ]
     keep = strided.clone()
-    out_nc = trtllm_workspace_allreduce(strided, dist.group.WORLD)
+    out_nc = trtllm_workspace_allreduce(strided, dist.group.WORLD, fp32_acc=False)
     assert out_nc is not None
     torch.cuda.synchronize()
     torch.testing.assert_close(strided, keep, atol=0, rtol=0)
@@ -617,3 +667,360 @@ def _rsag_body(comm, sub, grank, dev):
     # Refusals must not mutate the armed workspace.
     assert manager.initialized and manager.use_fp32_lamport is True
     assert manager.workspace_tensor is ws_before
+
+
+@pytest.mark.parametrize("entrypoint", ["native", "ops"])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mhc_post_norm_shared_workspace_graph(monkeypatch, entrypoint, pdl):
+    from tokenspeed_kernel import platform
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+    from tokenspeed_kernel.ops.residual.triton import (
+        mhc_pre_layer_norm_hc4,
+        triton_mhc_post,
+    )
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        MNNVL_TWOSHOT_MAX_TOKEN,
+        _load_trtllm_mhc_module,
+        trtllm_allreduce_fusion,
+    )
+
+    workspace = _skip_unless_mnnvl()
+    rank, device = workspace["rank"], workspace["dev"]
+    world = workspace["world"]
+    ws = workspace["mhc"]
+    # Exercise the public capability check and launch with the same workspace
+    # as ordinary AR, without changing managers captured by other tests.
+    manager = comm.TrtllmFusionWorkspaceManager()
+    manager.initialized = True
+    manager.rank = rank
+    manager.world_size = world
+    manager.use_fp32_lamport = False
+    manager.mnnvl_workspace = ws
+    monkeypatch.setattr(comm, "_manager_for_group", lambda group: manager)
+    monkeypatch.setattr(platform, "pdl_enabled", lambda: pdl)
+    for tokens in (
+        0,
+        MNNVL_TWOSHOT_MAX_TOKEN + 1,
+        1,
+        8,
+        16,
+        17,
+        ws.oneshot_token_cap,
+        ws.oneshot_token_cap + 1,
+        24,
+        32,
+        96,
+        192,
+        MNNVL_TWOSHOT_MAX_TOKEN,
+        1,
+    ):
+        torch.manual_seed(123 + rank)
+        x = torch.randn(tokens, 5120, dtype=torch.bfloat16, device=device)
+        residual = torch.randn(tokens, 4, 5120, dtype=x.dtype, device=device)
+        post, pre = [torch.rand(tokens, 4, device=device) for _ in range(2)]
+        comb = torch.randn(tokens, 4, 4, device=device).softmax(-1)
+        weight = torch.randn(5120, dtype=x.dtype, device=device)
+        updated, normalized = torch.empty_like(residual), torch.empty_like(x)
+        use_oneshot = ws.resolve_use_oneshot(tokens, None, 5120)
+
+        def native(capacity_bytes, *, peers, flags):
+            _load_trtllm_mhc_module().trtllm_mnnvl_mhc(
+                x,
+                residual,
+                post,
+                comb,
+                pre,
+                weight,
+                updated,
+                normalized,
+                EPS,
+                rank,
+                ws.multicast_ptr,
+                ws.local_ptr,
+                peers,
+                flags,
+                capacity_bytes,
+                use_oneshot,
+                pdl,
+            )
+            return updated, normalized
+
+        if not 0 < tokens <= MNNVL_TWOSHOT_MAX_TOKEN:
+            with pytest.raises(RuntimeError, match="tokens"):
+                native(ws.buffer_size_bytes, peers=ws.peer_ptrs, flags=ws.buffer_flags)
+            assert not comm.supports_allreduce_mhc_post_norm(
+                x, weight, dist.group.WORLD
+            )
+            continue
+
+        if tokens == 1:
+            for peers, flags, match in (
+                (ws.peer_ptrs, ws.buffer_flags.to(torch.int64), "flags.dtype"),
+                (ws.peer_ptrs.to(torch.int32), ws.buffer_flags, "peers.dtype"),
+                (ws.peer_ptrs.cpu(), ws.buffer_flags, "device_type"),
+            ):
+                with pytest.raises(RuntimeError, match=match):
+                    native(ws.buffer_size_bytes, peers=peers, flags=flags)
+
+        # All ranks pass real workspace pointers; an undersized capacity must
+        # be rejected before launching or advancing the shared rotation state.
+        lane_tokens = tokens * world if use_oneshot else 2 * -(-tokens // world) * world
+        with pytest.raises(RuntimeError, match="capacity_bytes"):
+            native(
+                lane_tokens * 5120 * x.element_size() - 1,
+                peers=ws.peer_ptrs,
+                flags=ws.buffer_flags,
+            )
+
+        if entrypoint == "ops":
+            assert comm.supports_allreduce_mhc_post_norm(x, weight, dist.group.WORLD)
+
+        def fused():
+            if entrypoint == "native":
+                return native(
+                    ws.buffer_size_bytes, peers=ws.peer_ptrs, flags=ws.buffer_flags
+                )
+            return comm.allreduce_mhc_post_norm(
+                x, residual, post, comb, pre, weight, EPS, dist.group.WORLD
+            )
+
+        fused()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = fused()
+        if entrypoint == "ops":
+            assert manager.graph_consumed
+        for _ in range(3):
+            x.normal_().add_(rank)
+            reduced = torch.empty_like(x)
+            trtllm_allreduce_fusion(
+                x,
+                world,
+                rank,
+                tokens,
+                5120,
+                ws,
+                trigger_completion_at_end=True,
+                fp32_acc=False,
+                pattern_code=0,
+                allreduce_out=reduced,
+                launch_with_pdl=pdl,
+                use_oneshot=use_oneshot,
+            )
+            expected_residual = triton_mhc_post(reduced, residual, post, comb)
+            expected_norm = torch.empty_like(x)
+            mhc_pre_layer_norm_hc4(
+                pre, expected_residual, weight, expected_norm, eps=EPS
+            )
+            graph.replay()
+            torch.testing.assert_close(
+                result[0], expected_residual, rtol=0.008, atol=1e-5
+            )
+            torch.testing.assert_close(result[1], expected_norm, rtol=0.008, atol=0.001)
+
+
+@pytest.mark.parametrize(
+    "token_num,width", [(1, 640), (16, 1280), (32, 640), (4, 4096)]
+)
+def test_lamport_all_gather_moves_every_bit(token_num, width):
+    """The barrier-free all-gather returns NCCL's gather bit for bit, also for
+    -0.0, NaN payloads, raw integer lanes and a lane pair whose raw packing is
+    the 32-bit sentinel; with a fresh payload every call, between one-shot and
+    two-shot all-reduces on the same rotation that stay correct, after a wider
+    gather, and under CUDA-graph replay."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        AllReduceFusionPattern,
+        trtllm_allreduce_fusion,
+        trtllm_mnnvl_allgather,
+    )
+
+    ws = _skip_unless_mnnvl()
+    rank, world, dev, mnnvl = ws["rank"], ws["world"], ws["dev"], ws["mnnvl"]
+    gen = torch.Generator(device=dev).manual_seed(6_000 + rank)
+    shape = (token_num, width)
+
+    def payload():
+        bits = torch.randint(-(2**15), 2**15, shape, generator=gen, device=dev).short()
+        bits[:, :8] = -0x8000  # -0.0 and the 16-bit lamport sentinel
+        bits[:, 8:16] = 0x7FC1  # a NaN payload
+        # Packed raw, this pair would be the 32-bit sentinel.
+        bits[:, 16:18] = torch.tensor([0, -0x8000], dtype=torch.int16, device=dev)
+        rows = bits.view(torch.bfloat16)
+        # NCCL has no int16; its bf16 all-gather is a plain copy.
+        want = torch.empty(world, token_num, width, dtype=torch.bfloat16, device=dev)
+        dist.all_gather_into_tensor(want, rows)
+        return rows, want.view(torch.int16).permute(1, 0, 2).reshape(token_num, -1)
+
+    x = torch.empty(shape, dtype=torch.bfloat16, device=dev)
+    first = torch.empty(1, width, dtype=torch.bfloat16, device=dev)
+    ar_in = torch.randn(token_num, H, device=dev, dtype=torch.bfloat16) * 0.1
+    ar_out = torch.empty_like(ar_in)
+    ar_kw = dict(pattern_code=AllReduceFusionPattern.kAllReduce, allreduce_out=ar_out)
+    twoshot_in = torch.randn(8, H, device=dev, dtype=torch.bfloat16) * 0.1
+    twoshot_out = torch.empty_like(twoshot_in)
+    ar_want, twoshot_want = ar_in.float(), twoshot_in.float()
+    dist.all_reduce(ar_want)
+    dist.all_reduce(twoshot_want)
+
+    def gather():
+        out = trtllm_mnnvl_allgather(x, mnnvl, launch_with_pdl=True)
+        _run_ar(mnnvl, ar_in, ar_out, ar_kw, token_num, H)
+        row = trtllm_mnnvl_allgather(first, mnnvl, launch_with_pdl=True)
+        trtllm_allreduce_fusion(
+            allreduce_in=twoshot_in,
+            world_size=world,
+            world_rank=rank,
+            token_num=8,
+            hidden_dim=H,
+            workspace_ptrs=mnnvl,
+            launch_with_pdl=True,
+            trigger_completion_at_end=True,
+            fp32_acc=False,
+            use_oneshot=False,
+            pattern_code=AllReduceFusionPattern.kAllReduce,
+            allreduce_out=twoshot_out,
+        )
+        return out, row
+
+    def step(run):
+        rows, want = payload()
+        x.copy_(rows)
+        first.copy_(rows[:1])
+        out, row = run()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), want)
+        assert torch.equal(row.view(torch.int16), want[:1])
+        torch.testing.assert_close(ar_out.float(), ar_want, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            twoshot_out.float(), twoshot_want, atol=3e-2, rtol=3e-2
+        )
+
+    for _ in range(3):  # every buffer of the rotation, between all-reduces
+        step(gather)
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = gather()
+
+    def replay():
+        graph.replay()
+        return captured
+
+    for _ in range(3):
+        step(replay)
+    dist.barrier()
+
+
+def test_lamport_all_gather_refuses_by_shape_and_copies_odd_layouts():
+    """Refusals depend only on dtype and shape, which every rank shares; a
+    strided or misaligned view is copied rather than refused, since a
+    rank-local refusal would strand the peers in the exchange."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        MNNVL_ALLGATHER_MAX_BYTES,
+        trtllm_mnnvl_allgather,
+    )
+
+    ws = _skip_unless_mnnvl()
+    rank, world, dev, mnnvl = ws["rank"], ws["world"], ws["dev"], ws["mnnvl"]
+    torch.manual_seed(7_000 + rank)
+    flat = torch.randn(4 * 1280 + 8, device=dev).bfloat16()
+    strided = flat[: 4 * 1280].view(4, 1280)[:, ::2]
+    misaligned = flat[1 : 1 + 4 * 640].view(4, 640)
+    assert misaligned.data_ptr() % 16 != 0
+    for rows in (strided, misaligned):
+        keep = rows.clone()
+        want = torch.empty(world, 4, 640, dtype=torch.bfloat16, device=dev)
+        dist.all_gather_into_tensor(want, rows.contiguous())
+        got = trtllm_mnnvl_allgather(rows, mnnvl, launch_with_pdl=True)
+        torch.cuda.synchronize()
+        assert got is not None
+        assert torch.equal(got, want.permute(1, 0, 2).reshape(4, world * 640))
+        assert torch.equal(rows, keep)
+    too_many = MNNVL_ALLGATHER_MAX_BYTES // (4096 * 2) + 1
+    for shape, dtype in (
+        ((4, 640), torch.float32),
+        ((4, 600), torch.bfloat16),
+        ((4, 4224), torch.bfloat16),
+        ((too_many, 4096), torch.bfloat16),
+        ((0, 640), torch.bfloat16),
+    ):
+        refused = torch.zeros(shape, dtype=dtype, device=dev)
+        assert trtllm_mnnvl_allgather(refused, mnnvl, launch_with_pdl=True) is None
+    dist.barrier()
+
+
+def test_lamport_all_gather_advances_the_rotation_and_clears_behind():
+    """Each gather takes the next buffer, records its widened extent and
+    returns the buffer the previous call dirtied to the sentinel, whatever the
+    widths on either side."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_mnnvl_allgather
+
+    ws = _skip_unless_mnnvl()
+    rank, world, dev, mnnvl = ws["rank"], ws["world"], ws["dev"], ws["mnnvl"]
+    handle = mnnvl._refs[1]
+    local = handle.get_buffer(rank, (handle.buffer_size // 4,), torch.int32)
+    words_per_buffer = mnnvl.buffer_size_bytes // 4
+    for token_num, width in ((4, 4096), (1, 640), (16, 1280), (2, 4096)):
+        torch.cuda.synchronize()
+        dist.barrier()
+        before = mnnvl.buffer_flags.tolist()
+        x = torch.randn(token_num, width, device=dev).bfloat16()
+        assert trtllm_mnnvl_allgather(x, mnnvl, launch_with_pdl=False) is not None
+        torch.cuda.synchronize()
+        dist.barrier()
+        after = mnnvl.buffer_flags.tolist()
+        extent = token_num * world * width * 4
+        assert after[:5] == [(before[0] + 1) % 3, before[0], before[2], 1, extent]
+        if before[3] == 1:
+            start = before[1] * words_per_buffer
+            behind = local[start : start + before[4] // 4]
+            assert torch.all(behind == -(2**31))
+
+
+def test_workspace_all_gather_freezes_the_workspace_only_when_served():
+    """Capturing a served gather through the backend-facing entry point
+    freezes the workspace against growth; capturing a refused one does not."""
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        ensure_workspace_initialized,
+        trtllm_workspace_all_gather,
+    )
+
+    rank, dev = _setup()
+    try:
+        armed = ensure_workspace_initialized(
+            rank=rank, group=dist.group.WORLD, max_token_num=2048, hidden_dim=H
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"trtllm fusion workspace unavailable: {exc}")
+    manager = comm._manager_for_group(dist.group.WORLD)
+    if not armed or manager.mnnvl_workspace is None:
+        pytest.skip("no mnnvl workspace on this fabric")
+    world = dist.get_world_size()
+    consumed_before = manager.graph_consumed
+    manager.graph_consumed = False
+    torch.manual_seed(8_000 + rank)
+    x = torch.randn(4, 640, device=dev).bfloat16()
+    refused = torch.randn(4, 640, device=dev)
+    want = torch.empty(world, 4, 640, dtype=torch.bfloat16, device=dev)
+    dist.all_gather_into_tensor(want, x)
+    try:
+        trtllm_workspace_all_gather(x, dist.group.WORLD)
+        torch.cuda.synchronize()
+        assert not manager.graph_consumed
+        # The refused capture holds one ordinary kernel so the graph is not empty.
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            refused.mul_(2)
+            assert trtllm_workspace_all_gather(refused, dist.group.WORLD) is None
+        assert not manager.graph_consumed
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = trtllm_workspace_all_gather(x, dist.group.WORLD)
+        assert got is not None and manager.graph_consumed
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(got, want.permute(1, 0, 2).reshape(4, world * 640))
+    finally:
+        manager.graph_consumed = consumed_before
+    dist.barrier()

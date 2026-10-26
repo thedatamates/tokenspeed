@@ -24,10 +24,18 @@ Exercise execution modes with all consumers, then each optional consumer alone.
 The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
 """
 
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
@@ -50,12 +58,16 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
-    wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8)
+    wrapper.config = SimpleNamespace(
+        spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
+    )
     wrapper.device = "cpu"
     full_backend = object.__new__(AttentionBackend)
     full_backend.device = "cpu"
 
-    def commit_recurrent(accepted_lengths):
+    def commit_recurrent(accepted_lengths, *, num_extends, accepted_path):
+        if num_extends:
+            return
         events.append("recurrent")
         commits["recurrent"].append(accepted_lengths.tolist())
 
@@ -83,7 +95,7 @@ def _runner(
         attention_backend=(
             HybridLinearAttnBackend(
                 full_backend,
-                SimpleNamespace(commit_verified_state=commit_recurrent),
+                SimpleNamespace(commit_state_after_acceptance=commit_recurrent),
                 [1, 3],
             )
             if "recurrent" in consumers
@@ -109,7 +121,12 @@ def _runner(
         ),
     )
     wrapper.drafter = (
-        SimpleNamespace(attn_backend=draft_backend) if has_drafter else None
+        SimpleNamespace(
+            attn_backend=draft_backend,
+            replay_decode_graph=lambda graph, *, bs, graph_bs: graph.replay(),
+        )
+        if has_drafter
+        else None
     )
     wrapper.max_tokens_per_req = 4
     wrapper.input_buffers = SimpleNamespace(
@@ -125,11 +142,14 @@ def _runner(
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._init_forward_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._cuda_graph_key = lambda bs: bs
+    wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
+    wrapper._expert_load_rows = None
     wrapper._graph_debug = False
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
         torch.arange(16, dtype=torch.int32),
         torch.tensor([3, 1, 99, 99], dtype=torch.int32),
+        None,
         None,
     )
 
@@ -137,7 +157,7 @@ def _runner(
         events.append("execute")
         if fail_forward:
             raise RuntimeError("forward failed")
-        return result[0][:8], result[1][:2], None
+        return result[0][:8], result[1][:2], None, None
 
     wrapper._forward_func = lambda **kwargs: execute()
     wrapper.graphs = {4: SimpleNamespace(replay=execute)}
@@ -155,6 +175,8 @@ def _run(wrapper, mode):
         all_decode_or_idle=mode.is_decode(),
         capture_hidden_mode=None,
         input_num_tokens=8,
+        output_layout=None,
+        query_shard=None,
     )
     empty = torch.empty(0, dtype=torch.int32)
     result = wrapper(
@@ -170,6 +192,8 @@ def _run(wrapper, mode):
         extend_seq_lens_cpu=empty,
         positions=None,
         block_tables={},
+        block_tables_cpu={},
+        settle=lambda: None,
     )
     assert ctx.bs == 2
     return result
@@ -209,15 +233,13 @@ def test_runner_commits_live_acceptance_once_after_execution(
     _run(wrapper, mode)
     expected_qsa = (
         [([3, 1], int(mode.is_mixed()))]
-        if has_drafter
-        and "qsa" in consumers
-        and mode in (ForwardMode.DECODE, ForwardMode.MIXED)
+        if "qsa" in consumers and mode in (ForwardMode.DECODE, ForwardMode.MIXED)
         else []
     )
     assert commits["qsa"] == expected_qsa
     assert events[:2] == ["metadata", "execute"]
     assert "draft_qsa" not in events
-    verifies_decode = has_drafter and mode.is_decode()
+    verifies_decode = mode.is_decode()
     expected_commits = []
     for consumer in ("recurrent", "ple"):
         active = verifies_decode and consumer in consumers
@@ -241,3 +263,7 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
         _run(wrapper, ForwardMode.DECODE)
     assert events == ["metadata", "execute"]
     assert commits == {"recurrent": [], "ple": [], "qsa": []}
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -45,10 +44,56 @@ class DpForwardMetadata:
 
     global_num_tokens: list[int]
     global_batch_size: list[int]
+    global_num_decodes: list[int]
     global_forward_mode: list[int]
     all_decode_or_idle: bool
     all_extend: bool
     need_idle_forward: bool
+
+    @classmethod
+    def from_ranks(
+        cls,
+        *,
+        global_num_tokens: list[int],
+        global_batch_size: list[int],
+        global_num_extends: list[int],
+        need_idle_forward: bool,
+    ) -> DpForwardMetadata:
+        """The metadata from every rank's batch, in rank order.
+
+        Args:
+            global_num_tokens: Tokens each rank forwards.
+            global_batch_size: Requests in each rank's batch; 0 for a rank
+                without model work.
+            global_num_extends: Prefill rows in each rank's batch.
+            need_idle_forward: This rank has no batch while another has one.
+        """
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        global_forward_mode = [
+            int(ForwardMode.from_num_extends(num_extends, batch_size))
+            for num_extends, batch_size in zip(global_num_extends, global_batch_size)
+        ]
+        return cls(
+            global_num_tokens=list(global_num_tokens),
+            global_batch_size=list(global_batch_size),
+            global_num_decodes=[
+                batch_size - num_extends
+                for batch_size, num_extends in zip(
+                    global_batch_size, global_num_extends
+                )
+            ],
+            global_forward_mode=global_forward_mode,
+            all_decode_or_idle=all(
+                mode in (int(ForwardMode.DECODE), int(ForwardMode.IDLE))
+                for mode in global_forward_mode
+            ),
+            # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+            all_extend=all(
+                mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
+            ),
+            need_idle_forward=need_idle_forward,
+        )
 
 
 @dataclass(frozen=True)
@@ -114,17 +159,23 @@ class InputLogprobPlan:
             0 for a slot that needs none.
         position_starts: Per extend slot, the prompt position of its first
             gathered row (meaningful only where the count is non-zero).
+        top_k: How many most likely next tokens every gathered row also
+            returns: the largest ``top_logprobs_num`` among the planned slots
+            (each slot keeps its own), 0 for none.
     """
 
     row_starts: tuple[int, ...]
     counts: tuple[int, ...]
     position_starts: tuple[int, ...]
+    top_k: int = 0
 
     def __post_init__(self) -> None:
         if not len(self.row_starts) == len(self.counts) == len(self.position_starts):
             raise ValueError("input logprob plan fields must have equal lengths")
         if any(count < 0 for count in self.counts):
             raise ValueError("input logprob plan counts must be non-negative")
+        if self.top_k < 0:
+            raise ValueError("input logprob plan top_k must be non-negative")
         if self.num_rows == 0:
             raise ValueError("an input logprob plan must name at least one row")
 
@@ -134,15 +185,44 @@ class InputLogprobPlan:
         return sum(self.counts)
 
 
+# Most stop tokens a request may end on (its own plus the model's EOS ids):
+# the width of the per-slot stop table the device cuts verify rounds with.
+MAX_STOP_TOKEN_IDS = 16
+
+
+@dataclass(frozen=True)
+class StopCriteria:
+    """Where a request's generation ends, as the device cuts verify rounds.
+
+    Attributes:
+        stop_token_ids: The tokens that end the request, at most
+            ``MAX_STOP_TOKEN_IDS``; empty under ``ignore_eos``.
+        token_limit: Total token count (prompt plus ``max_new_tokens``) at
+            which the request ends.
+    """
+
+    stop_token_ids: tuple[int, ...]
+    token_limit: int
+
+    def __post_init__(self) -> None:
+        if len(self.stop_token_ids) > MAX_STOP_TOKEN_IDS:
+            raise ValueError(
+                f"{len(self.stop_token_ids)} stop token ids exceed the device "
+                f"table width {MAX_STOP_TOKEN_IDS}"
+            )
+        if self.token_limit <= 0:
+            raise ValueError(f"token_limit must be positive, got {self.token_limit}")
+
+
 @dataclass(frozen=True)
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
-    Everything the data plane learns about a round arrives through here and
-    is captured into the submitted closure, so every field must be something
-    the control plane will not touch again once the round is dispatched (the
-    capture contract in ``forward_thread.py``). A new field either satisfies
-    that, or it is a new registered exception — not a comment.
+    Everything the forward learns about a round arrives through here, so
+    every field must be something nothing edits again once the forward is
+    launched (the capture contract in ``execution/device.py``). A new field
+    either satisfies that, or it is a new registered exception — not a
+    comment.
 
     Attributes:
         forward_op: The scheduler's op for this round. A per-round value copy
@@ -165,6 +245,11 @@ class PlannedForward:
         input_logprob_plan: The prompt rows whose logprobs this forward
             gathers, None when no extend row needs any. A frozen dataclass
             of plain tuples.
+        sampled_top_k: How many most likely tokens each prefill row's
+            sampled token is reported with: the largest ``top_logprobs_num``
+            among the extend slots, 0 for none. A plain int.
+        stop_criteria: Per-slot stop tokens and token limits, gathered by the
+            loop. Frozen values fixed for the request's lifetime.
     """
 
     forward_op: Any
@@ -175,6 +260,48 @@ class PlannedForward:
     ngram_inputs: NGramInputs | None
     request_history_seeds: RequestHistorySeeds | None
     input_logprob_plan: InputLogprobPlan | None
+    sampled_top_k: int
+    stop_criteria: tuple[StopCriteria, ...]
+
+
+@dataclass
+class ForwardLogprobs:
+    """The logprobs an eager extend forward returns beside its sampled
+    tokens': the planned prompt rows' (``ForwardContext.input_logprob_rows``),
+    and the top-k alternatives of those rows and of the prefill rows' sampled
+    tokens (``ForwardContext.sampled_top_k``). A forward that asked for none of
+    them -- every captured graph among them -- returns None in its place.
+    """
+
+    input_token_logprobs: torch.Tensor | None = None
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
+
+    @classmethod
+    def of(cls, logits_output: Any) -> ForwardLogprobs | None:
+        """The forward's logprobs from its ``LogitsProcessorOutput``."""
+        logprobs = cls(
+            input_token_logprobs=logits_output.input_token_logprobs,
+            input_top_logprobs_val=logits_output.input_top_logprobs_val,
+            input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
+            output_top_logprobs_val=logits_output.sampled_top_logprobs_val,
+            output_top_logprobs_idx=logits_output.sampled_top_logprobs_idx,
+        )
+        return None if logprobs.is_empty() else logprobs
+
+    def is_empty(self) -> bool:
+        return all(value is None for value in vars(self).values())
+
+    def to_host(self) -> ForwardLogprobs:
+        """Non-blocking D2H copies, landed by the result's copy event."""
+        return ForwardLogprobs(
+            **{
+                name: None if value is None else value.to("cpu", non_blocking=True)
+                for name, value in vars(self).items()
+            }
+        )
 
 
 @dataclass
@@ -211,49 +338,30 @@ class ModelExecutionResult:
     # slices the flat tensor per request without re-deriving the rows.
     input_token_logprobs: torch.Tensor | None = None
     input_logprob_plan: InputLogprobPlan | None = None
+    # The top-k alternatives ([rows, k] fp32 values and int64 ids) of the
+    # planned prompt rows (plan order) and of the prefill rows' sampled tokens
+    # (prefill output order); None when the forward asked for none.
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
         """Block until this result's D2H copy has landed.
 
-        Called exactly once, by ``PendingExecution.result()`` — the single
-        gate between the forward thread and the control plane. Consumers
-        receive an already-synced result and must not call this again; a
-        second call means a redundant sync path was reintroduced, so it
-        raises instead of silently costing a no-op event join.
+        Called exactly once, by the commit (``HostDataPlane.complete``) — the
+        single gate between the forward thread and the control plane.
+        Consumers receive an already-synced result and must not call this
+        again; a second call means a redundant sync path was reintroduced, so
+        it raises instead of silently costing a no-op event join.
         """
         if self._synced:
             raise RuntimeError(
-                "ModelExecutionResult is synced exactly once, by "
-                "PendingExecution.result(); consumers get a synced result."
+                "ModelExecutionResult is synced exactly once, by the commit; "
+                "consumers get a synced result."
             )
         if self.copy_event is None:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
         self._synced = True
-
-
-@dataclass
-class PendingExecution:
-    """A forward submitted to the forward thread, awaiting its result.
-
-    The control plane's ``in_flight`` queue holds these instead of raw
-    ``ModelExecutionResult``s. ``result()`` joins the forward-thread future
-    (all launches + D2H issued) and then syncs the copy event (D2H landed).
-    Only commit blocks here — the dispatch path never waits, which is what
-    keeps a backpressured stage's launches from stalling the control plane.
-
-    Also the only place a ``ModelExecutionResult`` crosses back, which is
-    what makes the sync exactly-once: the future is private and the result
-    is memoized.
-    """
-
-    _future: Future
-    _result: ModelExecutionResult | None = field(default=None, init=False, repr=False)
-
-    def result(self) -> ModelExecutionResult:
-        if self._result is None:
-            results = self._future.result()
-            results.sync()
-            self._result = results
-        return self._result

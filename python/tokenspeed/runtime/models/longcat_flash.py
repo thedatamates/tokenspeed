@@ -22,10 +22,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable as _Iterable
 
-import tokenspeed_kernel
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from tokenspeed_kernel.platform import current_platform as _current_platform
 from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -74,6 +75,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader as _default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM as _BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import (
+    capture_layer_input as _capture_layer_input,
+)
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
@@ -226,19 +230,31 @@ class _RuntimeLongcatRouter(nn.Module):
             quant_config=None,
             prefix=add_prefix("classifier", prefix),
         )
+        self.classifier_kernel_plan = (
+            plan_dense_gemm(
+                mode="mm",
+                input_size=config.hidden_size,
+                output_size=num_logits,
+                dtype=torch.float32,
+                batch_size=None,
+                batch_invariant=True,
+            )
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+            else None
+        )
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(num_logits, dtype=torch.float32)
         )
 
     def forward(self, hidden_states: torch.Tensor):
-        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+        if self.classifier_kernel_plan is not None:
             # The classifier's logits feed expert selection, so they must be
             # batch-invariant or top-k flips at near-ties. cuBLAS and the
-            # dsv3 router kernel tile by shape; the aok leaf does not.
-            return tokenspeed_kernel.mm(
+            # dsv3 router kernel tile by shape; the selected leaf must not.
+            return kernel_mm(
                 hidden_states.float(),
                 self.classifier.weight.float(),
-                override="aok",
+                plan=self.classifier_kernel_plan,
             )
         if _longcat_is_hopper_plus and hidden_states.shape[0] > 0:
             return _dsv3_router_gemm(
@@ -452,7 +468,7 @@ class _RuntimeLongcatMoE(nn.Module):
                 )
 
             zero_expert_output = self._apply_zero_experts(hidden_states, topk_output)
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_expert_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
@@ -469,6 +485,7 @@ class _RuntimeLongcatMoE(nn.Module):
                 expert_weights,
                 zero_expert_output,
                 top_k=self.topk.topk_config.top_k,
+                hidden_dim=hidden_states.shape[-1],
             )
 
         if zero_expert_output is not None:
@@ -780,10 +797,15 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: _ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
         if ctx.forward_mode.is_idle():
+            # No rows, but the tap and its gather stay aligned across ranks.
+            _capture_layer_input(
+                self.branch_comm[0], hidden_states, ctx, aux_hidden_states
+            )
             return self._forward_idle(
                 positions,
                 hidden_states,
@@ -797,6 +819,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
+        _capture_layer_input(self.branch_comm[0], residual, ctx, aux_hidden_states)
         hidden_states = self.self_attn[0](
             positions=positions,
             hidden_states=hidden_states,
@@ -912,15 +935,13 @@ class _RuntimeLongcatModel(nn.Module):
         aux_hidden_states = [] if self.layers_to_capture else None
         layer = None
         for layer_id, layer in enumerate(self.layers):
-            if aux_hidden_states is not None and layer_id in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            capture = layer_id in self.layers_to_capture
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 ctx,
                 residual,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
 
         if not ctx.forward_mode.is_idle() and layer is not None:

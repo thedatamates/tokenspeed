@@ -228,6 +228,47 @@ def test_reuse_persisted_cache_ignores_measurement_policy(
     assert fi.AutoTuner.search_cache is original_search
 
 
+@pytest.mark.parametrize("require_profiling_policy", [False, True])
+def test_reuse_cache_preserves_explicit_profiling_policy(
+    monkeypatch, require_profiling_policy
+):
+    fi = pytest.importorskip("flashinfer.autotuner.autotuner")
+    monkeypatch.setattr(tuning, "_autotuner", fi)
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", raising=False)
+
+    class Runner(fi.TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return [7]
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            raise AssertionError("Cache lookup must not launch a kernel")
+
+    tuner = fi.AutoTuner()
+    runner = Runner()
+    config = fi.TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+    inputs = [torch.empty(1, 128)]
+    shapes = ((1, 128),)
+    key = tuner._get_cache_key("probe", runner, shapes, config, ())
+    # An entry without measurement provenance is treated as hot-L2. A strict
+    # cold-L2 lookup must miss even inside the serving-cache reuse adapter.
+    tuner.profiling_cache[key] = (7, None)
+    tuner.is_tuning_mode = True
+    original_search = fi.AutoTuner.search_cache
+    with tuning._reuse_autotune_cache():
+        hit, _, tactic, _ = tuner.search_cache(
+            "probe",
+            [runner],
+            shapes,
+            config,
+            inputs=inputs,
+            require_profiling_policy=require_profiling_policy,
+        )
+        assert hit is not require_profiling_policy
+        assert tactic == (-1 if require_profiling_policy else 7)
+        assert tuner.is_tuning_mode
+    assert fi.AutoTuner.search_cache is original_search
+
+
 @pytest.mark.parametrize(
     "tokens,local,queries",
     [(512, 112, [512, 64]), (513, 112, [513, 65]), (512, 896, [512])],
@@ -433,3 +474,58 @@ def test_legacy_bundled_configs_do_not_bypass_tuning(monkeypatch):
     original = tuning._autotuner.AutoTuner.search_cache
     with tuning._reuse_autotune_cache():
         assert tuning._autotuner.AutoTuner.search_cache is original
+
+
+def test_partial_rank_cache_hit_profiles_on_every_rank(monkeypatch):
+    _install_fake_flashinfer(monkeypatch, metadata={})
+    monkeypatch.setattr(tuning, "_autotune_process_group", object(), raising=False)
+    monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)
+
+    def gather(states, hit, *, group):
+        states[:] = [hit, False]
+
+    monkeypatch.setattr(tuning.dist, "all_gather_object", gather)
+    tuner = types.SimpleNamespace(
+        _lock=threading.RLock(),
+        is_tuning_mode=True,
+        _blocklist=types.SimpleNamespace(filter=lambda *args: [7]),
+    )
+    search = tuning._autotuner.AutoTuner.search_cache
+    search.return_value = (True, 0, 7, None)
+    with tuning._reuse_autotune_cache():
+        assert tuning._autotuner.AutoTuner.search_cache(
+            tuner,
+            "probe",
+            [object()],
+            ((1, 128),),
+            object(),
+            require_profiling_policy=True,
+        ) == (False, 0, -1, None)
+    assert search.call_args.kwargs["require_profiling_policy"] is True
+    assert tuner.is_tuning_mode
+
+
+def test_save_keeps_rank_specific_tactics(monkeypatch, tmp_path):
+    import json
+
+    tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
+    local = {"_metadata": {}, "rank0": ["Runner", 7]}
+    peer = {"_metadata": {}, "rank1": ["Runner", 9]}
+    monkeypatch.setattr(
+        tuner, "save_configs", lambda path: Path(path).write_text(json.dumps(local))
+    )
+    monkeypatch.setattr(tuning.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(tuning.dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(tuning.dist, "broadcast_object_list", lambda *a, **k: None)
+
+    def gather(states, value, *, group):
+        states[:] = [
+            value,
+            value if isinstance(value, bool) else json.dumps(peer).encode(),
+        ]
+
+    monkeypatch.setattr(tuning.dist, "all_gather_object", gather)
+    path = tmp_path / "configs.json"
+    assert save_autotune_cache(str(path), object(), 0)
+    assert json.loads(path.read_bytes()) == local | peer

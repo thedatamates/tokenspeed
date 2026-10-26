@@ -80,12 +80,15 @@ def _bare_mla_backend(
     backend.page_table_buf = None
     backend.seq_lens_buf = None
     backend._decode_views_by_bs = {}
+    backend.tree_verify = None
+    backend.tree_draft = None
     return backend
 
 
 def _bare_amd_mla_backend(*, spec_num_tokens: int = 1) -> MLAAttnBackend:
     backend = MLAAttnBackend.__new__(MLAAttnBackend)
     backend.device = "cpu"
+    backend.decode_kernel_plan = None
     backend.kernel_page_size = _PAGE_SIZE
     backend.max_context_len = _MAX_CTX
     backend.max_num_pages = _MAX_CTX // _PAGE_SIZE

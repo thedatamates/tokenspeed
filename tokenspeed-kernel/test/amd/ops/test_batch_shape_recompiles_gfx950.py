@@ -25,9 +25,6 @@ specialization class, then sweep the batch-dependent value inside
 ``assert_no_triton_compile``.
 """
 
-import importlib
-import sys
-
 import pytest
 import torch
 from utils import (
@@ -136,7 +133,8 @@ def test_mxfp8_gemm_row_count():
     run(2048)
     run(768)
     with assert_no_triton_compile(mm.gluon_mm_mxfp8_gfx950):
-        for rows in (256, 1280, 1792):
+        # Ragged counts shift their last tile instead of specializing on M.
+        for rows in (256, 300, 1280, 1531, 1792, 2559):
             # Rows are independent: a shorter batch is a prefix.
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 
@@ -164,11 +162,9 @@ def test_mxfp4_precomputed_route_row_count():
         assert torch.equal(gate, weights.flatten()[scatter.long()])
         assert torch.equal(gather, scatter // topk)
 
-    # 5 to 8 tokens share the power-of-two route tiles; the block counts
-    # alternate between the two integer classes.
+    # Row and block counts are unspecialized runtime arguments.
     run(5)
-    run(6)
-    with assert_no_triton_compile(routing._fused_precomputed_topk_route_small_m):
+    with assert_no_triton_compile(routing._precomputed_topk_route):
         for tokens in (7, 8):
             run(tokens)
 
@@ -192,7 +188,8 @@ def test_mxfp4_moe_sorting_route_count():
                 128,
                 torch.bfloat16,
                 block,
-                compact_route_programs=False,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
             )
         )
         assert int(valid[1]) == tokens
@@ -247,31 +244,26 @@ def test_moe_topk_row_count():
             run(rows)
 
 
-def test_iris_allreduce_sizes(monkeypatch):
-    pytest.importorskip("iris")
+def test_iris_allreduce_sizes():
+    pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
     from tokenspeed_kernel._triton import gl
-
-    # Other tests stub the Iris module through sys.modules, which only works
-    # while it has not been imported; record its absence so teardown drops the
-    # import this test makes.
-    name = "tokenspeed_kernel.ops.communication.iris"
-    if name not in sys.modules:
-        package = importlib.import_module("tokenspeed_kernel.ops.communication")
-        monkeypatch.setattr(package, "iris", None, raising=False)
-        monkeypatch.setitem(sys.modules, name, None)
-        del sys.modules[name]
-    comm = importlib.import_module(name)
+    from tokenspeed_kernel.ops.communication._iris import all_reduce as comm
 
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=64, WORDS_PER_LANE=2)
-    common.update(ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+    policy = comm.iris_cache_policy()
+    common = dict(RANK=0, WORLD_SIZE=8)
+    common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+    common.update(
+        PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+    )
 
     # Compile only: the allreduce itself needs the symmetric heap of every rank.
     def two_stage(words):
         tiles = -(-words // 128)
-        comm.iris_reduce_symmetric_two_stage_gluon_kernel.warmup(
+        comm.iris_pull_twoshot.warmup(
             buf,
             buf,
             buf,
@@ -290,7 +282,7 @@ def test_iris_allreduce_sizes(monkeypatch):
 
     def one_stage(numel):
         tiles = -(-numel // 512)
-        comm.iris_reduce_symmetric_gluon_kernel.warmup(
+        comm.iris_pull_oneshot.warmup(
             buf,
             buf,
             flags,
@@ -312,8 +304,8 @@ def test_iris_allreduce_sizes(monkeypatch):
     one_stage(7168 * 3)
     one_stage(7168 * 3 + 1)
     with assert_no_triton_compile(
-        comm.iris_reduce_symmetric_two_stage_gluon_kernel,
-        comm.iris_reduce_symmetric_gluon_kernel,
+        comm.iris_pull_twoshot,
+        comm.iris_pull_oneshot,
     ):
         for words in (157248, 996240, 236880, 79296):
             two_stage(words)
@@ -332,29 +324,35 @@ def test_kda_fused_replay_batch_size():
     def compile_for(batch):
         pages = torch.zeros(2, batch, dtype=torch.int32, device=DEVICE)
         accepted = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+        metadata = torch.zeros(batch, 3, dtype=torch.int64, device=DEVICE)
+        stamps = torch.zeros(layers, batch, 4, 2, dtype=torch.int64, device=DEVICE)
+        activation_ref = torch.empty(0, dtype=torch.bfloat16, device=DEVICE)
         decode.gluon_kda_fused_replay_gfx950.warmup(
             descriptors,
             groups,
             pages,
             pages,
             accepted,
+            metadata,
+            stamps,
+            activation_ref,
+            activation_ref,
+            BATCH=batch,
+            qkv_stride=4608,
+            conv_stride=13824,
+            state_stride=196608,
+            u_stride=1536,
+            kg_stride=3072,
+            record_slots=batch,
+            stamp_layer_stride=stamps.stride(0),
+            lower_bound=-5.0,
             H=12,
             D=128,
-            TOKENS_PER_SEQUENCE=4,
-            MIXED_ROW_STRIDE=4608,
-            CONV_WEIGHT_ROW_STRIDE=4,
-            CONV_WEIGHT_COL_STRIDE=1,
-            CONV_POOL_PAGE_STRIDE=13824,
-            CONV_POOL_CHANNEL_STRIDE=3,
-            CONV_POOL_HISTORY_STRIDE=1,
-            GATE_ROW_STRIDE=1536,
-            BETA_ROW_STRIDE=12,
-            STATE_POOL_PAGE_STRIDE=196608,
-            HAS_LOWER_BOUND=True,
-            LOWER_BOUND=-5.0,
-            BATCH_SIZE=batch,
+            T=4,
+            CAPACITY=4,
+            BOUNDED=True,
             num_warps=4,
-            num_stages=2,
+            debug=True,
             grid=(1,),
         )
 
@@ -388,9 +386,6 @@ def test_kda_fused_decode_batch_size():
             beta_logits=rows[:, 4 * width + head_dim :],
             A_log=torch.zeros(heads, device=DEVICE),
             dt_bias=torch.zeros(width, device=DEVICE),
-            output_gate=rows[:, 3 * width : 4 * width],
-            norm_weight=torch.ones(head_dim, device=DEVICE).bfloat16(),
-            norm_eps=1e-6,
             state_pool=state_pool,
             read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
             write_indices=torch.arange(

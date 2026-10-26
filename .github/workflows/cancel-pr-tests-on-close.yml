@@ -17,8 +17,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: AMD Tests
-            group: pr-test-amd
+          - name: AMD MI350 Tests
+            group: pr-test-amd-mi350
+          - name: AMD MI450 Tests
+            group: pr-test-amd-mi450
+          - name: AMD Kernel Benchmark
+            group: pr-test-amd-kernel-benchmark
           - name: NVIDIA B200 Tests
             group: pr-test-nvidia
           - name: PR Test NVIDIA ARM

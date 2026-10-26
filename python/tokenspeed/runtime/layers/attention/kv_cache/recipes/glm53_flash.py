@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -35,10 +36,13 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
-    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_replay_supported,
+    kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -184,6 +188,23 @@ def declare_glm53_flash_groups(
             f"{target_dsa.index_k_format!r}"
         )
     target_linear = _require_linear_config(attn_config)
+    # Batched KDA replay walks every layer's state pages with one stride. A
+    # target-only plan leaves the last KDA plane without an MLA tenant, so a
+    # KDA page narrower than an MLA plane is padded to that plane's width.
+    mla_plane_bytes = (
+        glm53_flash_packing_counts(
+            tp_size=target_dsa.attn_tp_size,
+            mla_element_size=attn_config.kv_cache_dtype.itemsize,
+        )[FULL_ATTENTION]
+        * GLM53_FLASH_LOGICAL_BLOCK_TOKENS
+        * (target_dsa.kv_lora_rank + target_dsa.qk_rope_head_dim)
+        * attn_config.kv_cache_dtype.itemsize
+    )
+    kda_page_bytes = (
+        math.prod(target_linear.conv_state_shape) * torch.bfloat16.itemsize
+        + math.prod(target_linear.temporal_state_shape) * torch.float32.itemsize
+    )
+    kda_page_alignment = mla_plane_bytes if kda_page_bytes < mla_plane_bytes else 1
     target_layer_types = _target_layer_types(attn_config, num_target_layers)
     group_ids = (
         tuple(split_recurrent_state_groups(target_layer_types))
@@ -227,6 +248,7 @@ def declare_glm53_flash_groups(
                 target_linear.conv_state_shape,
                 cache_dtype_name(torch.bfloat16),
                 exact_page_stride=False,
+                page_stride_alignment_bytes=kda_page_alignment,
             ),
             CacheFieldSpec(
                 f"layer.{layer_id}.recurrent_state",
@@ -234,6 +256,7 @@ def declare_glm53_flash_groups(
                 target_linear.temporal_state_shape,
                 cache_dtype_name(torch.float32),
                 exact_page_stride=False,
+                page_stride_alignment_bytes=kda_page_alignment,
             ),
         )
 
@@ -346,14 +369,26 @@ class Glm53FlashRecipe(CacheRecipe):
             state_group_ids=state_group_ids,
         )
 
-    @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
+    @cached_property
+    def replay_kda(self) -> bool:
+        """Cache the replay capability for this recipe's fixed configuration."""
+        return kda_replay_supported(self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:
-        """Bounded raw KPool tails kept once per request and DSA layer."""
-        return self.pool_options().workspace_bytes
+        """Shared KPool tails plus the target's KDA verification staging."""
+        tail_bytes = self.pool_options().workspace_bytes
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if self.server_args.disaggregation_mode == "prefill" or (
+            width == 1 and not self.replay_kda
+        ):
+            return tail_bytes
+        return tail_bytes + kda_verify_workspace_bytes(
+            self.attn_config,
+            self.groups(),
+            draft_token_num=width,
+            replay_kda=self.replay_kda,
+        )
 
     @override
     def pool_options(self) -> Glm53FlashPoolOptions:

@@ -21,6 +21,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+
+#include "cache/tier/storage.h"
 #include <vector>
 
 #include "cache/core/cache_config.h"
@@ -37,13 +40,31 @@ struct SchedulerConfig {
     };
     AllocatorConfig host_allocator;
     AllocatorConfig device_allocator;
+    // The request-private pool a retracted request's image tail lives in
+    // (the unaligned tail pages, groups that never publish, and -- with no
+    // Host cache -- the whole image). Never prefix-indexed, never evicted.
+    // Required: total_pages == 1 (the null page alone) means the engine never
+    // retracts; anything above it enables retraction on the fused and D roles.
+    AllocatorConfig snapshot_allocator;
+    // Slot-state blob slots in the runtime's arena, hence the most requests
+    // that can be retracted at once. Required with a snapshot pool above the
+    // null page, and 0 without one.
+    std::int32_t max_retracted_requests{};
+    // Test knob: every |N| plans the fused/D grammar retracts the oldest
+    // quiescent Decoding request (N > 0) or the one Prefilling request
+    // between its chunks (N < 0), bypassing ReserveCoversGeneration but not
+    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool.
+    // Lives here so every mirrored rank decides identically.
+    std::int32_t debug_force_retraction_interval{0};
 
     std::vector<CacheGroupConfig> cache_groups{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
+    bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
 
-    // Decode uses Host cache only for best-effort Retraction and recovery. It
-    // does not continuously stream ordinary Device cache entries to Host.
+    // The D role streams no ordinary Device cache entry to Host; its Host
+    // cache holds only the published pages of retracted requests (the image's
+    // L2 leg) until they are restored.
     bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
 
     std::int32_t max_scheduled_tokens{};
@@ -55,6 +76,7 @@ struct SchedulerConfig {
     std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
+    std::optional<StorageConfig> storage_config;
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 
@@ -69,6 +91,15 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // Write a reusable State checkpoint inside the prefill forward that spans
+    // the page boundary before a long prompt's replay tail
+    // (PrefillStateCheckpointTokens), without cutting a chunk there: that
+    // forward holds one more block per State group, and the request's next
+    // publication point publishes it under the boundary's page hash. The
+    // runtime writes the state at ForwardBatch::extend_state_checkpoint_lens
+    // into the third entry of every State group's row. Requires prefix
+    // caching, except on the D role, which never computes a prompt.
+    bool state_checkpoint_in_forward{false};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

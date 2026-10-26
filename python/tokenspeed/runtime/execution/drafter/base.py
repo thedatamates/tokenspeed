@@ -31,6 +31,11 @@ from tokenspeed.runtime.execution.drafter.speculative_sampling import (
     DraftProposalSampler,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -41,9 +46,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
 class BaseDrafter:
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a drafter that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
+
     # Whether the draft model reuses the target's embedding and LM head
     # weights (set via set_embed_and_head right after both models load, in
     # create_model_runner, so the draft's own copies are dropped before the
@@ -214,7 +225,11 @@ class BaseDrafter:
         """
 
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
         """The IDLE draft forwards an idle attention-DP rank runs per round,
         as the per-rank token counts each one reports: entry ``i`` sizes the
@@ -231,7 +246,8 @@ class BaseDrafter:
 
         Args:
             global_num_tokens: The round's per-rank target token counts.
-            global_bs: The round's per-rank decode request counts.
+            global_bs: The round's per-rank total request counts.
+            global_num_decodes: The round's per-rank decode request counts.
 
         Returns:
             One ``global_num_tokens`` per IDLE draft forward, in step order.
@@ -263,6 +279,41 @@ class BaseDrafter:
             "tree drafting needs an EAGLE-style drafter (EAGLE3, or MTP served by Eagle)"
         )
 
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """The drafter-owned per-slot rows a retraction snapshot images.
+
+        Cross-round state keyed by ``req_pool_index`` that a forward alone
+        regenerates -- a stash of target hiddens, a request-persistent
+        context window, a write frontier -- belongs here, in a fixed order.
+        A drafter whose state lives entirely in cache groups or batch rows
+        keeps the empty default. Draft KV pages are cache groups and travel
+        with the pages, not here.
+        """
+        del slot
+        return []
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # The default rows are rewritten by every forward of the slot, never
+        # keyed by request; a drafter that keys them (DSpark) overrides both
+        # copies to image the prepared marker (``slot_state.py``).
+        del request_id
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
     @abstractmethod
     def run(
         self,
@@ -272,6 +323,44 @@ class BaseDrafter:
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def rewrite_verify_outputs(
+        self,
+        ctx: ForwardContext,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+    ) -> None:
+        """Rewrite the verify's outputs in place before anything reads them."""
+
+    def prepare_round_sampling(
+        self, sampling_params_list: list[SamplingParams]
+    ) -> None:
+        """Take the forward's sampling parameters before it runs (host-side).
+        Default: ignored."""
+
+    def replay_decode_graph(
+        self, graph: torch.cuda.CUDAGraph, *, bs: int, graph_bs: int
+    ) -> None:
+        """Replay the target's decode graph for ``bs`` live requests padded to
+        ``graph_bs``, the forward's stream ordered after it; a drafter may
+        start its round behind it on another stream. Default: replays it on
+        the current stream."""
+        del bs, graph_bs
+        graph.replay()
+
+    def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
+        """Draft after the forward at its decode graph's padded batch (None: eager)."""
+
+    def complete_round(self) -> None:
+        """Finish a round ``finish_round`` left pending (the next round's inputs)."""
+
+    def capture_round_graphs(
+        self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]
+    ) -> None:
+        """Capture ``finish_round``'s graphs at a decode graph's padded batch."""
+
+    def release_round_graphs(self) -> None:
+        """Drop the graphs ``capture_round_graphs`` recorded (they name the cache pool)."""
 
     @abstractmethod
     def draft(self, *args, **kwargs) -> torch.Tensor | None:

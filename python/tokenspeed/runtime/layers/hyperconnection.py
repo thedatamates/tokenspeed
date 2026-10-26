@@ -26,11 +26,15 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
-    gated_residual_combine,
+from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
-    gated_residual_mix,
     grouped_gemma_rmsnorm,
+)
+from tokenspeed_kernel.ops.residual import (
+    gated_residual_combine,
+    gated_residual_mix,
+    pad_gated_residual_projection_weight,
+    prepare_gated_residual_up_weight,
 )
 from torch import nn
 
@@ -146,16 +150,32 @@ class GatedResidualSimple(nn.Module):
         projection_rows = (config.hc_lowrank if use_mix else 0) + (
             self.hc_count if use_combine else 0
         )
+        self._projection_rows = projection_rows
         self.mix_inject_proj = (
             nn.Linear(hc_size, projection_rows, bias=False) if projection_rows else None
         )
         if self.mix_inject_proj is not None:
             self.mix_inject_proj.weight.weight_loader = self._load_projection_shard
+        self.register_buffer("packed_up_weight", None, persistent=False)
         self.input_mix_weight_up = (
             nn.Linear(config.hc_lowrank, hc_size, bias=False) if use_mix else None
         )
         if self.input_mix_weight_up is not None:
             self.input_mix_weight_up.weight.weight_loader = self._load_up_weight
+
+    @staticmethod
+    def process_weights_after_loading(module: GatedResidualSimple) -> None:
+        """Prepare mix weights, including dummy/sharded loading."""
+        if module.use_mix:
+            module._pad_projection_weight()
+            module._prepare_up_weight()
+
+    def _pad_projection_weight(self) -> None:
+        weight = self.mix_inject_proj.weight
+        weight.data = pad_gated_residual_projection_weight(
+            weight.data, projection_rows=self._projection_rows
+        )
+        self.mix_inject_proj.out_features = weight.shape[0]
 
     def _load_up_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         """Load the fixed-shape up projection."""
@@ -165,6 +185,22 @@ class GatedResidualSimple(nn.Module):
                 f"{tuple(param.shape)}, loaded {tuple(loaded_weight.shape)}"
             )
         param.data.copy_(loaded_weight)
+        self._prepare_up_weight()
+
+    def _prepare_up_weight(self) -> None:
+        packed = prepare_gated_residual_up_weight(
+            self.input_mix_weight_up.weight.data,
+            self.hc_count,
+            self.hidden_size,
+            self.hc_lowrank,
+        )
+        if packed is None:
+            self.packed_up_weight = None
+        elif self.packed_up_weight is None:
+            self.packed_up_weight = packed
+        else:
+            # Captured graphs retain this address across checkpoint reloads.
+            self.packed_up_weight.copy_(packed)
 
     def _load_projection_shard(
         self,
@@ -180,7 +216,7 @@ class GatedResidualSimple(nn.Module):
         if size == 0:
             # This stream does not use that half of the projection.
             return
-        if loaded_weight.shape[0] != size or param.shape[0] != mix_rows + inject_rows:
+        if loaded_weight.shape != (size, param.shape[1]):
             raise ValueError(
                 f"hyper-connection {shard_id} shard shape mismatch: param "
                 f"{tuple(param.shape)}, loaded {tuple(loaded_weight.shape)}"
@@ -191,6 +227,10 @@ class GatedResidualSimple(nn.Module):
             else loaded_weight
         )
         param.data[start : start + size].copy_(weight.to(param.device, param.dtype))
+        # Allocate padding on the first shard only. Later shards and reloads
+        # write directly into the same parameter storage used by CUDA graphs.
+        if self.use_mix:
+            self._pad_projection_weight()
 
     def _inject_logits(self, normalized: torch.Tensor):
         """Inject logits alone, for residual rows ``mix`` never saw."""
@@ -198,7 +238,7 @@ class GatedResidualSimple(nn.Module):
             return None
         weight = self.mix_inject_proj.weight
         if self.use_mix:
-            weight = weight[self.hc_lowrank :]
+            weight = weight[self.hc_lowrank : self._projection_rows]
         logits = F.linear(normalized, weight)
         if self._projection_scale != 1.0:
             logits = logits * self._projection_scale
@@ -256,8 +296,10 @@ class GatedResidualSimple(nn.Module):
             self.hc_count,
             self.hidden_size,
             self.hc_lowrank,
+            projection_rows=self._projection_rows,
             projection_scale=self._projection_scale,
             weights_independent=True,
+            packed_up_weight=self.packed_up_weight,
         )
         mixed = mixed.to(self.config.params_dtype)
         return mixed, (

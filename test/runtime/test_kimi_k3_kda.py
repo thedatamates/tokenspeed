@@ -27,6 +27,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kda import (
+    kda_delta_rule,
+    kda_gate,
+)
 from tokenspeed_kernel.ops.attention.kda import kda_recurrent_layout
 from tokenspeed_kernel.platform import current_platform
 
@@ -88,8 +92,8 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         backend._prepare_prefill_scan_query_start_loc(scan_boundaries)
         is scan_boundaries
     )
-    # The body and tail have their own boundaries; neither may use the full
-    # forward's cached boundaries, even when those have the same row count.
+    # The scan takes the boundaries it is handed, never the metadata's cached
+    # ones, even when those have the same row count.
     full_boundaries = torch.tensor([0, 5, 8], dtype=torch.int32)
     full_scan_boundaries = full_boundaries.to(torch.int64)
     backend.forward_metadata = mamba.MambaForwardMetadata(
@@ -130,7 +134,6 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         num_real_tokens=num_tokens,
         lower_bound=-5.0,
         cu_seqlens_cpu=boundaries.to(torch.int64),
-        inputs_packed=False,
     )
     assert captured["initial_state"] is stored
     assert captured["cu_seqlens"] is scan_boundaries
@@ -183,7 +186,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
         (
             CacheGroupSpec(
                 group_id=group_id,
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
@@ -192,10 +195,8 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
             if group_id == "full_attention"
             else CacheGroupSpec(
                 group_id=group_id,
-                retention="full_history",
+                attn_kind="state",
                 sliding_window_tokens=None,
-                family="state",
-                checkpoint_granularity=prefix_granularity,
                 replayable=False,
             )
         )
@@ -254,25 +255,18 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
     beta = sigmoid(beta_raw), scale = D ** -0.5.
     """
     T, H, D = q.shape
-    qf = q.float()
-    kf = k.float()
+    qf, kf = q.float(), k.float()
     qf = qf / (qf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
     kf = kf / (kf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
-    g = lower_bound * torch.sigmoid(
-        A_log.float().exp().view(H, 1) * (g_raw.float() + dt_bias.float().view(H, D))
+    outputs, state = kda_delta_rule(
+        qf * D**-0.5,
+        kf,
+        v,
+        kda_gate(g_raw, A_log, dt_bias.view(H, D), lower_bound=lower_bound),
+        torch.sigmoid(beta_raw.float()),
+        S0.transpose(-1, -2),
     )
-    beta = torch.sigmoid(beta_raw.float())
-    scale = D**-0.5
-    S = S0.float().clone()
-    vf = v.float()
-    outs = []
-    for t in range(T):
-        S = S * g[t].exp().unsqueeze(-1)
-        kt = kf[t]
-        v_delta = vf[t] - (kt.unsqueeze(-1) * S).sum(-2)
-        S = S + (beta[t].unsqueeze(-1) * kt).unsqueeze(-1) * v_delta.unsqueeze(-2)
-        outs.append(((qf[t] * scale).unsqueeze(-1) * S).sum(-2))
-    return torch.stack(outs), S
+    return outputs, state.transpose(-1, -2)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +286,6 @@ def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
-    assert backend._checkpoint_granularity == pool.arena.prefix_granularity
     _, state = backend._state_components(backend._state_layer_ids()[0])
     assert replay_probe == {
         "recurrent_layout": backend.kda_recurrent_layout,
@@ -341,7 +334,7 @@ def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-group dual-index metadata
+# Per-group two-slot metadata
 # ---------------------------------------------------------------------------
 
 
@@ -359,29 +352,42 @@ def _kimi_tables(bs: int, width: int, *, base: int = 1) -> dict[str, np.ndarray]
     return tables
 
 
-def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
+def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     monkeypatch,
 ) -> None:
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    page_size = pool.arena.prefix_granularity
 
-    plan_calls = 0
-    real = mamba._compute_state_block_index_plan
+    resolve_calls = 0
+    real = (
+        mamba.verify_state_blocks
+        if backend.deferred_state_commit
+        else mamba.compute_state_block_indices
+    )
 
     def counting(*args, **kwargs):
-        nonlocal plan_calls
-        plan_calls += 1
+        nonlocal resolve_calls
+        resolve_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(mamba, "_compute_state_block_index_plan", counting)
+    monkeypatch.setattr(
+        mamba,
+        (
+            "verify_state_blocks"
+            if backend.deferred_state_commit
+            else "compute_state_block_indices"
+        ),
+        counting,
+    )
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
+    # Request 0 is the first decode after prompt end (the rotated checkpoint
+    # in slot 0); request 1 evolves its live block in place.
+    for group_id in _STATE_GROUPS:
+        tables[group_id][1, 0] = 0
     delivered = _tables_for(pool.arena.runtime_contract, tables, "cpu")
-    # Decode: request 0 crosses into its second page, request 1 stays inside
-    # its first page.
-    seq_lens = torch.tensor([page_size + 1, 5], dtype=torch.int32)
+    seq_lens = torch.tensor([65, 5], dtype=torch.int32)
     backend.init_cuda_graph_state(max_bs=bs)
     backend.refresh_decode_metadata(
         bs,
@@ -392,23 +398,21 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
         block_tables=delivered,
     )
 
-    # Conversion and slot arithmetic run once for the whole batch. Each state
-    # group only gathers its independent page ids from that shared plan.
-    assert plan_calls == 1
+    # One resolve per state group over its own table, never per layer.
+    assert resolve_calls == len(_STATE_GROUPS)
 
     md = backend.forward_metadata
     assert tuple(sorted(md.state_in_blocks_by_group)) == _STATE_GROUPS
     assert tuple(sorted(md.state_out_blocks_by_group)) == _STATE_GROUPS
     for group_id in _STATE_GROUPS:
         rows = tables[group_id]
-        # req 0: before=P -> in slot 0, out slot 1; req 1: before=4 -> slot 0.
         assert md.state_in_blocks_by_group[group_id].tolist() == [
             int(rows[0, 0]),
-            int(rows[1, 0]),
+            int(rows[1, 1]),
         ]
         assert md.state_out_blocks_by_group[group_id].tolist() == [
             int(rows[0, 1]),
-            int(rows[1, 0]),
+            int(rows[1, 1]),
         ]
     # Three groups carry three disjoint page-id sets (independence).
     all_pages = [
@@ -456,9 +460,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         # Real row 0 refreshed from this group's table; padded row 1 -> pad.
         expected_in, _ = compute_state_block_indices(
             torch.as_tensor(tables[gid][:1]),
-            pool.arena.runtime_contract.prefix_granularity,
             torch.tensor([4]),  # before = seq_len 5 - 1
-            torch.tensor([5]),
             validate=False,
             group_id=gid,
         )
@@ -467,7 +469,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
 
 
 # ---------------------------------------------------------------------------
-# GPU: KDA prefill/decode over dual state page indices vs naive + FLA
+# GPU: KDA prefill/decode over two-slot state tables vs naive + FLA
 # ---------------------------------------------------------------------------
 
 
@@ -546,18 +548,19 @@ class _KDAHarness:
         }
         return _tables_for(self.contract, np_tables, self.device)
 
-    def extend_metadata(self, tables, seq_lens, extend_prefix_lens):
-        """An EXTEND batch: every row extends, the executor's host mirrors
-        carry each row's new-token and prefix lengths."""
+    def extend_metadata(self, tables, seq_lens, extend_prefix_lens, num_extends):
+        """An EXTEND batch, or a MIXED one whose rows past ``num_extends``
+        decode one token each; the executor's host mirrors carry each row's
+        new-token and prefix lengths."""
         bs = len(seq_lens)
         prefix_cpu = torch.tensor(extend_prefix_lens, dtype=torch.int32)
         new_cpu = torch.tensor(seq_lens, dtype=torch.int32) - prefix_cpu
         self.backend.init_forward_metadata(
             bs=bs,
-            num_extends=bs,
+            num_extends=num_extends,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=ForwardMode.from_num_extends(num_extends, bs),
             block_tables=self._delivered(tables),
             extend_seq_lens=new_cpu.to(self.device),
             extend_seq_lens_cpu=new_cpu,
@@ -581,30 +584,62 @@ class _KDAHarness:
             block_tables=self._delivered(tables),
         )
 
-    def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1):
+    def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1, *, forward_mode):
         seq_len = mixed.shape[0]
-        # The conv kernels write their output IN PLACE into mixed_qkv (a
-        # fresh projection in production); clone so the oracle can reuse the
-        # raw token stream afterwards.
-        return self.backend.forward_extend(
-            None,
-            None,
-            None,
-            layer=None,
-            out_cache_loc=None,
-            token_to_kv_pool=self.pool,
-            bs=bs,
-            forward_mode=ForwardMode.EXTEND,
-            mixed_qkv=mixed.clone(),
-            save_kv_cache=True,
-            g_raw=g_raw,
-            beta_raw=beta_raw,
-            seq_len=seq_len,
-            **self.common_kwargs(layer_id),
-        ).flatten(0, 1)
+        # The model hands over the q|k|v slice of its merged projection rows
+        # (here [q|k|v|g]); it used to pass a compact copy. From the same
+        # states, both must leave the same output and state bytes. The slice
+        # runs last, so its states carry on. Fresh rows keep the raw token
+        # stream intact for the oracle.
+        rows = torch.cat((mixed, g_raw), dim=-1)
+        states = [
+            self.pool.get_component(layer_id, name)
+            for name in ("conv_state", "recurrent_state")
+        ]
+        initial = [state.clone() for state in states]
+        results = []
+        for mixed_qkv in (
+            rows[:, : mixed.shape[1]].contiguous(),
+            rows[:, : mixed.shape[1]],
+        ):
+            for state, start in zip(states, initial):
+                state.copy_(start)
+            out = self.backend.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=self.pool,
+                bs=bs,
+                forward_mode=forward_mode,
+                mixed_qkv=mixed_qkv,
+                save_kv_cache=True,
+                g_raw=g_raw,
+                beta_raw=beta_raw,
+                seq_len=seq_len,
+                **self.common_kwargs(layer_id),
+            ).flatten(0, 1)
+            results.append([out, *(state.clone() for state in states)])
+        for compact, view in zip(*results):
+            assert view.dtype == compact.dtype
+            assert torch.equal(
+                view.contiguous().view(torch.uint8),
+                compact.contiguous().view(torch.uint8),
+            )
+        return results[1][0]
+
+    def commit_decode(self, bs):
+        self.backend.commit_state_after_acceptance(
+            torch.ones(bs, dtype=torch.int32, device=self.device),
+            num_extends=0,
+            accepted_path=None,
+        )
 
     def decode(self, layer_id, mixed, g_raw, beta_raw, bs):
-        # mixed cloned for the same reason as in extend().
+        # The conv kernels may write their output in place into mixed_qkv (a
+        # fresh projection in production); clone so the oracle can reuse the
+        # raw token stream afterwards.
         return self.backend.forward_decode(
             None,
             None,
@@ -617,7 +652,7 @@ class _KDAHarness:
             g_raw=g_raw,
             beta_raw=beta_raw,
             **self.common_kwargs(layer_id),
-        ).flatten(0, 1)
+        ).reshape(-1, self.D)
 
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
@@ -629,8 +664,7 @@ class _KDAHarness:
         from tokenspeed_kernel.ops.attention.kda._triton.fla import (
             kda_chunk_prefill,
         )
-
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        from tokenspeed_kernel.ops.conv import (
             causal_conv1d_fn,
         )
 
@@ -722,48 +756,69 @@ def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):
 @requires_cuda
 @requires_fla
 def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
-    """Prefill from zero state, same-page decode, boundary-crossing decode,
-    per-group table independence — vs naive fp32 recurrence AND FLA."""
+    """Prefill from zero state, the first decode off the rotated prompt-end
+    checkpoint, in-place decodes, per-group table independence -- vs naive
+    fp32 recurrence AND FLA."""
     P, usable = 4, 8
     contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )
     h = _KDAHarness(pool, contract, layer_ids=[0, 1, 2])
-    # Distinct pages per group: writes to the wrong group's pages would land
-    # in rows this test asserts stay zero.
-    tables = {
-        "linear_attention_0": [[1, 4]],
-        "linear_attention_1": [[2, 5]],
-        "linear_attention_2": [[3, 6]],
+    # Distinct blocks per group: writes to the wrong group's blocks would land
+    # in rows this test asserts stay zero. Block (checkpoint, live) per group.
+    blocks = {
+        "linear_attention_0": (1, 4),
+        "linear_attention_1": (2, 5),
+        "linear_attention_2": (3, 6),
     }
     streams = {layer_id: h.token_stream(6) for layer_id in [0, 1, 2]}
 
     outputs = {layer_id: [] for layer_id in [0, 1, 2]}
-    # Prefill 3 tokens: in = null page 0 (zero state), out = slot 0.
-    h.extend_metadata(tables, seq_lens=[3], extend_prefix_lens=[0])
+    # Prefill 3 tokens from the zero state (slot 0 null) into the checkpoint block.
+    h.extend_metadata(
+        {gid: [[0, checkpoint]] for gid, (checkpoint, _) in blocks.items()},
+        seq_lens=[3],
+        extend_prefix_lens=[0],
+        num_extends=1,
+    )
     md = h.backend.forward_metadata
     for gid in _STATE_GROUPS:
         assert md.state_in_blocks_by_group[gid].tolist() == [0]
-        assert md.state_out_blocks_by_group[gid].tolist() == [tables[gid][0][0]]
+        assert md.state_out_blocks_by_group[gid].tolist() == [blocks[gid][0]]
     for layer_id in [0, 1, 2]:
         s = streams[layer_id]
         outputs[layer_id].append(
-            h.extend(layer_id, s["mixed"][:3], s["g_raw"][:3], s["beta_raw"][:3])
+            h.extend(
+                layer_id,
+                s["mixed"][:3],
+                s["g_raw"][:3],
+                s["beta_raw"][:3],
+                forward_mode=ForwardMode.EXTEND,
+            )
+        )
+    # The prompt-end block is published: read-only from here on.
+    snapshot = {}
+    for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
+        page = blocks[gid][0]
+        snapshot[layer_id] = (
+            pool.get_component(layer_id, "conv_state")[page].clone(),
+            pool.get_component(layer_id, "recurrent_state")[page].clone(),
         )
 
-    # Decode token 4 (same page), 5 (crossing), 6 (same new page).
+    # Decode token 4 reads the rotated checkpoint and writes the fresh live
+    # block; tokens 5 and 6 evolve the live block in place (slot 0 released).
+    decode_tables = [
+        {gid: [[checkpoint, live]] for gid, (checkpoint, live) in blocks.items()},
+        {gid: [[0, live]] for gid, (_, live) in blocks.items()},
+        {gid: [[0, live]] for gid, (_, live) in blocks.items()},
+    ]
     expected_pages = {
-        gid: [
-            (rows[0][0], rows[0][0]),
-            (rows[0][0], rows[0][1]),
-            (rows[0][1], rows[0][1]),
-        ]
-        for gid, rows in tables.items()
+        gid: [(checkpoint, live), (live, live), (live, live)]
+        for gid, (checkpoint, live) in blocks.items()
     }
-    snapshot = {}
     for step, pos in enumerate(range(3, 6)):
-        h.decode_metadata(tables, seq_lens=[pos + 1])
+        h.decode_metadata(decode_tables[step], seq_lens=[pos + 1])
         md = h.backend.forward_metadata
         for gid in _STATE_GROUPS:
             assert md.state_in_blocks_by_group[gid].tolist() == [
@@ -783,14 +838,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
                     bs=1,
                 )
             )
-        if pos == 3:
-            # Page written at the P boundary becomes a read-only snapshot.
-            for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
-                page = tables[gid][0][0]
-                snapshot[layer_id] = (
-                    pool.get_component(layer_id, "conv_state")[page].clone(),
-                    pool.get_component(layer_id, "recurrent_state")[page].clone(),
-                )
+        h.commit_decode(1)
 
     for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
         s = streams[layer_id]
@@ -802,24 +850,23 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
         _assert_close(flat_out, fla_out, f"layer {layer_id} out vs FLA")
         ssm = pool.get_component(layer_id, "recurrent_state")
         conv = pool.get_component(layer_id, "conv_state")
-        final_page = tables[gid][0][1]
+        snap_page, final_page = blocks[gid]
         _assert_close(ssm[final_page], naive_state, f"layer {layer_id} state vs naive")
         _assert_close(ssm[final_page], fla_state, f"layer {layer_id} state vs FLA")
-        # Snapshot page untouched by the boundary-crossing decode.
-        snap_page = tables[gid][0][0]
+        # The published checkpoint is untouched by the decode that read it.
         assert torch.equal(conv[snap_page], snapshot[layer_id][0])
         assert torch.equal(ssm[snap_page], snapshot[layer_id][1])
         assert ssm[snap_page].abs().max().item() > 0.0
         # Null page 0 is never written.
         assert conv[0].abs().max().item() == 0.0
         assert ssm[0].abs().max().item() == 0.0
-        # Independence: pages belonging to the OTHER groups stay zero in this
-        # layer's slabs — the layer consumed only its own group's indices.
+        # Independence: blocks belonging to the OTHER groups stay zero in this
+        # layer's slabs -- the layer consumed only its own group's indices.
         other_pages = [
             page
-            for other_gid, rows in tables.items()
+            for other_gid, pages in blocks.items()
             if other_gid != gid
-            for page in rows[0]
+            for page in pages
         ]
         for page in other_pages:
             assert ssm[page].abs().max().item() == 0.0, (layer_id, page)
@@ -829,9 +876,10 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 @requires_cuda
 @requires_fla
 def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
-    """Prefix hit at a P boundary: the shared snapshot page is read-only for
-    both branches (CoW), and batched decode keeps requests isolated."""
-    P, usable = 4, 12
+    """Prefix hit at a published prompt-end checkpoint: the shared block is
+    read-only for both branches, and a MIXED forward and batched decode keep
+    requests isolated."""
+    P, usable = 4, 16
     contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
@@ -845,15 +893,15 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         # computes indices for every group once per batch).
         return {
             "linear_attention_0": rows0,
-            "linear_attention_1": [[p + 4 for p in row] for row in rows0],
-            "linear_attention_2": [[p + 8 for p in row] for row in rows0],
+            "linear_attention_1": [[p + 4 if p else 0 for p in row] for row in rows0],
+            "linear_attention_2": [[p + 8 if p else 0 for p in row] for row in rows0],
         }
 
-    # Shared prefix: 4 tokens (exactly one page). Branch A continues with 2
+    # Shared prefix: 4 tokens (exactly one page). Branch A continues with 3
     # decodes; branch B resumes from the snapshot with a 3-token extend and
-    # one decode. Total streams: A = prefix + a4 a5; B = prefix + b4 b5 b6 b7.
+    # one decode. Total streams: A = prefix + a4 a5 a6; B = prefix + b4 b5 b6 b7.
     prefix = h.token_stream(4)
-    a_new = h.token_stream(2)
+    a_new = h.token_stream(3)
     b_new = h.token_stream(4)
 
     def cat(*streams):
@@ -865,16 +913,27 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     a_full = cat(prefix, a_new)
     b_full = cat(prefix, b_new)
 
-    # 1) A prefills the shared 4-token prefix -> snapshot page 1.
-    h.extend_metadata(tables_for([[1]]), seq_lens=[4], extend_prefix_lens=[0])
-    a_outs = [h.extend(layer_id, prefix["mixed"], prefix["g_raw"], prefix["beta_raw"])]
+    # 1) A prefills the shared 4-token prefix -> its prompt-end state, block 1.
+    h.extend_metadata(
+        tables_for([[0, 1]]), seq_lens=[4], extend_prefix_lens=[0], num_extends=1
+    )
+    a_outs = [
+        h.extend(
+            layer_id,
+            prefix["mixed"],
+            prefix["g_raw"],
+            prefix["beta_raw"],
+            forward_mode=ForwardMode.EXTEND,
+        )
+    ]
     conv = pool.get_component(layer_id, "conv_state")
     ssm = pool.get_component(layer_id, "recurrent_state")
     snap_conv = conv[1].clone()
     snap_ssm = ssm[1].clone()
     assert snap_ssm.abs().max().item() > 0.0
 
-    # 2) A decodes token 5: crossing out of the snapshot (in=1, out=2).
+    # 2) A's first decode (token 5) reads the rotated checkpoint (slot 0 =
+    #    block 1) and writes the fresh live block 2.
     h.decode_metadata(tables_for([[1, 2]]), seq_lens=[5])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1]
@@ -888,39 +947,57 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
             bs=1,
         )
     )
+    h.commit_decode(1)
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 3) B resumes from the shared snapshot: extend prefix=4 -> 7 tokens
-    #    (in = shared page 1, out = fresh page 3; page 1 must stay intact).
-    h.extend_metadata(tables_for([[1, 3]]), seq_lens=[7], extend_prefix_lens=[4])
+    # 3) One MIXED forward: B hits the published checkpoint, extend prefix=4
+    #    -> 7 tokens (in = shared block 1, out = fresh block 3; block 1 must
+    #    stay intact), while A decodes token 6 in place on block 2 (slot 0
+    #    released).
+    h.extend_metadata(
+        tables_for([[1, 3], [0, 2]]),
+        seq_lens=[7, 6],
+        extend_prefix_lens=[4, 5],
+        num_extends=1,
+    )
     md = h.backend.forward_metadata
-    assert md.state_in_blocks_by_group[gid].tolist() == [1]
-    assert md.state_out_blocks_by_group[gid].tolist() == [3]
-    b_outs = [
-        h.extend(
-            layer_id, b_new["mixed"][:3], b_new["g_raw"][:3], b_new["beta_raw"][:3]
-        )
-    ]
+    assert md.state_in_blocks_by_group[gid].tolist() == [1, 2]
+    assert md.state_out_blocks_by_group[gid].tolist() == [3, 2]
+    both = h.extend(
+        layer_id,
+        torch.cat([b_new["mixed"][:3], a_new["mixed"][1:2]], dim=0),
+        torch.cat([b_new["g_raw"][:3], a_new["g_raw"][1:2]], dim=0),
+        torch.cat([b_new["beta_raw"][:3], a_new["beta_raw"][1:2]], dim=0),
+        bs=2,
+        forward_mode=ForwardMode.MIXED,
+    )
+    b_outs = [both[: 3 * h.H]]
+    a_outs.append(both[3 * h.H :])
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 4) Batched decode: A token 6 (in-page evolution on page 2) and B token 8
-    #    (crossing to page 5) in ONE forward — isolation between requests.
-    h.decode_metadata(tables_for([[1, 2], [1, 3]]), seq_lens=[6, 8])
+    # 4) Batched decode: A token 7 (in place on block 2) and B's first
+    #    decode, token 8 (its prompt-end block 3 rotated into slot 0, fresh
+    #    live block 5), in ONE forward -- isolation between requests.
+    h.decode_metadata(tables_for([[0, 2], [3, 5]]), seq_lens=[7, 8])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [2, 3]
-    assert md.state_out_blocks_by_group[gid].tolist() == [2, 3]
-    mixed = torch.cat([a_new["mixed"][1:2], b_new["mixed"][3:4]], dim=0)
-    g_raw = torch.cat([a_new["g_raw"][1:2], b_new["g_raw"][3:4]], dim=0)
-    beta_raw = torch.cat([a_new["beta_raw"][1:2], b_new["beta_raw"][3:4]], dim=0)
+    assert md.state_out_blocks_by_group[gid].tolist() == [2, 5]
+    b_prompt_end = (conv[3].clone(), ssm[3].clone())
+    mixed = torch.cat([a_new["mixed"][2:3], b_new["mixed"][3:4]], dim=0)
+    g_raw = torch.cat([a_new["g_raw"][2:3], b_new["g_raw"][3:4]], dim=0)
+    beta_raw = torch.cat([a_new["beta_raw"][2:3], b_new["beta_raw"][3:4]], dim=0)
     both = h.decode(layer_id, mixed, g_raw, beta_raw, bs=2)
+    h.commit_decode(2)
     a_outs.append(both[: h.H])
     b_outs.append(both[h.H :])
 
-    # Shared snapshot page is still byte-identical after everything.
+    # Both published checkpoints are still byte-identical after everything.
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
+    assert torch.equal(conv[3], b_prompt_end[0])
+    assert torch.equal(ssm[3], b_prompt_end[1])
     assert ssm[0].abs().max().item() == 0.0
 
     naive_a, state_a, fla_a, fla_state_a = h.oracle(
@@ -929,7 +1006,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     naive_b, state_b, fla_b, fla_state_b = h.oracle(
         layer_id, b_full["mixed"], b_full["g_raw"], b_full["beta_raw"]
     )
-    flat_a = torch.cat(a_outs, dim=0)  # tokens 1..6
+    flat_a = torch.cat(a_outs, dim=0)  # tokens 1..7
     flat_b = torch.cat(b_outs, dim=0)  # tokens 5..8 (B computes only its new)
     _assert_close(flat_a, naive_a, "branch A out vs naive")
     _assert_close(flat_a, fla_a, "branch A out vs FLA")
@@ -937,8 +1014,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     _assert_close(flat_b, fla_b[4 * h.H :], "branch B out vs FLA")
     _assert_close(ssm[2], state_a, "branch A final state vs naive")
     _assert_close(ssm[2], fla_state_a, "branch A final state vs FLA")
-    _assert_close(ssm[3], state_b, "branch B final state vs naive")
-    _assert_close(ssm[3], fla_state_b, "branch B final state vs FLA")
+    _assert_close(ssm[5], state_b, "branch B final state vs naive")
+    _assert_close(ssm[5], fla_state_b, "branch B final state vs FLA")
 
 
 @requires_cuda
@@ -969,11 +1046,17 @@ def test_kda_cache_pool_component_views_end_to_end(
     streams = {layer_id: h.token_stream(total) for layer_id in layer_ids}
 
     outputs = {layer_id: [] for layer_id in layer_ids}
-    h.extend_metadata(tables, seq_lens=[8], extend_prefix_lens=[0])
+    h.extend_metadata(tables, seq_lens=[8], extend_prefix_lens=[0], num_extends=1)
     for layer_id in layer_ids:
         s = streams[layer_id]
         outputs[layer_id].append(
-            h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
+            h.extend(
+                layer_id,
+                s["mixed"][:8],
+                s["g_raw"][:8],
+                s["beta_raw"][:8],
+                forward_mode=ForwardMode.EXTEND,
+            )
         )
 
     from tokenspeed_kernel.ops.attention.kda._triton import recurrent
@@ -1012,6 +1095,7 @@ def test_kda_cache_pool_component_views_end_to_end(
                     bs=1,
                 )
             )
+        h.commit_decode(1)
 
     assert indexed_decode_calls == len(layer_ids) * (total - 8)
 
@@ -1098,7 +1182,10 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
     for harness in harnesses:
         harness.backend.kda_backend = "cutedsl_kda"
         harness.extend_metadata(
-            tables, seq_lens=[prefix + 868], extend_prefix_lens=[prefix]
+            tables,
+            seq_lens=[prefix + 868],
+            extend_prefix_lens=[prefix],
+            num_extends=1,
         )
 
     def pytorch_staging(conv, state, sources, destinations):
@@ -1115,10 +1202,20 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(mamba, "_prepare_cache_prefill_state_inputs", pytorch_staging)
             expected = before.extend(
-                layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+                layer_id,
+                stream["mixed"],
+                stream["g_raw"],
+                stream["beta_raw"],
+                bs=1,
+                forward_mode=ForwardMode.EXTEND,
             )
         actual = after.extend(
-            layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+            layer_id,
+            stream["mixed"],
+            stream["g_raw"],
+            stream["beta_raw"],
+            bs=1,
+            forward_mode=ForwardMode.EXTEND,
         )
         assert torch.equal(actual, expected)
         for component in ("conv_state", "recurrent_state"):

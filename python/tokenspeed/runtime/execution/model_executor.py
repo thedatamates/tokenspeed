@@ -24,14 +24,17 @@ import gc
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from functools import partial
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     autotune_cache_path,
+    kernel_warmup,
     load_autotune_cache,
     save_autotune_cache,
     set_autotune_max_num_tokens,
@@ -54,12 +57,14 @@ from tokenspeed.runtime.execution.accept_simulation import (
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
+from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
+    EagleHarnessConfig,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
-from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -73,13 +78,16 @@ from tokenspeed.runtime.execution.prefill_graph import (
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.slot_state import SlotStateExporter
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    ForwardLogprobs,
     InputLogprobPlan,
     ModelExecutionResult,
     NGramInputs,
     RequestHistorySeeds,
+    StopCriteria,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -99,11 +107,16 @@ from tokenspeed.runtime.layers.attention.backends.support import resolve_tree_su
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
+    validate_state_checkpoint_in_forward,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    local_page_pairs_by_group,
     local_pages_by_group,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsProcessorOutput,
+    prepare_logits_communication,
+)
 from tokenspeed.runtime.layers.paged_attention import (
     bind_cache_groups,
     check_block_drafter_storage,
@@ -115,6 +128,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -150,11 +164,30 @@ def _sampling_info_for_requests(
     return info
 
 
-PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
+def _set_sampled_top_logprobs(
+    logits_output: LogitsProcessorOutput, prefill_logits: torch.Tensor, top_k: int
+) -> None:
+    """Report each prefill row's ``top_k`` most likely tokens beside its sample.
+
+    ``prefill_logits`` are the rows the sampler drew from (any grammar mask
+    already applied in place), so the alternatives are of the distribution
+    the sampled token's own logprob is read from: ``top_token_logprobs``, the
+    prompt rows' top-k arithmetic too, most likely first. Only eager
+    prefills ask (``ForwardContext.sampled_top_k`` is 0 in every captured
+    graph), so no graph records this.
+    """
+    if top_k <= 0 or prefill_logits.shape[0] == 0:
+        return
+    values, ids = top_token_logprobs(prefill_logits, top_k)
+    logits_output.sampled_top_logprobs_val = values
+    logits_output.sampled_top_logprobs_idx = ids
+
+
+PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 8192
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+    """Largest prefill-graph bucket: explicit value, or min(8192, chunk, kv budget).
 
     Returns 0 (graph off) when the MoE all-to-all backend is DeepEP: an
     extend-shaped forward takes DeepEP's normal dispatch, whose per-expert
@@ -217,6 +250,7 @@ def select_dspark_context_producer(
     pp_size: int,
     draft_model: torch.nn.Module | None,
     draft_token_to_kv_pool,
+    draft_attn_backend,
 ):
     """Return the stage's DSpark context producer, or None when nothing is produced.
 
@@ -258,13 +292,58 @@ def select_dspark_context_producer(
     )
 
     if isinstance(draft_model, DSparkContextModel):
-        return DSparkContextProducer(draft_model, draft_token_to_kv_pool)
+        return DSparkContextProducer(
+            draft_model, draft_token_to_kv_pool, attn_backend=draft_attn_backend
+        )
     if is_block_drafter(spec_algo, is_draft=True):
         raise TypeError(
             f"{type(draft_model).__name__} cannot produce DSpark context across "
             "pipeline stages."
         )
     return None
+
+
+@runtime_checkable
+class RopeTableModel(Protocol):
+    """A model that sizes its RoPE table itself (Beam's covers the
+    speculative pad past the context)."""
+
+    # Positions its precomputed cos/sin table covers; None without one.
+    rope_positions: int | None
+
+
+def warn_past_rope_table(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+    context_len: int,
+    physical_context_len: int,
+) -> None:
+    """Warn when spec verify can index past the model's RoPE table.
+
+    Spec verify commits positions up to physical_context_len - 1 for a
+    finished request lingering one overlap step, and the RoPE kernels read
+    the precomputed cos/sin table at those positions. A RopeTableModel
+    reports the table it built; any other model's tables are precomputed for
+    its derived context length. The values only feed a dead request's garbage
+    KV, but the read itself is out of table bounds — warn so the operator can
+    lower --max-model-len by the difference.
+    """
+    if isinstance(model, RopeTableModel):
+        table_len = model.rope_positions
+        if table_len is None:
+            return
+    else:
+        table_len = get_context_length(model_config.hf_text_config)
+    if physical_context_len > table_len:
+        logger.warning(
+            f"physical context extent {physical_context_len!s} (context_len "
+            f"{context_len!s} + spec overshoot "
+            f"pad {physical_context_len - context_len!s}) exceeds the "
+            f"{table_len!s} positions of the model's rope tables; "
+            "positions in the pad index past the precomputed rope tables. "
+            "Lower --max-model-len by at least "
+            f"{physical_context_len - table_len!s} to stay in bounds.",
+        )
 
 
 @dataclass
@@ -329,6 +408,9 @@ class ModelExecutorConfig:
     # every row.
     query_shard_size: int
     query_shard_rank: int
+    # Sleep/wake (--enable-memory-saver): decode CUDA graphs are captured into
+    # the memory saver's ``cuda_graph`` region so a release can free them.
+    enable_memory_saver: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -345,6 +427,8 @@ class ModelExecutorConfig:
 
     # ====== SPEC =========
     spec_algo: str | None = None
+    # EAGLE-Harness drafting (EAGLE4 with --speculative-exec-mode >= 0), else None.
+    eagle_harness: EagleHarnessConfig | None = None
     spec_num_steps: int | None = None
     # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
@@ -369,11 +453,20 @@ class ModelExecutorConfig:
     prefill_graph_max_tokens: int = 0
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # The scheduler may give extend rows in-forward State checkpoints
+    # (--enable-state-checkpoint-in-forward).
+    state_checkpoint_in_forward: bool = False
+
+    @property
+    def spec_draft_tree(self) -> bool:
+        """Drafts go through the draft-tree path: topk > 1, or EAGLE-Harness chains."""
+        return self.spec_topk > 1 or self.eagle_harness is not None
 
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
         model_config: ModelConfig,
+        model: torch.nn.Module,
         max_req_pool_size: int,
         gpu_id: int,
         global_rank: int,
@@ -388,25 +481,12 @@ class ModelExecutorConfig:
         rope_parameters = get_rope_parameters(model_config.hf_text_config)
         model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
-        # Spec verify commits positions up to physical_context_len - 1 for a
-        # finished request lingering one overlap step. Rope cos/sin tables are
-        # precomputed for the model's derived context length, so positions in
-        # the pad read past them when context_len is set flush against the
-        # model limit. The values only feed a dead request's garbage KV, but
-        # the read itself is out of table bounds — warn so the operator can
-        # lower --max-model-len by the pad.
-        physical_context_len = model_config.context_len + server_args.spec_context_pad
-        derived_context_len = get_context_length(model_config.hf_text_config)
-        if physical_context_len > derived_context_len:
-            logger.warning(
-                f"physical context extent {physical_context_len!s} (context_len "
-                f"{model_config.context_len!s} + spec overshoot "
-                f"pad {server_args.spec_context_pad!s}) exceeds the model's derived "
-                f"context length {derived_context_len!s}; "
-                "positions in the pad index past the precomputed rope tables. "
-                "Lower --max-model-len by at least "
-                f"{physical_context_len - derived_context_len!s} to stay in bounds.",
-            )
+        warn_past_rope_table(
+            model,
+            model_config,
+            model_config.context_len,
+            model_config.context_len + server_args.spec_context_pad,
+        )
 
         # User intent only; backend-imposed graph restrictions are declared on
         # the backend classes (cuda_graph_support) and resolved in
@@ -438,12 +518,14 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+            state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
             decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
+            enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -453,6 +535,9 @@ class ModelExecutorConfig:
                 server_args.mapping.pp_group if server_args.mapping.has_pp else None
             ),
             spec_algo=server_args.speculative_algorithm,
+            eagle_harness=EagleHarnessConfig.from_server_args(
+                server_args, model_config
+            ),
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
             enable_speculative_sampling=server_args.enable_speculative_sampling,
@@ -502,6 +587,10 @@ class ModelExecutor:
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
         )
+        if config.state_checkpoint_in_forward:
+            validate_state_checkpoint_in_forward(
+                attn_backend=attn_backend, kv_pool=token_to_kv_pool
+            )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -519,16 +608,21 @@ class ModelExecutor:
             ),
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
+            reads_state_checkpoints=config.state_checkpoint_in_forward,
         )
         # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
-        # rank's position in the DCP group selects the pages it owns.
-        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
+        # rank's position in the KVP group selects the pages it owns.
+        self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
         ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
         if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
-        self.input_buffers.init_ngram_buffers(ngram_context)
+        self.input_buffers.init_ngram_buffers(
+            ngram_context,
+            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+            config.vocab_size,
+        )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -541,7 +635,8 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        if config.enable_speculative_sampling:
+        # Trees keep their draft q per tree instead (bind_tree).
+        if config.enable_speculative_sampling and not config.spec_draft_tree:
             if config.spec_algo is None:
                 raise ValueError(
                     "enable_speculative_sampling needs a speculative drafter to "
@@ -564,13 +659,27 @@ class ModelExecutor:
                 draft_model_runner.model if draft_model_runner is not None else None
             ),
             draft_token_to_kv_pool=draft_token_to_kv_pool,
+            draft_attn_backend=draft_attn_backend,
         )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
             # wired to the target.
-            DrafterImpl = get_drafter_impl(config.spec_algo, draft_model_runner.model)
+            if config.spec_algo != "DUMMY" and draft_model_runner is None:
+                raise ValueError(
+                    f"{config.spec_algo} speculative decoding requires a draft model"
+                )
+            DrafterImpl = get_drafter_impl(
+                config.spec_algo,
+                None if draft_model_runner is None else draft_model_runner.model,
+            )
+            if config.eagle_harness is not None:
+                from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import (
+                    EagleHarness,
+                )
+
+                DrafterImpl = partial(EagleHarness, harness=config.eagle_harness)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
@@ -591,11 +700,19 @@ class ModelExecutor:
             )
         else:
             self.drafter = None
+        if (
+            self._pp_is_last_stage
+            and self.sampling_backend.reads_only_argmax()
+            and config.grammar_backend == "none"
+        ):
+            # The sampler reads only each row's argmax, so the target head can
+            # reduce it across vocabulary shards instead of gathering logits.
+            self.model_runner.model.logits_processor.fuse_argmax()
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
             verify_width=config.output_length,
-            draft_tree=config.spec_topk > 1,
+            draft_tree=config.spec_draft_tree,
         )
         if self._simulated_accept_length is not None:
             logger.info(
@@ -605,7 +722,7 @@ class ModelExecutor:
             )
 
         self.tree_spec: TreeSpec | None = None
-        if config.spec_topk > 1:
+        if config.spec_draft_tree:
             self._init_tree_spec(max_bs)
 
         self.grammar_runtime = create_grammar_runtime(
@@ -648,6 +765,11 @@ class ModelExecutor:
         self._active_positions_override = None
 
         self._graph_support = graph_support
+        self.device_module = torch.get_device_module(self.device)
+        if self._pp_is_last_stage:
+            prepare_logits_communication(self.model_runner.model)
+            if self._draft_model_runner is not None:
+                prepare_logits_communication(self._draft_model_runner.model)
         self._build_graph_owners()
 
         # Encoder graphs are installed before KV-cache sizing and retained by
@@ -656,7 +778,6 @@ class ModelExecutor:
             self.model_runner, "encoder_graph_wrappers", {}
         )
 
-        self.device_module = torch.get_device_module(self.device)
         # Two streams, named once. `default_stream` is the forward thread's
         # own: page zeroing runs here, and the cache ops take it by name for
         # their fences and start events. `execution_stream` carries the model
@@ -666,15 +787,6 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
-        # The data plane: every CUDA-touching operation after startup is
-        # submitted here and runs in FIFO order on one thread. The event loop
-        # (control plane) never waits on the GPU along the per-round path —
-        # dispatch submits and moves on, only commit joins — so a round stays
-        # microseconds and its cross-rank gloo collectives always find every
-        # rank promptly regardless of GPU depth. (A few low-rate paths do
-        # block on purpose: the DP idle forward, the PD receive and landing,
-        # the post-wake KV repair, RL weight updates. See DeviceHandle.)
-        self.forward_thread = ForwardThread(self.device)
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
@@ -701,7 +813,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy or triton"
+                "use --sampling-backend greedy, triton or flashinfer"
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(
@@ -745,6 +857,7 @@ class ModelExecutor:
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
         self.attn_backend.configure_runtime(
+            request_slot_capacity=self.config.max_req_pool_size + 1,
             cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=_cache_arena_attr(
                 self.token_to_kv_pool, "cache_group_page_counts", None
@@ -787,6 +900,7 @@ class ModelExecutor:
         self.prefill_graph.release_graphs()
         if self.drafter is not None:
             self.drafter.release_prefill_graph()
+            self.drafter.release_round_graphs()
         workspace_pool(self.device).unfreeze()
         gc.collect()
 
@@ -807,6 +921,10 @@ class ModelExecutor:
             attn_backend=self.attn_backend,
             kv_pool=token_to_kv_pool,
         )
+        if self.config.state_checkpoint_in_forward:
+            validate_state_checkpoint_in_forward(
+                attn_backend=self.attn_backend, kv_pool=token_to_kv_pool
+            )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         if self.drafter is not None:
@@ -918,7 +1036,7 @@ class ModelExecutor:
         )
 
     def autotune(self) -> None:
-        """Tune missing prefill/decode configs and persist the shared cache."""
+        """Warm encountered kernels and optionally tune missing FlashInfer tactics."""
 
         per_rank_max_batch = max(
             1,
@@ -963,81 +1081,87 @@ class ModelExecutor:
 
         if self.config.pp_size > 1:
             # These dummy forwards do not perform pipeline stage transfers.
-            logger.info("Kernel tuning skipped under pipeline parallelism")
+            logger.info("Kernel warmup and tuning skipped under pipeline parallelism")
             return
-        if self.config.disable_autotune:
-            logger.info("Kernel tuning disabled (--disable-autotune)")
-            return
+        tune_mode = not self.config.disable_autotune
+        if not tune_mode:
+            logger.info("Kernel tactic profiling disabled (--disable-autotune)")
 
-        # One traversal discovers each operator. Its dispatch exposes the
-        # tunable branches; FI enumerates native buckets independently of the
-        # graph ladder. Prefill stays inside the actual buffer/request limits.
+        # One traversal discovers each operator. Its dispatch warms finite
+        # compile variants independently of FI, which may also profile tactics.
+        # Prefill stays inside the actual buffer/request limits.
         logger.info(
-            f"Kernel startup tuning with {num_tokens} "
+            f"Kernel startup warmup with {num_tokens} "
             f"{'decode' if decode_only else 'prefill'} tokens"
         )
 
         tic = time.time()
         set_autotune_process_group(cpu_group)
-        # Capture later refreshes the metadata created here in place.
-        with torch.no_grad(), autotune(
-            tune_mode=True, tuning_buckets=None, round_up=None
-        ):
-            # Dummy forwards must not borrow live Engram history or masks.
-            ib.fill_dummy_decode_buffers(
-                batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
-            )
-            if decode_only:
-                # No extend forward exists on this layout; the decode step
-                # reaches the target and, through the speculative forward,
-                # the draft.
-                if self.drafter is not None:
-                    self._autotune_draft_experts(num_tokens)
-                self.forward_step.warmup_decode_path(
-                    batch_sizes=(self.forward_step.max_decode_bs,), graph_phase=False
+        try:
+            # Capture later refreshes the metadata created here in place.
+            with (
+                torch.no_grad(),
+                kernel_warmup(enabled=True),
+                autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
+            ):
+                # Dummy forwards must not borrow live Engram history or masks.
+                ib.fill_dummy_decode_buffers(
+                    batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
                 )
-            else:
-                bs = dummy_batch_size(num_tokens, self.config.context_len)
-                ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-                # The model's rows: the span, or this rank's query shard of
-                # it, as on a real extend (_run_target_forward).
-                rows = (
-                    slice(0, num_tokens)
-                    if ctx.query_shard is None
-                    else ctx.query_shard.local_slice
-                )
-                positions = (
-                    ib.mrope_positions_buf[:, rows]
-                    if self.config.model_is_mrope
-                    else ib.positions_buf[rows]
-                )
-                with active_forward(ctx):
-                    self.model_runner.forward(
-                        ctx=ctx,
-                        input_ids=ib.input_ids_buf[rows],
-                        positions=positions,
-                        **self._model_input_kwargs(num_tokens, ctx.bs, rows),
-                    )
-                if self.drafter is not None:
-                    self._autotune_draft_experts(num_tokens)
-                if self.drafter is not None and not self.config.prefill_only:
-                    # Prefill-only roles do not allocate decode/verify scratch.
-                    # The draft model is reached through the shared speculative
-                    # forward, not model_runner.forward above. One request
-                    # exposes its operators; FI still owns their bucket
-                    # enumeration.
+                if decode_only:
+                    # No extend forward exists on this layout; the decode step
+                    # reaches the target and, through the speculative forward,
+                    # the draft.
+                    if self.drafter is not None:
+                        self._autotune_draft_experts(num_tokens)
                     self.forward_step.warmup_decode_path(
-                        batch_sizes=(1,), graph_phase=False
+                        batch_sizes=(self.forward_step.max_decode_bs,),
+                        graph_phase=False,
                     )
-        set_autotune_process_group(None)
+                else:
+                    bs = dummy_batch_size(num_tokens, self.config.context_len)
+                    ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+                    # The model's rows: the span, or this rank's query shard of
+                    # it, as on a real extend (_run_target_forward).
+                    rows = (
+                        slice(0, num_tokens)
+                        if ctx.query_shard is None
+                        else ctx.query_shard.local_slice
+                    )
+                    positions = (
+                        ib.mrope_positions_buf[:, rows]
+                        if self.config.model_is_mrope
+                        else ib.positions_buf[rows]
+                    )
+                    with active_forward(ctx):
+                        self.model_runner.forward(
+                            ctx=ctx,
+                            input_ids=ib.input_ids_buf[rows],
+                            positions=positions,
+                            **self._model_input_kwargs(num_tokens, ctx.bs, rows),
+                        )
+                    if self.drafter is not None:
+                        self._autotune_draft_experts(num_tokens)
+                    if self.drafter is not None and not self.config.prefill_only:
+                        # Prefill-only roles do not allocate decode/verify scratch.
+                        # The draft model is reached through the shared speculative
+                        # forward, not model_runner.forward above. One request
+                        # exposes its operators; FI still owns their bucket
+                        # enumeration.
+                        self.forward_step.warmup_decode_path(
+                            batch_sizes=(1,), graph_phase=False
+                        )
+        finally:
+            set_autotune_process_group(None)
 
         torch.get_device_module(self.device).synchronize()
-        save_autotune_cache(cache_path, cpu_group, owner_rank)
+        if tune_mode:
+            save_autotune_cache(cache_path, cpu_group, owner_rank)
 
-        logger.info(f"Kernel startup tuning finished in {time.time() - tic:.1f}s")
+        logger.info(f"Kernel startup warmup finished in {time.time() - tic:.1f}s")
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
-        """Tune the draft model's routed-expert kernels inside the tuning window.
+        """Warm the draft model's routed-expert kernels inside the startup window.
 
         The dummy prefill drives the target model only. A draft with its own
         expert geometry (DSpark's 128-expert MoE) is keyed separately by the
@@ -1046,6 +1170,8 @@ class ModelExecutor:
         count lets the tuner enumerate every smaller bucket, exactly as the
         target's prefill does for the target experts.
         """
+        if self.drafter.draft_model_runner is None:
+            return
         from tokenspeed.runtime.layers.moe.expert import MoELayer
 
         tuned: set[tuple] = set()
@@ -1080,7 +1206,7 @@ class ModelExecutor:
             topk_weights, topk_ids = torch.topk(scores, layer.top_k, dim=-1)
             topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
             if layer.supports_precomputed_topk:
-                tokenspeed_kernel.moe_apply(
+                kernel_moe_apply(
                     layer.plan,
                     hidden_states,
                     layer,
@@ -1090,7 +1216,7 @@ class ModelExecutor:
                     num_tokens_global=num_tokens,
                 )
             else:
-                tokenspeed_kernel.moe_apply(
+                kernel_moe_apply(
                     layer.plan,
                     hidden_states,
                     layer,
@@ -1098,7 +1224,7 @@ class ModelExecutor:
                     num_tokens_global=num_tokens,
                 )
             logger.info(
-                f"Kernel tuning covered draft experts {layer.prefix!s} "
+                f"Kernel warmup covered draft experts {layer.prefix!s} "
                 f"({layer.plan['apply_kernel_name']!s}, {layer.num_experts:d} experts)"
             )
 
@@ -1368,6 +1494,13 @@ class ModelExecutor:
             num_prefill_tokens : ctx.input_num_tokens
         ].reshape(num_decodes, n)
 
+    def _state_group_ids(self) -> tuple[str, ...]:
+        return tuple(
+            spec.group_id
+            for spec in self._cache_runtime_contract.group_specs
+            if spec.attn_kind == "state"
+        )
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -1375,6 +1508,37 @@ class ModelExecutor:
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
+    ):
+        """Sample and verify, then end each request where the control plane
+        ends it: an accepted width is cut at the request's stop token or
+        token limit before anything reads it (the state commit, the accepted
+        frontier, the drafter, the reported tokens)."""
+        output_tokens, accept_lengths = self._sample_and_verify(
+            logits_output, sampling_info, ctx, candidates
+        )
+        if self.drafter is not None:
+            # The stop conditions cut what the drafter has the round commit.
+            self.drafter.rewrite_verify_outputs(ctx, output_tokens, accept_lengths)
+        ib = self.input_buffers
+        self.runtime_states.apply_stop_conditions(
+            ib.state_write_req_pool_indices_buf[: ctx.bs],
+            output_tokens,
+            accept_lengths,
+            ib.input_lengths_buf[: ctx.bs],
+            ib.extend_prompt_lens_buf[: ctx.num_extends],
+            num_extends=ctx.num_extends,
+            num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
+            decode_width=ctx.output_layout.decode_width,
+            padding_index=ib.state_write_padding_pool_index,
+        )
+        return output_tokens, accept_lengths
+
+    def _sample_and_verify(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        ctx: ForwardContext,
+        candidates: torch.Tensor | None,
     ):
         """One sampling rule for every batch: prefill rows sample, decode
         rows verify.
@@ -1387,9 +1551,16 @@ class ModelExecutor:
         num_decodes = ctx.bs - num_extends
         layout = ctx.output_layout
         num_prefill_outputs = layout.num_prefill_outputs
+        # Eager prefills only: 0 in every captured graph.
+        sampled_top_k = ctx.sampled_top_k
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            return self.sampling_backend.sample(logits_output, sampling_info)
+            sampled = self.sampling_backend.sample(logits_output, sampling_info)
+            if sampled_top_k:
+                _set_sampled_top_logprobs(
+                    logits_output, logits_output.next_token_logits, sampled_top_k
+                )
+            return sampled
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
@@ -1401,6 +1572,7 @@ class ModelExecutor:
                     else TreeVerifyBatch(
                         parents=self.tree_spec.parent_buf[:num_decodes],
                         depths=self.tree_spec.depth_buf[:num_decodes],
+                        draft_q=self.runtime_states.future_draft_q,
                     )
                 ),
             )
@@ -1419,16 +1591,24 @@ class ModelExecutor:
             else None
         )
         logits = logits_output.next_token_logits
+        token_ids = logits_output.next_token_ids
         token_parts, length_parts, logprob_parts = [], [], []
 
         if num_prefill_outputs:
-            prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
+            prefill_out = LogitsProcessorOutput(
+                next_token_logits=logits[prefill],
+                next_token_ids=None if token_ids is None else token_ids[prefill],
+            )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
                 _sampling_info_for_requests(
                     sampling_info, prefill, mask_width=mask_width, prefill=True
                 ),
             )
+            if sampled_top_k:
+                _set_sampled_top_logprobs(
+                    logits_output, prefill_out.next_token_logits, sampled_top_k
+                )
             # verify writes the same backend buffers; snapshot the prefix.
             token_parts.append(tokens.clone() if num_decodes else tokens)
             length_parts.append(lengths.clone() if num_decodes else lengths)
@@ -1448,7 +1628,12 @@ class ModelExecutor:
                 )
             )
         if num_decodes:
-            decode_out = LogitsProcessorOutput(next_token_logits=logits[decode_outputs])
+            decode_out = LogitsProcessorOutput(
+                next_token_logits=logits[decode_outputs],
+                next_token_ids=(
+                    None if token_ids is None else token_ids[decode_outputs]
+                ),
+            )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,
                 _sampling_info_for_requests(
@@ -1535,6 +1720,13 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        # KV offloading uses scheduler request slots to bind hot partitions;
+        # ordinary backends keep their existing path through a no-op hook.
+        self.attn_backend.prepare_cache_batch(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            num_extends=ctx.num_extends,
+            stream=self.device_module.current_stream(),
+        )
         ctx.dspark_context_producer = self.dspark_context_producer
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
@@ -1569,13 +1761,17 @@ class ModelExecutor:
             logits_output, sampling_info, ctx, candidates
         )
 
+        # Offloading must persist accepted target-input KV before completion
+        # can publish prefixes or allow a scheduler request slot to be reused.
+        self.attn_backend.writeback_accepted_kv(accept_lengths)
+
         # Backstop: flag any request whose sampled id falls outside [0, vocab)
         # so the output processor can terminate it. Covers sampler/verify kernel
         # corruption and DP-sharded steps that audit_logits cannot attribute.
         self.nan_guard.merge_oov(output_tokens, ctx, self.runtime_states.vocab_size)
 
         # Fork sampler-output D2H onto the grammar side stream so the
-        # next step's build hostfunc can advance the matcher.
+        # next step's host node can advance the matcher.
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
@@ -1583,14 +1779,25 @@ class ModelExecutor:
             self._compact_accepted_tree(ctx.bs, logits_output)
 
         if self.drafter is not None:
+            draft_accept_lengths = accept_lengths
+            if ctx.output_layout.num_decodes:
+                # A stopped request keeps no token; its drafts are discarded,
+                # but the drafter indexes the last accepted position.
+                draft_accept_lengths = accept_lengths.clone()
+                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
+                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
+                        min=1
+                    )
+                )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
                 logits_output=logits_output,
                 output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
+                accept_lengths=draft_accept_lengths,
             )
             # _update_runtime_state skips future_input_map when drafter is
-            # active — drafter writes the next-round inputs directly.
+            # active — drafter writes the next-round inputs directly, and the
+            # row's candidate columns are real from here on.
             indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             for requests in (
                 ctx.output_layout.prefill_slice,
@@ -1601,6 +1808,7 @@ class ModelExecutor:
                 self.runtime_states.future_input_map[indices[requests]] = (
                     next_round_input_ids[requests].to(torch.int32)
                 )
+                self.runtime_states.mark_spec_candidates_drafted(indices[requests])
                 if self.tree_spec is not None:
                     self.runtime_states.future_parent_map[indices[requests]] = (
                         self.tree_spec.draft_parent_buf[requests]
@@ -1612,7 +1820,7 @@ class ModelExecutor:
             output_tokens,
             accept_lengths,
             output_logprobs,
-            logits_output.input_token_logprobs,
+            ForwardLogprobs.of(logits_output),
         )
 
     @nvtx_range("update_runtime_state", color="orange")
@@ -1648,8 +1856,25 @@ class ModelExecutor:
                     .to(torch.int32)
                 )
 
+        bs = req_pool_indices.shape[0]
         ib = self.input_buffers
         tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            commit_ngram_inputs(
+                req_pool_indices,
+                input_lengths,
+                accept_lengths,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:bs],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                num_extends,
+                ib.state_write_padding_pool_index,
+            )
+            return
         advance_accepted_frontier(
             req_pool_indices,
             input_lengths,
@@ -1657,16 +1882,17 @@ class ModelExecutor:
             self.runtime_states.valid_cache_lengths,
             num_extends,
             ib.state_write_padding_pool_index,
-            ngram_tail=tail,
-            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
-            ngram_token_mask=ib.ngram_token_mask_buf,
-            input_ids=ib.input_ids_buf if tail is not None else None,
         )
 
-    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
+    def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+            extend_lengths=(
+                self.input_buffers.input_lengths_buf[:num_extends]
+                if num_extends
+                else None
+            ),
             draft_probs=self.runtime_states.draft_probs,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
@@ -1675,127 +1901,201 @@ class ModelExecutor:
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
-        Called by the EventLoop when this DP rank has no work but other
+        Called by the control plane when this DP rank has no work but other
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
-        graph_forward_mode = ForwardMode.DECODE
-        ctx = ForwardContext(
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            bs=0,
-            num_extends=0,
-            output_layout=ForwardOutputLayout(0, 0, 0, 1),
-            input_num_tokens=0,
-            forward_mode=graph_forward_mode,
-            global_num_tokens=dp_metadata.global_num_tokens,
-            global_bs=dp_metadata.global_batch_size,
-            all_decode_or_idle=dp_metadata.all_decode_or_idle,
-        )
-        sampling_info = SamplingBatchInfo(
-            req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
-            valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            vocab_size=self.runtime_states.vocab_size,
-            device=self.device,
-        )
-        if self.forward_step.can_run(bs=0, ctx=ctx):
-            padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
-            self.input_buffers.fill_dummy_decode_buffers(
-                batch_size=padded_bs,
-                total_tokens=padded_bs * self.config.output_length,
+        self.execution_stream.wait_stream(self.default_stream)
+        with self.device_module.stream(self.execution_stream):
+            graph_forward_mode = ForwardMode.DECODE
+            ctx = ForwardContext(
+                attn_backend=self.attn_backend,
+                token_to_kv_pool=self.token_to_kv_pool,
+                bs=0,
+                num_extends=0,
+                output_layout=ForwardOutputLayout(0, 0, 0, 1),
+                input_num_tokens=0,
+                forward_mode=graph_forward_mode,
+                global_num_tokens=dp_metadata.global_num_tokens,
+                global_bs=dp_metadata.global_batch_size,
+                global_num_decodes=dp_metadata.global_num_decodes,
+                all_decode_or_idle=dp_metadata.all_decode_or_idle,
             )
-            # Captured hostfunc pops one entry per replay; push a dummy
-            # for this idle replay, same as run_once.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * padded_bs,
-                    bs=padded_bs,
-                    has_candidates=False,
-                    output_layout=ForwardOutputLayout(
-                        0, 0, padded_bs, self.config.output_length
-                    ),
+            sampling_info = SamplingBatchInfo(
+                req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
+                valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+                vocab_size=self.runtime_states.vocab_size,
+                device=self.device,
+            )
+            if self.forward_step.can_run(bs=0, ctx=ctx):
+                padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
+                self.input_buffers.fill_dummy_decode_buffers(
+                    batch_size=padded_bs,
+                    total_tokens=padded_bs * self.config.output_length,
                 )
-            # IDLE doesn't produce tokens, so no sampler/drafter call here —
-            # only the model forward, which still participates in collectives.
-            # The draft router's idle refresh zeroes its history stack rows,
-            # so the captured drafter steps' KV writes land on the dummy
-            # page (#955's aliasing hazard is handled at the table source).
-            ib = self.input_buffers
-            with nvtx_range("forward_step idle", color="blue"):
-                self.forward_step(
-                    bs=0,
-                    ctx=ctx,
-                    sampling_info=sampling_info,
-                    extend_with_prefix=False,
-                    extend_prefix_lens=ib.extend_prefix_lens_buf[:0],
-                    extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
-                    extend_seq_lens=ib.extend_seq_lens_buf[:0],
-                    extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
-                    extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:0],
-                    extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:0],
-                    # No request, so no group tables on either side.
-                    block_tables_cpu={},
-                )
-            return
-
-        # Run model forward with IDLE mode — skips attention but still
-        # participates in MLP NCCL collectives (dense all-gather, MoE).
-        ctx.forward_mode = ForwardMode.IDLE
-        empty = torch.zeros(0, dtype=torch.int32, device=self.device)
-        self.model_runner.forward(
-            ctx,
-            input_ids=empty,
-            positions=empty,
-            **self._model_input_kwargs(0, 0, slice(0, 0)),
-        )
-
-        # If a drafter is active, its model also has MoE layers that issue
-        # NCCL collectives. Idle ranks must match those collectives: the
-        # drafter lists the draft forwards the active ranks run per round,
-        # each as the per-rank token counts sizing its collectives
-        # (idle_forward_global_num_tokens); every step runs the IDLE forward
-        # over an empty window with its own spec_step_idx.
-        if self.drafter is not None:
-            # A draft model that reads request-token history takes the view
-            # on every forward; the idle rank hands it an empty one, as the
-            # target's idle forward above does.
-            draft_kwargs: dict[str, object] = {}
-            if (
-                self.drafter.draft_model_runner.model_config.requires_request_token_history
-            ):
-                ib = self.input_buffers
-                draft_kwargs["request_token_history"] = (
-                    self.runtime_states.draft_request_token_history_view(
-                        req_pool_indices=ib.req_pool_indices_buf[:0],
-                        input_start_offsets=ib.input_start_offsets_buf[:1],
-                        active_request_mask=ib.active_request_mask_buf[:0],
-                        committed_lengths=self.runtime_states.valid_cache_lengths,
-                        row_offset=0,
+                # The captured host node pops one grammar batch per replay;
+                # add a dummy for this idle replay, same as run_once.
+                if self.capturable_grammar is not None:
+                    self.capturable_grammar.add_batch(
+                        grammars=[None] * padded_bs,
+                        bs=padded_bs,
+                        has_candidates=False,
+                        output_layout=ForwardOutputLayout(
+                            0, 0, padded_bs, self.config.output_length
+                        ),
                     )
-                )
-            step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
-                dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+                # IDLE doesn't produce tokens, so no sampler/drafter call here —
+                # only the model forward, which still participates in collectives.
+                # The draft router's idle refresh zeroes its history stack rows,
+                # so the captured drafter steps' KV writes land on the dummy
+                # page (#955's aliasing hazard is handled at the table source).
+                ib = self.input_buffers
+                with nvtx_range("forward_step idle", color="blue"):
+                    self.forward_step(
+                        bs=0,
+                        ctx=ctx,
+                        sampling_info=sampling_info,
+                        extend_with_prefix=False,
+                        extend_prefix_lens=ib.extend_prefix_lens_buf[:0],
+                        extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
+                        extend_seq_lens=ib.extend_seq_lens_buf[:0],
+                        extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
+                        extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:0],
+                        extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:0],
+                        # No request, so no group tables on either side.
+                        block_tables_cpu={},
+                        # A task, not a forward: the thread settled any pending round.
+                        settle=lambda: None,
+                    )
+                return
+
+            # Run model forward with IDLE mode — skips attention but still
+            # participates in MLP NCCL collectives (dense all-gather, MoE).
+            ctx.forward_mode = ForwardMode.IDLE
+            empty = torch.zeros(0, dtype=torch.int32, device=self.device)
+            self.model_runner.forward(
+                ctx,
+                input_ids=empty,
+                positions=empty,
+                **self._model_input_kwargs(0, 0, slice(0, 0)),
             )
-            for step_idx, draft_global_num_tokens in enumerate(step_global_num_tokens):
-                draft_ctx = ForwardContext(
-                    attn_backend=self.drafter.attn_backend,
-                    token_to_kv_pool=self.drafter.token_to_kv_pool,
-                    bs=0,
-                    num_extends=0,
-                    output_layout=ForwardOutputLayout(0, 0, 0, 1),
-                    input_num_tokens=0,
-                    forward_mode=ForwardMode.IDLE,
-                    global_num_tokens=draft_global_num_tokens,
-                    global_bs=dp_metadata.global_batch_size,
-                    all_decode_or_idle=dp_metadata.all_decode_or_idle,
+
+            # If a drafter is active, its model also has MoE layers that issue
+            # NCCL collectives. Idle ranks must match those collectives: the
+            # drafter lists the draft forwards the active ranks run per round,
+            # each as the per-rank token counts sizing its collectives
+            # (idle_forward_global_num_tokens); every step runs the IDLE forward
+            # over an empty window with its own spec_step_idx.
+            if self.drafter is not None and self.drafter.draft_model_runner is not None:
+                # A draft model that reads request-token history takes the view
+                # on every forward; the idle rank hands it an empty one, as the
+                # target's idle forward above does.
+                draft_kwargs: dict[str, object] = {}
+                if (
+                    self.drafter.draft_model_runner.model_config.requires_request_token_history
+                ):
+                    ib = self.input_buffers
+                    draft_kwargs["request_token_history"] = (
+                        self.runtime_states.draft_request_token_history_view(
+                            req_pool_indices=ib.req_pool_indices_buf[:0],
+                            input_start_offsets=ib.input_start_offsets_buf[:1],
+                            active_request_mask=ib.active_request_mask_buf[:0],
+                            committed_lengths=self.runtime_states.valid_cache_lengths,
+                            row_offset=0,
+                        )
+                    )
+                step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    global_num_decodes=dp_metadata.global_num_decodes,
                 )
-                self.drafter.draft_model_runner.forward(
-                    draft_ctx,
-                    input_ids=empty,
-                    positions=empty,
-                    spec_step_idx=step_idx,
-                    **draft_kwargs,
-                )
+                for step_idx, draft_global_num_tokens in enumerate(
+                    step_global_num_tokens
+                ):
+                    draft_ctx = ForwardContext(
+                        attn_backend=self.drafter.attn_backend,
+                        token_to_kv_pool=self.drafter.token_to_kv_pool,
+                        bs=0,
+                        num_extends=0,
+                        output_layout=ForwardOutputLayout(0, 0, 0, 1),
+                        input_num_tokens=0,
+                        forward_mode=ForwardMode.IDLE,
+                        global_num_tokens=draft_global_num_tokens,
+                        global_bs=dp_metadata.global_batch_size,
+                        global_num_decodes=dp_metadata.global_num_decodes,
+                        all_decode_or_idle=dp_metadata.all_decode_or_idle,
+                    )
+                    self.drafter.draft_model_runner.forward(
+                        draft_ctx,
+                        input_ids=empty,
+                        positions=empty,
+                        spec_step_idx=step_idx,
+                        **draft_kwargs,
+                    )
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter): the retraction snapshot's blob
+    # ------------------------------------------------------------------
+
+    def slot_state_exporters(self) -> tuple[SlotStateExporter, ...]:
+        """The owners of per-slot state outside the cache groups, in blob order.
+
+        The runtime states, every node of the target attention tree, the
+        nodes of the draft tree not already listed (a draft Inkling wrapper
+        owns its own ring; a shared node is listed once), the drafter and the
+        sampling backend (its per-request scalars, penalty history and coin
+        generator). The Host cache executor lays these out once
+        (``SlotStateLayout``):
+        each contributes a fixed-size segment, exported on a retraction
+        store from the exporters' tensors on ``execution_stream`` (the caller
+        orders the transfer stream behind it) and imported on a restore
+        after the plan's zeroing, before the request's first forward.
+        """
+        exporters: list[SlotStateExporter] = [self.runtime_states]
+        exporters.extend(self.attn_backend.slot_state_exporters())
+        draft_backend = self.draft_attn_backend
+        if draft_backend is not None:
+            listed = {id(exporter) for exporter in exporters}
+            exporters.extend(
+                exporter
+                for exporter in draft_backend.slot_state_exporters()
+                if id(exporter) not in listed
+            )
+        if self.drafter is not None:
+            exporters.append(self.drafter)
+        exporters.append(self.sampling_backend)
+        return tuple(exporters)
+
+    def copy_cache_pages(self, pairs: Mapping[str, Sequence[Sequence[int]]]) -> None:
+        """Copy cached blocks whole onto newly granted blocks of the same group.
+
+        A prefix hit that ends inside a block takes a private copy of that
+        block (copy-on-write); a request that keeps writing past its prompt
+        end moves to a copy so the block it published stays immutable. Runs
+        on ``default_stream`` behind the forwards in flight on
+        ``execution_stream`` -- the source may have been written by the
+        previous forward -- and ahead of this plan's zeroing: a source may be
+        re-granted and zeroed in the same plan, and the next forward's prologue
+        waits on the default stream.
+
+        Args:
+            pairs: Scheduler (virtual) ``(source, destination)`` block ids per
+                cache group id. Under KVP a rank copies only the pairs it owns
+                (both ends share one owner by construction); a replicated
+                group copies every pair.
+        """
+        local_pairs = {
+            group_id: local
+            for group_id, local in local_page_pairs_by_group(
+                pairs, contract=self._cache_runtime_contract, rank=self._cache_kvp_rank
+            ).items()
+            if len(local)
+        }
+        if not local_pairs:
+            return
+        self.default_stream.wait_stream(self.execution_stream)
+        with nvtx_range("copy_cache_pages", color="purple"):
+            self.token_to_kv_pool.arena.copy_blocks(local_pairs)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
@@ -1817,7 +2117,7 @@ class ModelExecutor:
             pages = local_pages_by_group(
                 pages,
                 contract=self._cache_runtime_contract,
-                rank=self._cache_dcp_rank,
+                rank=self._cache_kvp_rank,
             )
 
         def sanitize(pool, pool_pages) -> bool:
@@ -1878,6 +2178,11 @@ class ModelExecutor:
         done.record(self.default_stream)
         return done
 
+    def complete_pending_drafting(self) -> None:
+        """Finish a draft round the last forward left pending."""
+        if self.drafter is not None:
+            self.drafter.complete_round()
+
     @nvtx_range("reset_valid_cache_length", color="orange")
     def _reset_valid_cache_length(self, forward_op) -> None:
         """Rewind the prefill rows' valid cache lengths before a forward.
@@ -1901,8 +2206,9 @@ class ModelExecutor:
         A PD decode destination never executes the prompt locally, so no
         forward of its own can establish these lengths — they come from the
         complete remotely-computed prompt instead, before the first local
-        decode. The cache-transfer path additionally selects the transferred
-        recurrent-state snapshot block from the resulting sequence length.
+        decode. The transferred recurrent state needs no length: it lands in
+        the live slot of the request's state row, which the first decode reads
+        and evolves in place.
         """
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
@@ -1929,6 +2235,11 @@ class ModelExecutor:
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
             self.runtime_states.reset_states(rows, values)
+            # KV offloading tags may still describe a previous owner or a
+            # replaced history view; invalidate them without erasing history.
+            self.attn_backend.invalidate_cache_residency(
+                rows, stream=self.execution_stream
+            )
 
     def execute_forward_op(
         self,
@@ -1942,6 +2253,8 @@ class ModelExecutor:
         ngram_inputs: NGramInputs | None,
         request_history_seeds: RequestHistorySeeds | None,
         input_logprob_plan: InputLogprobPlan | None,
+        sampled_top_k: int,
+        stop_criteria: Sequence[StopCriteria],
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1969,6 +2282,9 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
+            self.runtime_states.bind_stop_criteria(
+                forward_op.request_ids, forward_op.request_pool_indices, stop_criteria
+            )
             cache_metadata = None
             block_tables = {}
             block_tables_cpu = {}
@@ -1984,21 +2300,79 @@ class ModelExecutor:
                 block_tables_cpu = dict(
                     cache_metadata.tables_cpu(active_forward_op=forward_op)
                 )
+            # What the batch fixes on its own is staged while a pending round still drafts.
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
-                ngram_inputs=ngram_inputs,
             )
-            if self.tree_spec is not None and num_extends == 0 and bs > 0:
-                self.tree_spec.load_step(
-                    bs,
+            state_group_ids = self._state_group_ids()
+            if (
+                self.config.overlap_schedule_depth > 0
+                and bs > num_extends
+                and state_group_ids
+            ):
+                # A decode dispatched before the round that ended its request
+                # landed runs as a padding row for the recurrent state.
+                block_tables = self.runtime_states.masked_state_tables(
+                    block_tables,
                     self.input_buffers.req_pool_indices_buf[:bs],
-                    self.runtime_states.future_parent_map,
+                    state_group_ids,
                 )
-                self.tree_spec.depth_positions(
-                    bs, self.input_buffers.positions_buf[:total_tokens]
+
+            def settle() -> None:
+                """What reads the pending round's outputs (see ForwardStepRunner)."""
+                nonlocal grammar_completion, mrope_ms
+                # The previous round's drafts are this forward's inputs.
+                self.complete_pending_drafting()
+                self.input_buffers.load_round_inputs(
+                    forward_op,
+                    self.runtime_states,
+                    total_tokens,
+                    decode_input_ids,
+                    ngram_inputs=ngram_inputs,
                 )
+                if (
+                    self.sampling_backend.config.synthetic_acceptance_length is not None
+                    and decode_input_ids is not None
+                ):
+                    self.sampling_backend.limit_synthetic_acceptance(
+                        self.input_buffers.force_single_token_verify_buf[
+                            num_extends:bs
+                        ],
+                        num_extends,
+                    )
+                if self.tree_spec is not None and num_extends == 0 and bs > 0:
+                    self.tree_spec.load_step(
+                        bs,
+                        self.input_buffers.req_pool_indices_buf[:bs],
+                        self.runtime_states.future_parent_map,
+                        self.input_buffers.positions_buf[:total_tokens],
+                    )
+                # M-RoPE positions copy the tree's depth positions loaded above.
+                mrope_start = time.perf_counter() if timing_enabled else 0.0
+                self._active_positions_override = (
+                    self.mm_runtime.build_positions_override(
+                        forward_op=forward_op,
+                        multimodal_context=multimodal_context,
+                        total_tokens=total_tokens,
+                    )
+                )
+                if timing_enabled:
+                    mrope_ms = (time.perf_counter() - mrope_start) * 1000.0
+                if total_tokens > 0:
+                    # An eager grammar fill reads the decode rows' input ids.
+                    grammar_completion = setup_grammar_step(
+                        sampling_info=sampling_info,
+                        bs=bs,
+                        is_spec_decode=self.drafter is not None and num_extends < bs,
+                        grammar_inputs=grammar_inputs,
+                        grammar_runtime=self.grammar_runtime,
+                        input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
+                        grammar_backend=self.config.grammar_backend,
+                        output_layout=output_layout,
+                    )
+
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)
             if self.drafter is not None and hasattr(
@@ -2012,14 +2386,6 @@ class ModelExecutor:
             if timing_enabled:
                 input_fill_done = time.perf_counter()
                 input_fill_ms = (input_fill_done - timing_start) * 1000.0
-            mrope_start = time.perf_counter() if timing_enabled else 0.0
-            self._active_positions_override = self.mm_runtime.build_positions_override(
-                forward_op=forward_op,
-                multimodal_context=multimodal_context,
-                total_tokens=total_tokens,
-            )
-            if timing_enabled:
-                mrope_ms = (time.perf_counter() - mrope_start) * 1000.0
 
             forward_mode = ForwardMode.from_num_extends(num_extends, bs)
 
@@ -2028,8 +2394,9 @@ class ModelExecutor:
 
             grammar_completion = None
 
-            input_token_logprobs = None
+            forward_logprobs = None
             if total_tokens == 0:
+                settle()
                 # Fully prefix-cached prefill: no tokens to process.
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
@@ -2122,6 +2489,7 @@ class ModelExecutor:
                     input_logprob_rows=self._input_logprob_rows(
                         input_logprob_plan, num_extends, total_tokens, query_shard
                     ),
+                    sampled_top_k=sampled_top_k if num_extends > 0 else 0,
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
                     query_shard=query_shard,
@@ -2134,22 +2502,12 @@ class ModelExecutor:
                         )
                     ctx.global_num_tokens = dp_metadata.global_num_tokens
                     ctx.global_bs = dp_metadata.global_batch_size
+                    ctx.global_num_decodes = dp_metadata.global_num_decodes
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
-                    grammar_completion = setup_grammar_step(
-                        sampling_info=sampling_info,
-                        bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
-                        grammar_inputs=grammar_inputs,
-                        grammar_runtime=self.grammar_runtime,
-                        input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
-                        grammar_backend=self.config.grammar_backend,
-                        output_layout=output_layout,
-                    )
+                    sampling_info = self._build_sampling_info(bs, num_extends)
                     extend_with_prefix = num_extends > 0 and any(
                         forward_op.extend_prefix_lens
                     )
@@ -2164,6 +2522,8 @@ class ModelExecutor:
                         sampling_params_list=sampling_params_list,
                         num_tokens_per_req=self.config.output_length,
                     )
+                    if self.drafter is not None:
+                        self.drafter.prepare_round_sampling(sampling_params_list)
                     if timing_enabled:
                         sampling_prep_ms = (
                             time.perf_counter() - sampling_start
@@ -2187,7 +2547,7 @@ class ModelExecutor:
                         output_tokens,
                         output_lengths,
                         output_logprobs,
-                        input_token_logprobs,
+                        forward_logprobs,
                     ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -2211,8 +2571,12 @@ class ModelExecutor:
                         extend_prompt_lens_cpu=self.input_buffers.extend_prompt_lens_cpu[
                             :num_extends
                         ],
+                        extend_state_checkpoint_lens_cpu=self.input_buffers.extend_state_checkpoint_lens_cpu[
+                            :num_extends
+                        ],
                         block_tables=block_tables,
                         block_tables_cpu=block_tables_cpu,
+                        settle=settle,
                     )
                     if timing_enabled:
                         forward_step_ms = (
@@ -2283,10 +2647,10 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if input_token_logprobs is not None:
-                    input_token_logprobs = input_token_logprobs.to(
-                        "cpu", non_blocking=True
-                    )
+                if forward_logprobs is not None:
+                    forward_logprobs = forward_logprobs.to_host()
+                else:
+                    forward_logprobs = ForwardLogprobs()
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
@@ -2294,6 +2658,10 @@ class ModelExecutor:
                 copy_event.record()
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
+
+            # Enqueued behind the output copies; the next forward or task completes the rest.
+            if self.drafter is not None and total_tokens > 0:
+                self.drafter.finish_round(ctx, self.forward_step.last_graph_bs)
 
             if timing_enabled and (
                 num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0
@@ -2324,11 +2692,15 @@ class ModelExecutor:
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
-            input_token_logprobs=input_token_logprobs,
+            input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a
             # pipeline stage without logits adopts the last stage's logprobs on
             # the commit path and pairs them with its own (mirrored) plan.
             input_logprob_plan=input_logprob_plan,
+            input_top_logprobs_val=forward_logprobs.input_top_logprobs_val,
+            input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
+            output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
+            output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
         )
 
     def _input_logprob_rows(
@@ -2392,6 +2764,7 @@ class ModelExecutor:
             num_input_rows=num_input_rows,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
             rows_per_rank=rows_per_rank,
+            top_k=plan.top_k,
         )
 
     def write_remote_spec_candidate_ids(
@@ -2439,8 +2812,16 @@ class ModelExecutor:
             step_counter.record_cache()
 
     def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
-        """Clear backend restore state before publishing RDMA destinations."""
+        """Clear backend restore state before publishing RDMA destinations.
+
+        A slot granted to a remote admission may be a victim's the same
+        plan retracted: the snapshot store reads the victim's slot state on
+        the write stream and fences the default stream, so this write
+        orders behind the default stream like ``_write_valid_cache_lengths``
+        does -- or it could race the export.
+        """
         slots = [int(slot) for slot in req_pool_indices]
+        self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             self.attn_backend.prepare_remote_cache_slots(slots)
 

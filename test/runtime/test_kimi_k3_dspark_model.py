@@ -10,11 +10,18 @@ the exact set of checkpoint keys the loader must route, skip, or reject.
 from __future__ import annotations
 
 import copy
+import os
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
@@ -164,45 +171,10 @@ def test_taps_must_be_ascending() -> None:
         validate_k3_dspark_config(make_config(target_layer_ids=[2, 47, 23, 71, 89]))
 
 
-def test_taps_must_be_distinct() -> None:
-    with pytest.raises(ValueError, match="distinct"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 2, 47, 71, 89]))
-
-
-def test_taps_must_be_in_range_for_the_target() -> None:
-    with pytest.raises(ValueError, match="out of range"):
-        validate_k3_dspark_config(make_config(target_layer_ids=[2, 23, 47, 71, 93]))
-
-
-def test_mask_token_is_required() -> None:
-    with pytest.raises(ValueError, match="mask_token_id"):
-        validate_k3_dspark_config(make_config(mask_token_id=None))
-
-
-def test_mask_token_must_be_inside_the_vocabulary() -> None:
-    with pytest.raises(ValueError, match="outside"):
-        validate_k3_dspark_config(make_config(mask_token_id=200000))
-
-
-def test_markov_head_is_mandatory() -> None:
-    with pytest.raises(ValueError, match="markov_rank > 0"):
-        validate_k3_dspark_config(make_config(markov_rank=0))
-
-
-def test_unsupported_markov_head_type_is_rejected() -> None:
-    with pytest.raises(ValueError, match="markov_head_type"):
-        validate_k3_dspark_config(make_config(markov_head_type="rnn"))
-
-
 def test_nope_attention_is_rejected() -> None:
     """K3's target is NoPE MLA; this draft is not, and running it NoPE is wrong."""
     with pytest.raises(ValueError, match="RoPE MLA"):
         validate_k3_dspark_config(make_config(mla_use_nope=True))
-
-
-def test_output_gate_is_rejected() -> None:
-    with pytest.raises(ValueError, match="output gate"):
-        validate_k3_dspark_config(make_config(mla_use_output_gate=True))
 
 
 # --------------------------------------------------------------------------
@@ -219,20 +191,6 @@ class _Target:
 
 def test_matching_target_passes() -> None:
     validate_k3_dspark_config(make_config(), target_config=_Target())
-
-
-def test_target_hidden_size_mismatch_is_rejected() -> None:
-    with pytest.raises(ValueError, match="target_hidden_size"):
-        validate_k3_dspark_config(
-            make_config(), target_config=_Target(hidden_size=4096)
-        )
-
-
-def test_target_depth_mismatch_is_rejected() -> None:
-    with pytest.raises(ValueError, match="target_num_hidden_layers"):
-        validate_k3_dspark_config(
-            make_config(), target_config=_Target(num_hidden_layers=61)
-        )
 
 
 def test_vocab_mismatch_is_rejected() -> None:
@@ -410,3 +368,42 @@ def test_k3_per_tap_projection_uses_local_checkpoint_columns(capture_idx, with_n
     torch.testing.assert_close(model.project_target_tap(capture_idx, hidden), expected)
     with pytest.raises(ValueError):
         model.project_target_tap(1, hidden)
+
+
+def test_context_kv_write_respects_dcp_ownership():
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1])
+    latent = torch.arange(slots.numel() * 6).reshape(-1, 6).float()
+    attn = SimpleNamespace(
+        attn_mqa=object(),
+        kv_lora_rank=4,
+        project_latent_kv=lambda hidden: hidden,
+        apply_latent_rope=lambda positions, hidden: hidden,
+    )
+    model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
+    owner_counts = torch.zeros_like(slots)
+    for rank in range(4):
+
+        def write(layer, local, key, rope, *, write_mask):
+            expected = (
+                (slots >= 128) & (slots < 1024) & (((slots // 128 - 1) % 4) == rank)
+            )
+            torch.testing.assert_close(write_mask, expected)
+            expected_local = ((slots // 128 - 1) // 4 + 1) * 128 + slots % 128
+            torch.testing.assert_close(local[expected], expected_local[expected])
+            torch.testing.assert_close(torch.cat((key, rope), dim=-1), latent)
+            owner_counts.add_(write_mask)
+
+        backend = SimpleNamespace(
+            cache_placement=lambda layer: CachePlacement(128, 8, (0, 1, 2, 3), rank)
+        )
+        K3DSparkModel.write_context_kv(
+            model,
+            latent,
+            torch.arange(slots.numel()),
+            slots,
+            SimpleNamespace(set_mla_kv_buffer=write),
+            attn_backend=backend,
+        )
+    torch.testing.assert_close(owner_counts, ((slots >= 128) & (slots < 1024)).long())

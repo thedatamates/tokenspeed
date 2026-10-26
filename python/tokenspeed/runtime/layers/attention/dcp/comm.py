@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
+    combine_dcp_attention_partials,
     dcp_apply_sink,
     dcp_weight_for_reduce_scatter,
+    dispatch_dcp_attention_partials,
 )
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
     all_reduce,
+    all_to_all_single,
     reduce_scatter,
 )
 
@@ -63,24 +66,25 @@ def combine_attention_partials(
     sink: torch.Tensor | None,
     keep_all_heads: bool,
 ) -> torch.Tensor:
-    """Gather LSE and combine weighted partials across the context shards.
+    """Combine partials across context shards, returning the requested heads.
 
     Args:
         local_output: CUDA local context output [tokens, gathered_heads, head_dim].
         local_lse: Natural-log FP32 LSE [tokens, gathered_heads].
-        group: Consecutive DCP subgroup of attention TP.
+        group: The KVP subgroup (consecutive attention-TP ranks) whose
+            partials are merged.
         rank: This process's position in group.
         sink: Required keyword: TP-local sink logits, or explicitly None for
             attention without a sink. There is no implicit sink policy.
         keep_all_heads: Required keyword. ``False`` is the head-sharded form:
             the query heads were gathered from every rank of the group and the
-            weighted partials are reduce-scattered back so each rank keeps its
-            TP-local heads. ``True`` is the head-replicated form (a layer
-            holding every head, as under query context parallelism): every
+            original partials and LSE are sent to their head owner, which
+            weights and sums them in FP32. ``True`` is the head-replicated form
+            (a layer holding every head, as under query context parallelism): every
             rank attended all heads over its own pages and the weighted
             partials are all-reduced, so every rank returns every head; no
-            sink yet. Both forms share the weighting kernel, which splits the
-            heads by the group's degree, so ``heads % len(group) == 0`` holds
+            sink yet. Both forms split heads by the group's degree, so
+            ``heads % len(group) == 0`` holds
             for either.
 
     Returns:
@@ -98,6 +102,24 @@ def combine_attention_partials(
     heads = local_output.shape[1] // degree
     if sink is not None and sink.numel() < heads:
         raise ValueError("DCP sink must cover the TP-local heads")
+    if (
+        not keep_all_heads
+        and local_output.is_cuda
+        and local_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and (sink is None or local_output.dtype != torch.float32)
+    ):
+        packed = dispatch_dcp_attention_partials(
+            local_output, local_lse.float(), degree=degree
+        )
+        received = torch.empty_like(packed)
+        all_to_all_single(received.flatten(), packed.flatten(), group)
+        return combine_dcp_attention_partials(
+            received,
+            head_dim=local_output.shape[-1],
+            partial_dtype=local_output.dtype,
+            output_dtype=local_output.dtype,
+            sink=sink,
+        )
     gathered_lse = all_gather(local_lse.float().unsqueeze(0).contiguous(), group, dim=0)
     weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
     if keep_all_heads:
@@ -117,27 +139,3 @@ def combine_attention_partials(
             dtype=local_output.dtype, memory_format=torch.contiguous_format
         ).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
-
-
-def gather_owned_rows(
-    local_rows: torch.Tensor,
-    owned: torch.Tensor,
-    group: tuple[int, ...],
-) -> torch.Tensor:
-    """Reconstruct aligned rows with one owner per row through a sum reduction.
-
-    Args:
-        local_rows: Local values [rows, ...], in identical logical order on all ranks.
-        owned: Boolean vector [rows]; false rows must contribute zero, even if NaN.
-        group: DCP ranks collectively owning those rows, or a singleton group.
-
-    Returns:
-        Contiguous reconstructed rows with the original shape and dtype.
-    """
-    if owned.shape != local_rows.shape[:1] or owned.dtype != torch.bool:
-        raise ValueError("DCP owner mask must be bool [rows]")
-    mask = owned.reshape((-1,) + (1,) * (local_rows.ndim - 1))
-    rows = torch.where(mask, local_rows, 0).contiguous()
-    if len(group) == 1:
-        return rows
-    return all_reduce(rows, group).contiguous()

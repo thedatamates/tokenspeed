@@ -31,7 +31,10 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_prefill_topk,
 )
-from tokenspeed_kernel.ops.attention.dsa.triton import workspace_topk_to_global_slots
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    local_topk_to_global_slots,
+    workspace_topk_to_global_slots,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -56,6 +59,7 @@ from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3DecoderLayer,
@@ -595,7 +599,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 - (q_len_per_req - 1)
                 + torch.arange(q.shape[0], device=q.device) % q_len_per_req
             )
-            offsets, counts = select_dsa_topk(
+            offsets, _ = select_dsa_topk(
                 q,
                 weights,
                 index_k_cache,
@@ -610,13 +614,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 local_tokens=0,
                 max_logits_bytes=64 * 1024 * 1024,
             )
-            pages = page_table[
-                requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size
-            ]
-            topk_slice.copy_(
-                torch.where(offsets >= 0, pages * page_size + offsets % page_size, -1)
+            local_topk_to_global_slots(
+                local_topk_offsets=offsets,
+                block_table=page_table,
+                block_size=page_size,
+                seq_lens=None,
+                q_len_per_req=q_len_per_req,
+                topk_layout="global_slots",
+                out=topk_slice,
+                lens_out=topk_lens_slice,
             )
-            topk_lens_slice.copy_(counts)
         else:
             dsa_decode_topk(
                 q,
@@ -1188,6 +1195,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -1197,6 +1205,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             hidden_states, residual = self.comm_manager.input_reduce_norm(
                 hidden_states, residual
             )
+            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1216,6 +1225,10 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 max_num_tokens_per_gpu,
             )
         else:
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
+            )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -1279,6 +1292,8 @@ class GlmMoeDsaModel(DeepseekV3Model):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: set = set()
+        # DFLASH: each capture layer's positional tap index.
+        self._dflash_capture_idx_map: dict[int, int] = {}
 
 
 def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:

@@ -80,6 +80,7 @@ def _run_mla_decode(
     backend.kv_cache_dim = 4
     backend.data_type = data_type
     backend.kernel_solution = None
+    backend.decode_kernel_plan = None
     backend._query_block_decode = {}
 
     layer = SimpleNamespace(
@@ -337,6 +338,8 @@ def _run_cutedsl_decode(
     backend.kernel_page_size = 32
     backend._cutedsl_workspace = lambda q_len: torch.empty(0, dtype=torch.int8)
     backend._logged_block_layouts = set()
+    backend.tree_verify = None
+    backend.tree_draft = None
 
     layer = SimpleNamespace(
         tp_q_head_num=1,

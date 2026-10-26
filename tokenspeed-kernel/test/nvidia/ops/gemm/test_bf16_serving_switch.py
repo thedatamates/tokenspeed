@@ -23,19 +23,19 @@
 from dataclasses import astuple
 
 import pytest
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel import compile_monitor
+from tokenspeed_kernel.ops.gemm import _use_mv
 from tokenspeed_kernel.ops.gemm import flashinfer as fi
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    _rowcta_gemv_kernel,
-    decode_gemv,
-    use_decode_gemv,
-)
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import mv
+from tokenspeed_kernel.ops.gemm._triton.gemv import _rowcta_gemv_kernel
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not fi.has_flashinfer_cute_dsl_bf16(),
+    not torch.cuda.is_available()
+    or fi.platform.arch_version not in (fi.ArchVersion(10, 0), fi.ArchVersion(10, 3))
+    or not fi.has_flashinfer_cute_dsl_bf16(),
     reason="the joint BF16 GEMM needs FlashInfer's cute-dsl backend on SM100/SM103",
 )
 
@@ -70,7 +70,7 @@ def test_serving_routes_new_row_counts_away_from_per_m_compiles(warp_splitk):
     x = torch.randn(fi.BF16_GEMM_MAX_M, K, device="cuda").to(torch.bfloat16)
 
     misses = warp_splitk._compile.cache_info().misses
-    decode_gemv(x[:24], weight)
+    mv(x[:24], weight)
     assert warp_splitk._compile.cache_info().misses == misses + 1
 
     compile_monitor.mark_serving()
@@ -79,8 +79,8 @@ def test_serving_routes_new_row_counts_away_from_per_m_compiles(warp_splitk):
     with assert_no_triton_compile(_rowcta_gemv_kernel):
         for m in (1, 5, 17, 23):
             rows = x[:m]
-            assert not use_decode_gemv(rows, weight)
+            assert not _use_mv(rows, weight)
             expected = (rows.float() @ weight.float().T).to(torch.bfloat16)
-            for got in (decode_gemv(rows, weight), tokenspeed_kernel.mm(rows, weight)):
+            for got in (mv(rows, weight), kernel_mm(rows, weight)):
                 torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
     assert warp_splitk._compile.cache_info().misses == misses

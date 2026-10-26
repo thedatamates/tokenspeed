@@ -26,13 +26,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection as kernel_kimi3_latent_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection_add3 as kernel_kimi3_latent_projection_add3,
+)
 from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
 )
-from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -123,11 +128,15 @@ def latent_moe_expert_shared_all_reduce(
 
 @dataclass(frozen=True)
 class Kimi3MoEExecutionPlan:
-    """Construction-time orchestration selected for Kimi-K3 latent MoE."""
+    """Construction-time orchestration selected for Kimi-K3 latent MoE.
+
+    NVIDIA MegaMoE workspace use is separate from fused EP communication ownership.
+    """
 
     use_native: bool
     use_trtllm: bool
     use_mega_moe: bool
+    owns_ep_communication: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
@@ -141,15 +150,19 @@ class Kimi3MoEExecutionPlan:
     ) -> "Kimi3MoEExecutionPlan":
         """Select orchestration from the backend, streams, and parallel layout."""
 
-        use_mega_moe = moe_backend in (MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT)
-        use_native = not use_mega_moe and native_latent_moe_available()
+        use_mega_moe = moe_backend == MoeBackend.MEGA_MOE
+        owns_ep_communication = moe_backend in (
+            MoeBackend.MEGA_MOE,
+            MoeBackend.GLUON_PETIT,
+        )
+        use_native = not owns_ep_communication and native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
         # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
         # neither the AMD-native nor the (Blackwell) TRT-LLM path is available;
         # it can also be forced with ``--moe-backend marlin``.
         use_marlin = (
-            not use_mega_moe
+            not owns_ep_communication
             and not use_native
             and (
                 moe_backend.is_marlin()
@@ -157,7 +170,7 @@ class Kimi3MoEExecutionPlan:
             )
         )
         use_trtllm = (
-            not use_mega_moe
+            not owns_ep_communication
             and not use_native
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
@@ -166,6 +179,7 @@ class Kimi3MoEExecutionPlan:
             use_native=use_native,
             use_trtllm=use_trtllm,
             use_mega_moe=use_mega_moe,
+            owns_ep_communication=owns_ep_communication,
             use_marlin=use_marlin,
             overlap_shared_experts=(
                 use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
@@ -373,7 +387,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         """
         if self.shard_group is None and self.column_group is None:
             raise ValueError("project_shard requires a column-parallel projection")
-        return tokenspeed_kernel.kimi3_latent_projection(
+        return kernel_kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
@@ -389,7 +403,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     def _project_replicated(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project through whatever this rank stores, gathering nothing."""
-        return tokenspeed_kernel.kimi3_latent_projection(
+        return kernel_kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
@@ -467,7 +481,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         enumeration over every ``shard_group is None`` left in this class.
         """
         if not self.narrowed:
-            return tokenspeed_kernel.kimi3_latent_projection_add3(
+            return kernel_kimi3_latent_projection_add3(
                 hidden_states,
                 self.weight,
                 addend_a,
@@ -477,7 +491,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             )
         rows = self.output_size_full // self.shard_size
         start = self.shard_rank * rows
-        local = tokenspeed_kernel.kimi3_latent_projection_add3(
+        local = kernel_kimi3_latent_projection_add3(
             hidden_states,
             self.weight,
             addend_a.narrow(-1, start, rows),

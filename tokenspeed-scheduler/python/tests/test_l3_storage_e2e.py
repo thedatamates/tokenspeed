@@ -18,393 +18,305 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""End-to-end scheduler tests for Mooncake Store L3 under compact Host KV.
-
-CI does not run a Mooncake master. These tests drive the scheduler control
-plane the runtime uses with ``--kvstore-storage-backend mooncake`` (and the
-in-process ``memory`` stand-in): cross-instance ``register_storage_keys``
-after ``batch_exists``, write-back object keys, and L3-only load-back with
-``prefetch_from_storage``.
-"""
-
-from __future__ import annotations
-
-import inspect
+"""Scheduler integration: remote objects become Host data before admission."""
 
 import pytest
-from conftest import _advance, _finish, _spec
+import tokenspeed_scheduler as ts
+from conftest import _advance, _finish, _spec, storage_ops
+from test_async_l3 import done, event, requests, tick
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+
+def config(*, host=32, grain=2, groups=None):
+    c = ts.SchedulerConfig()
+    c.prefix_granularity = grain
+    c.num_snapshot_pages = 1
+    c.num_device_pages = 64
+    c.num_host_pages = host
+    c.max_scheduled_tokens = 64
+    c.max_batch_size = 8
+    c.enable_l3_storage = True
+    c.storage_config = ts.StorageConfig(
+        8,
+        64,
+        host - 1,
+        16,
+        64,
+        grain,
+        100,
+        100,
+        ts.StoragePressure(8, 1048576, 1000),
+        ts.StoragePressure(4, 524288, 500),
+    )
+    c.cache_groups = groups or [group("full", grain, ts.AttnKind.Full)]
+    return c
 
 
-def _l3_config(
-    *,
-    num_device_pages: int,
-    num_host_pages: int,
-    with_swa: bool,
-) -> ts.SchedulerConfig:
-    cfg = ts.SchedulerConfig()
-    cfg.prefix_granularity = 2
-    cfg.num_device_pages = num_device_pages
-    cfg.num_host_pages = num_host_pages
-    cfg.max_scheduled_tokens = 64
-    cfg.max_batch_size = 8
-    cfg.enable_l3_storage = True
-    cfg.disable_l2_cache = False
-    cfg.disable_prefix_cache = False
+def group(name, grain, family, *, window=None):
+    return ts.CacheGroupConfig(
+        group_id=name,
+        block_granularity=0 if family == ts.AttnKind.State else grain,
+        total_pages=64,
+        attn_kind=family if window is None else ts.AttnKind.SlidingWindow,
+        sliding_window_tokens=window,
+    )
+
+
+def start(c):
+    s = ts.Scheduler(c)
+    tick(s, 1, forward=True, storage=True)
+    return s
+
+
+def submit(s, rid="r", tokens=None):
+    spec = _spec(rid, list(range(8)) if tokens is None else tokens)
+    if tokens is None:
+        # Keep the general transaction cases aligned; tail cases supply tokens.
+        spec.max_cached_prefix_tokens = 6
+    s.submit_requests([spec])
+    return storage_ops(s.next_execution_plan())[0]
+
+
+def read(s, query, flags=None):
+    done(s, query, [1] * len(query.keys) if flags is None else flags, retired=True)
+    return s.next_execution_plan()
+
+
+def acknowledge_get(s, plan):
+    op = next(x for x in storage_ops(plan) if x.kind == ts.StorageKind.Get)
+    done(s, op, [1] * len(op.keys), retired=True)
+    return s.next_execution_plan()
+
+
+def test_remote_miss_enters_normal_prefill_without_loadback():
+    s = start(config())
+    q = submit(s)
+    plan = read(s, q, [0] * len(q.keys))
+    assert requests(plan) == ["r"]
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    assert not any(isinstance(x, ts.Cache.LoadBackOp) for x in plan.cache)
+
+
+def test_remote_hint_alone_never_claims_unfilled_host_data():
+    s = start(config())
+    q = submit(s)
+    assert q.kind == ts.StorageKind.Query
+    assert s.host_pool_cached_blocks() == 0
+    get_plan = read(s, q)
+    assert s.host_pool_cached_blocks() == 0
+    assert not requests(get_plan)
+    plan = acknowledge_get(s, get_plan)
+    assert list(plan.forward[0].extend_prefix_lens) == [6]
+
+
+def test_host_shortage_clamps_complete_prefix_before_device_admission():
+    s = start(config(host=3))
+    plan = acknowledge_get(s, read(s, submit(s)))
+    batch = plan.forward[0]
+    assert list(batch.extend_prefix_lens) == [4]
+    assert list(batch.input_lengths) == [4]
+
+
+def test_mixed_grain_shortage_cannot_skip_unrestored_prefix():
+    c = config(
+        host=2,
+        grain=4,
+        groups=[
+            group("fine", 2, ts.AttnKind.Full),
+            group("coarse", 4, ts.AttnKind.Full),
+        ],
+    )
+    s = start(c)
+    plan = read(s, submit(s))
+    assert requests(plan) == ["r"]
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    assert s.storage_held_blocks() == 0
+
+
+def test_swa_missing_cannot_be_replaced_by_full_kv_hit():
+    s = start(
+        config(
+            groups=[
+                group("full", 2, ts.AttnKind.Full),
+                group("swa", 2, ts.AttnKind.Full, window=4),
+            ]
+        )
+    )
+    q = submit(s)
+    plan = read(s, q, [int(key[0] == 0) for key in q.keys])
+    assert requests(plan) == ["r"]
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+
+
+@pytest.mark.parametrize("state_groups", [1, 3])
+def test_sparse_state_hit_uses_existing_group_matcher(state_groups):
+    s = start(
+        config(
+            groups=[
+                group("full", 2, ts.AttnKind.Full),
+                *[
+                    group(f"state{i}", 2, ts.AttnKind.State)
+                    for i in range(state_groups)
+                ],
+            ]
+        )
+    )
+    q = submit(s)
+    checkpoint = s.prefix_hashes_for_tokens(list(range(8)))[-1]
+    final_states = {(gid, checkpoint, 0) for gid in range(1, state_groups + 1)}
+    flags = [int(key[0] == 0 or tuple(key) in final_states) for key in q.keys]
+    get_plan = read(s, q, flags)
+    get = storage_ops(get_plan)[0]
+    assert sum(key[0] != 0 for key in get.keys) == state_groups
+    plan = acknowledge_get(s, get_plan)
+    assert list(plan.forward[0].extend_prefix_lens) == [6]
+
+
+def test_partial_get_uses_only_complete_contiguous_prefix():
+    s = start(config())
+    get = storage_ops(read(s, submit(s)))[0]
+    done(s, get, [1, 0, 1], retired=True)
+    plan = s.next_execution_plan()
+    assert list(plan.forward[0].extend_prefix_lens) == [2]
+
+
+def test_l2_warm_new_request_does_not_send_query():
+    s = start(config())
+    plan = acknowledge_get(s, read(s, submit(s)))
+    load = next(x for x in plan.cache if isinstance(x, ts.Cache.LoadBackOp))
+    event(s, ts.Cache.LoadBackDoneEvent(load.op_ids[0]))
+    s.submit_requests([_spec("warm", list(range(8)))])
+    plan = s.next_execution_plan()
+    assert "warm" in requests(plan)
+    assert not any(x.kind == ts.StorageKind.Query for x in storage_ops(plan))
+
+
+def test_abort_id_reuse_does_not_publish_old_get():
+    s = start(config())
+    old_get = storage_ops(read(s, submit(s)))[0]
+    abort = ts.ForwardEvent.Abort()
+    abort.request_id = "r"
+    event(s, abort)
+    cancel_plan = s.next_execution_plan()
+    assert storage_ops(cancel_plan)[0].kind == ts.StorageKind.Cancel
+    query = submit(s, tokens=list(range(10, 18)))
+    assert query.op_id != old_get.op_id
+    done(s, old_get, [1] * len(old_get.keys), retired=True)
+    assert s.host_pool_cached_blocks() == 0
+    assert s.storage_pending()
+
+
+def test_l3_put_failure_preserves_published_host_cache():
+    s = start(config())
+    q = submit(s)
+    read(s, q, [0] * len(q.keys))
+    _advance(s, "r", [99])
+    plan = s.next_execution_plan()
+    wb = next(x for x in plan.cache if isinstance(x, ts.Cache.WriteBackOp))
+    ack = ts.Cache.WriteBackDoneEvent()
+    ack.op_id = wb.op_ids[0]
+    event(s, ack)
+    cached = s.host_pool_cached_blocks()
+    put = next(
+        x for x in storage_ops(s.next_execution_plan()) if x.kind == ts.StorageKind.Put
+    )
+    assert cached > 0 and s.storage_held_blocks() > 0
+    done(s, put, [0] * len(put.keys), retired=True)
+    assert s.host_pool_cached_blocks() == cached
+    assert s.storage_held_blocks() == 0
+
+
+def test_flush_rejects_query_without_erasing_its_operation():
+    s = start(config())
+    q = submit(s)
+    assert not s.clear_cache()
+    assert s.storage_pending()
+    assert s.clear_l1_cache()
+    plan = read(s, q, [0] * len(q.keys))
+    assert requests(plan) == ["r"]
+
+
+def test_state_groups_cannot_resume_from_different_remote_checkpoints():
+    s = start(
+        config(
+            groups=[
+                group("full", 2, ts.AttnKind.Full),
+                group("state0", 0, ts.AttnKind.State),
+                group("state1", 0, ts.AttnKind.State),
+            ]
+        )
+    )
+    q = submit(s)
+    states = {gid: [tuple(k) for k in q.keys if k[0] == gid] for gid in (1, 2)}
+    # One recurrent group has only the last checkpoint, the other only the
+    # first. Full KV coverage cannot make either mismatched state usable.
+    hits = {states[1][-1], states[2][0]}
+    plan = read(s, q, [int(k[0] == 0 or tuple(k) in hits) for k in q.keys])
+    assert requests(plan) == ["r"]
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    assert not any(op.kind == ts.StorageKind.Get for op in storage_ops(plan))
+
+
+def test_storage_configuration_cannot_be_silently_ignored():
+    cfg = config()
+    cfg.enable_l3_storage = False
+    with pytest.raises(ValueError, match="StorageConfig requires L3"):
+        ts.Scheduler(cfg)
+
+
+@pytest.mark.parametrize("kinds", [("full",), ("state",), ("full", "swa", "state")])
+@pytest.mark.parametrize("suffix_tokens", [1, 4])
+def test_cold_reader_restores_actual_published_unaligned_checkpoint(
+    kinds, suffix_tokens
+):
     groups = [
-        ts.CacheGroupConfig(
-            group_id="full",
-            block_granularity=cfg.prefix_granularity,
-            total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+        group(
+            kind,
+            2,
+            ts.AttnKind.State if kind == "state" else ts.AttnKind.Full,
+            window=4 if kind == "swa" else None,
         )
+        for kind in kinds
     ]
-    if with_swa:
-        groups.append(
-            ts.CacheGroupConfig(
-                group_id="swa",
-                block_granularity=cfg.prefix_granularity,
-                total_pages=cfg.num_device_pages,
-                retention=ts.CacheRetention.SlidingWindow,
-                sliding_window_tokens=4,
-                family=ts.CacheGroupFamily.History,
-            )
-        )
-    cfg.cache_groups = groups
-    return cfg
-
-
-def _find_write_back(plan):
-    for op in plan.cache:
-        if isinstance(op, ts.Cache.WriteBackOp):
-            return op
-    return None
-
-
-def _find_load_back(plan):
-    for op in plan.cache:
-        if isinstance(op, ts.Cache.LoadBackOp):
-            return op
-    return None
-
-
-def _ack_write_back(scheduler, op_id: int) -> None:
-    event = ts.Cache.WriteBackDoneEvent()
-    event.op_id = int(op_id)
-    execution_event = ts.ExecutionEvent()
-    execution_event.add_event(event)
-    scheduler.advance(execution_event)
-
-
-def _ack_load_back(scheduler, op_id: int, success: bool) -> None:
-    event = ts.Cache.LoadBackDoneEvent(int(op_id), success)
-    execution_event = ts.ExecutionEvent()
-    execution_event.add_event(event)
-    scheduler.advance(execution_event)
-
-
-def _retract(scheduler, request_id: str) -> None:
-    event = ts.ForwardEvent.Retract()
-    event.request_id = request_id
-    execution_event = ts.ExecutionEvent()
-    execution_event.add_event(event)
-    scheduler.advance(execution_event)
-
-
-def _run_to_finalize(scheduler, spec) -> object:
-    scheduler.submit_requests([spec])
-    scheduler.next_execution_plan()  # prefill
-    _advance(scheduler, spec.request_id, [9001])
-    return scheduler.next_execution_plan()  # PrefillDone -> Decoding: drain
-
-
-def _finish_and_reap(scheduler, request_id: str) -> None:
-    _advance(scheduler, request_id, [9002])
-    _finish(scheduler, request_id)
-    scheduler.next_execution_plan()
-
-
-def _prefetch_flags(load_op) -> list[int]:
-    return [int(flag) for row in load_op.prefetch_from_storage for flag in row]
-
-
-def test_l3_config_requires_device_host_and_swa() -> None:
-    parameters = inspect.signature(_l3_config).parameters
-    for name in ("num_device_pages", "num_host_pages", "with_swa"):
-        assert parameters[name].default is inspect.Parameter.empty
-
-
-def test_l3_cold_miss_does_not_prefetch() -> None:
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
-    )
-    scheduler.submit_requests([_spec("r1", list(range(1, 9)))])
-    plan = scheduler.next_execution_plan()
-    assert _find_load_back(plan) is None
-    assert any(dict(op.block_tables) for op in plan.forward)
-
-
-def test_l3_register_storage_keys_emits_prefetch_loadback() -> None:
-    """Cross-instance Mooncake path: batch_exists → register → prefetch H2D."""
-
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
-    )
-    tokens = list(range(1, 9))
-    hashes = scheduler.prefix_hashes_for_tokens(tokens)
-    assert hashes
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    assert group_ids
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
-
-    scheduler.submit_requests([_spec("r1", tokens)])
-    plan = scheduler.next_execution_plan()
-    load = _find_load_back(plan)
-    assert load is not None, "L3-only prefix must emit LoadBackOp"
-    assert list(load.op_ids)
-    flags = _prefetch_flags(load)
-    assert flags
-    assert all(flag != 0 for flag in flags)
-    assert any(row for row in load.content_hashes)
-    _ack_load_back(scheduler, load.op_ids[0], success=True)
-
-
-def test_l3_short_host_pool_retries_first_chunk_from_admitted_prefix() -> None:
-    """A Host-starved L3 hit must not skip the unallocated prefix tokens."""
-
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=3, with_swa=False)
-    )
-    tokens = list(range(1, 9))
-    hashes = scheduler.prefix_hashes_for_tokens(tokens)
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
-
-    scheduler.submit_requests([_spec("r1", tokens)])
-    plan = scheduler.next_execution_plan()
-    assert plan.forward
-    op = plan.forward[0]
-    assert list(op.extend_prefix_lens) == [4]
-    assert list(op.input_lengths) == [4]
-    assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
-
-
-def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
-    """A fine-group Host shortage must not skip a coarser group's prefix KV."""
-
-    cfg = ts.SchedulerConfig()
-    cfg.prefix_granularity = 4
-    cfg.num_device_pages = 32
-    cfg.num_host_pages = 2
-    cfg.max_scheduled_tokens = 64
-    cfg.max_batch_size = 8
-    cfg.enable_l3_storage = True
-    cfg.disable_l2_cache = False
-    cfg.disable_prefix_cache = False
-    cfg.cache_groups = [
-        ts.CacheGroupConfig(
-            group_id="full_fine",
-            block_granularity=2,
-            total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
-        ),
-        ts.CacheGroupConfig(
-            group_id="full_coarse",
-            block_granularity=4,
-            total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
-        ),
+    writer = start(config(groups=groups))
+    query = submit(writer, tokens=list(range(5)))
+    plan = read(writer, query, [0] * len(query.keys))
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    _advance(writer, "r", [77])
+    _finish(writer, "r")
+    plan = writer.next_execution_plan()
+    writes = [op for op in plan.cache if isinstance(op, ts.Cache.WriteBackOp)]
+    assert writes
+    for op in writes:
+        for op_id in op.op_ids:
+            ack = ts.Cache.WriteBackDoneEvent()
+            ack.op_id = op_id
+            event(writer, ack)
+    puts = [
+        op
+        for op in storage_ops(writer.next_execution_plan())
+        if op.kind == ts.StorageKind.Put
     ]
-    scheduler = ts.Scheduler(cfg)
-    tokens = list(range(1, 9))
-    hashes = scheduler.prefix_hashes_for_tokens(tokens)
-    assert hashes, "grain-4 prompts need more than 4 tokens for a candidate prefix page"
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
+    remote = {tuple(key) for op in puts for key in op.keys}
+    assert remote
+    for op in puts:
+        done(writer, op, [1] * len(op.keys), retired=True)
 
-    scheduler.submit_requests([_spec("r1", tokens)])
-    plan = scheduler.next_execution_plan()
-    assert plan.forward
-    op = plan.forward[0]
-    assert list(op.extend_prefix_lens) == [0]
-    assert list(op.input_lengths) == [8]
-    assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
-
-
-def test_waiting_prefix_hashes_match_submitted_prompt() -> None:
-    """Queued requests expose the same hashes the event loop revalidates."""
-
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
-    )
-    tokens = list(range(1, 9))
-    expected = scheduler.prefix_hashes_for_tokens(tokens)
-    assert expected
-    scheduler.submit_requests([_spec("r1", tokens)])
-    assert scheduler.waiting_prefix_hashes() == expected
-    scheduler.next_execution_plan()
-    assert scheduler.waiting_prefix_hashes() == []
-
-
-def test_waiting_prefix_hashes_skip_when_batch_cannot_admit() -> None:
-    """A full decode/prefill batch must not rehash a waiter that cannot join."""
-
-    cfg = _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
-    cfg.max_batch_size = 1
-    scheduler = ts.Scheduler(cfg)
-    scheduler.submit_requests([_spec("r1", list(range(1, 5)))])
-    scheduler.next_execution_plan()
-    scheduler.submit_requests([_spec("r2", list(range(100, 108)))])
-    assert scheduler.waiting_prefix_hashes() == []
-
-
-def test_waiting_prefix_hashes_skip_when_pool_cannot_admit() -> None:
-    """An exhausted Device pool must not rehash a waiter that still has a slot."""
-
-    cfg = _l3_config(num_device_pages=11, num_host_pages=11, with_swa=False)
-    cfg.disable_prefix_cache = True
-    cfg.cache_groups = [
-        ts.CacheGroupConfig(
-            group_id="full",
-            block_granularity=cfg.prefix_granularity,
-            total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
-        ),
-        ts.CacheGroupConfig(
-            group_id="swa",
-            block_granularity=cfg.prefix_granularity,
-            total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.SlidingWindow,
-            sliding_window_tokens=4,
-            family=ts.CacheGroupFamily.History,
-        ),
+    # A separate scheduler has no local TailTable or Host/Device cache state.
+    reader = start(config(groups=groups))
+    spec = _spec("r", [0, 1, 2, 3, 4] + [88] * suffix_tokens)
+    # Also cover an explicit, nonaligned logprob/replay bound inside a longer
+    # prompt: nothing beyond that token count may be claimed.
+    spec.max_cached_prefix_tokens = 5
+    reader.submit_requests([spec])
+    query = storage_ops(reader.next_execution_plan())[0]
+    plan = read(reader, query, [int(tuple(key) in remote) for key in query.keys])
+    get = next(op for op in storage_ops(plan) if op.kind == ts.StorageKind.Get)
+    assert all(tuple(key) in remote for key in get.keys)
+    assert [sum(key[0] == gid for key in get.keys) for gid in range(len(kinds))] == [
+        {"full": 3, "swa": 2, "state": 1}[kind] for kind in kinds
     ]
-    scheduler = ts.Scheduler(cfg)
-    scheduler.submit_requests([_spec("r1", list(range(1, 9)))])
-    scheduler.next_execution_plan()
-    assert scheduler.available_lcm_blocks() == 0
-    scheduler.submit_requests([_spec("r2", list(range(100, 108)))])
-    assert scheduler.waiting_prefix_hashes() == []
-
-
-def test_l3_unregister_storage_keys_removes_stale_remote_hit() -> None:
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
-    )
-    tokens = list(range(1, 9))
-    hashes = scheduler.prefix_hashes_for_tokens(tokens)
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
-    scheduler.unregister_storage_keys(group_ids, expanded, offsets)
-
-    scheduler.submit_requests([_spec("r1", tokens)])
-    plan = scheduler.next_execution_plan()
-    assert _find_load_back(plan) is None
-
-
-def test_l3_writeback_carries_object_keys() -> None:
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=True)
-    )
-    spec = _spec("r1", list(range(1, 9)))
-    finalize = _run_to_finalize(scheduler, spec)
-    write_back = _find_write_back(finalize)
-    assert write_back is not None, "finalize must drain a streaming Host write-back"
-    assert list(write_back.op_ids)
-    hashes = [content_hash for row in write_back.content_hashes for content_hash in row]
-    assert hashes
-    assert all(content_hash for content_hash in hashes)
-    offsets = [int(offset) for row in write_back.page_offsets for offset in row]
-    assert len(offsets) == len(hashes)
-
-    _finish_and_reap(scheduler, spec.request_id)
-    _ack_write_back(scheduler, write_back.op_ids[0])
-    scheduler.next_execution_plan()
-
-
-def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
-    """Host eviction keeps Mooncake objects; admit-time register restores the shadow."""
-
-    cfg = _l3_config(num_device_pages=13, num_host_pages=7, with_swa=True)
-    scheduler = ts.Scheduler(cfg)
-
-    r1 = _spec("r1", list(range(1, 9)))
-    wb1 = _find_write_back(_run_to_finalize(scheduler, r1))
-    assert wb1 is not None
-    _finish_and_reap(scheduler, "r1")
-    _ack_write_back(scheduler, wb1.op_ids[0])
-    scheduler.next_execution_plan()
-
-    churn = _spec("churn", list(range(501, 511)))
-    wb2 = _find_write_back(_run_to_finalize(scheduler, churn))
-    assert wb2 is not None, "a full Host pool must replace r1's committed entries"
-    _finish_and_reap(scheduler, "churn")
-    _ack_write_back(scheduler, wb2.op_ids[0])
-    scheduler.next_execution_plan()
-
-    r3_tokens = list(range(1, 11))
-    hashes = scheduler.prefix_hashes_for_tokens(r3_tokens)
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
-    scheduler.submit_requests([_spec("r3", r3_tokens)])
-    plan = scheduler.next_execution_plan()
-    load = _find_load_back(plan)
-    assert load is not None, "Host-evicted L3 prefix must still emit LoadBackOp"
-    flags = _prefetch_flags(load)
-    assert flags
-    assert all(flag != 0 for flag in flags), "replaced Host pages must prefetch from L3"
-    _ack_load_back(scheduler, load.op_ids[0], success=True)
-
-
-def test_vanished_l3_prefetch_retracts_then_readmits_as_cold_miss() -> None:
-    """A missed batch_get_into retracts snapshot-less; the next admit recomputes."""
-
-    scheduler = ts.Scheduler(
-        _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
-    )
-    tokens = list(range(1, 9))
-    hashes = scheduler.prefix_hashes_for_tokens(tokens)
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
-
-    scheduler.submit_requests([_spec("r1", tokens)])
-    plan = scheduler.next_execution_plan()
-    load = _find_load_back(plan)
-    assert load is not None, "registered L3 keys must emit LoadBackOp"
-    assert list(load.op_ids)
-    flags = _prefetch_flags(load)
-    assert flags
-    assert all(flag != 0 for flag in flags)
-    assert plan.forward
-    first = plan.forward[0]
-    assert list(first.request_ids) == ["r1"]
-    assert first.extend_prefix_lens[0] > 0
-
-    scheduler.unregister_storage_keys(group_ids, expanded, offsets)
-    _retract(scheduler, "r1")
-    _ack_load_back(scheduler, load.op_ids[0], success=False)
-
-    retry = scheduler.next_execution_plan()
-    assert _find_load_back(retry) is None, "unregistered L3 keys must not prefetch"
-    assert retry.forward
-    op = retry.forward[0]
-    assert list(op.request_ids) == ["r1"]
-    assert list(op.extend_prefix_lens) == [0]
-    assert op.extend_prefix_lens[0] + op.input_lengths[0] == op.prefill_lengths[0]
-
-
-def test_l3_storage_prefix_hash_and_register_bindings() -> None:
-    cfg = _l3_config(num_device_pages=32, num_host_pages=32, with_swa=True)
-    scheduler = ts.Scheduler(cfg)
-    assert hasattr(scheduler, "prefix_hashes_for_tokens")
-    hashes = scheduler.prefix_hashes_for_tokens([1, 2, 3, 4, 5])
-    assert hashes
-    group_ids, expanded, offsets = scheduler.expand_prefix_keys(hashes)
-    assert group_ids
-    assert len(group_ids) == len(expanded) == len(offsets)
-    scheduler.register_storage_keys(group_ids, expanded, offsets)
+    assert reader.host_pool_cached_blocks() == 0
+    plan = acknowledge_get(reader, plan)
+    assert list(plan.forward[0].extend_prefix_lens) == [5]
+    assert list(plan.forward[0].input_lengths) == [suffix_tokens]
+    assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)

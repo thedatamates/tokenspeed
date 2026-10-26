@@ -35,11 +35,13 @@ SchedulerConfig WidthConfig(std::int32_t budget) {
     config.disable_l2_cache = true;
     config.disable_prefix_cache = true;
     config.enable_l3_storage = false;
-    config.cache_groups.push_back(CacheGroupConfig{.group_id = "history",
-                                                   .block_granularity = 2,
-                                                   .total_pages = 128,
-                                                   .retention = CacheGroupConfig::Retention::FullHistory,
-                                                   .family = CacheGroupFamily::History});
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "history",
+        .block_granularity = 2,
+        .total_pages = 128,
+        .attn_kind = AttnKind::kFull,
+    });
+    SetTestSnapshotPool(config);
     return config;
 }
 const ForwardBatch& FirstBatch(const ExecutionPlan& plan) {
@@ -71,8 +73,22 @@ void FinishWidthRequest(Scheduler& scheduler, const std::string& id) {
 }
 }  // namespace
 
+static void AckRecovery(Scheduler& scheduler, const ExecutionPlan& plan) {
+    for (const auto& operation : plan.Operations()) {
+        const auto* transfers = std::get_if<CacheOperation>(&operation);
+        if (!transfers) continue;
+        ExecutionEvent completed;
+        if (const auto* stores = std::get_if<SnapshotStoreBatch>(transfers))
+            for (auto id : stores->op_ids) completed.With(cache::SnapshotDone{id});
+        if (const auto* loads = std::get_if<SnapshotRestoreBatch>(transfers))
+            for (auto id : loads->op_ids) completed.With(cache::RestoreDone{id});
+        scheduler.Advance(std::move(completed));
+    }
+}
 TEST(SelectedDecodeWidth, PartialCommitRetractionAndRestore) {
-    Scheduler scheduler(WidthConfig(64));
+    auto config = WidthConfig(64);
+    config.debug_force_retraction_interval = 5;
+    Scheduler scheduler(config);
     SubmitWidthRequest(scheduler, "a", {1, 2, 3, 4});
     SelectWidth(scheduler, "a", 1, 1);
     auto plan = scheduler.NextExecutionPlan();
@@ -93,17 +109,17 @@ TEST(SelectedDecodeWidth, PartialCommitRetractionAndRestore) {
     plan = scheduler.NextExecutionPlan();
     EXPECT_EQ(FirstBatch(plan).input_lengths, std::vector<std::int32_t>({6}));
     CommitWidthTokens(scheduler, "a", {14, 15, 16, 17, 18, 19});
-    ExecutionEvent retract;
-    retract.With(forward::Retract{.request_id = "a"});
-    scheduler.Advance(retract);
+    const auto image = scheduler.NextExecutionPlan();
+    ASSERT_EQ(scheduler.RetractedSize(), 1);
+    AckRecovery(scheduler, image);
+    const auto restored = scheduler.NextExecutionPlan();
+    AckRecovery(scheduler, restored);
     plan = scheduler.NextExecutionPlan();
-    const std::vector<std::int32_t> history{1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
     const auto& batch = FirstBatch(plan);
-    ASSERT_EQ(batch.extend_prefix_lens.size(), 1);
-    const auto start = batch.extend_prefix_lens[0];
-    ASSERT_GE(start, 0);
-    ASSERT_LE(start, history.size());
-    EXPECT_EQ(batch.input_ids, std::vector<std::int32_t>(history.begin() + start, history.end()));
+    EXPECT_EQ(batch.prefill_lengths, (std::vector<std::int32_t>{4}));
+    EXPECT_EQ(batch.decode_input_ids, (std::vector<std::int32_t>{19}));
+    EXPECT_EQ(batch.input_lengths, (std::vector<std::int32_t>{1}));
+    EXPECT_EQ(scheduler.RequestTokenSize("a"), 14);
     CommitWidthTokens(scheduler, "a", {20});
     plan = scheduler.NextExecutionPlan();
     EXPECT_EQ(FirstBatch(plan).input_lengths, std::vector<std::int32_t>({1}));
@@ -263,7 +279,9 @@ TEST(SelectedDecodeWidth, LegacyReserveFeedbackDoesNotInferSelectedWidthRefund) 
     const auto result = RunRetainedCapacityCase(std::nullopt, 1, 6);
     EXPECT_FALSE(result.empty_plan);
     EXPECT_EQ(result.generated, 7);
-    EXPECT_EQ(result.high_water_pages, 20);
+    // Unmodified upstream reuses the prepaid verify span: the same legacy
+    // case measures initial=18, high_water=18, generated=7, active=0.
+    EXPECT_EQ(result.high_water_pages, result.initial_pages);
 }
 
 TEST(SelectedDecodeWidth, ZeroRetainedResultReturnsItsWholeExplicitReservation) {
@@ -358,7 +376,7 @@ TEST(SelectedDecodeWidth, PartialCommitRefundWorksAcrossSparseReplayableGroups) 
     replay.group_id = "replay";
     replay.block_granularity = 4;
     replay.total_pages = 128;
-    replay.retention = CacheGroupConfig::Retention::SlidingWindow;
+    replay.attn_kind = AttnKind::kSlidingWindow;
     replay.sliding_window_tokens = 16;
     replay.replayable = true;
     config.cache_groups.push_back(replay);

@@ -49,6 +49,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
     TreeSupport,
@@ -92,21 +97,29 @@ class SparseTopKShare:
 
     ``prefill`` covers the extend rows, ``decode`` the decode rows (or the
     verify window); each family stores its own record type. ``qsa_metadata``
-    holds QSA's layer-invariant row geometry so it is built once per forward.
+    holds QSA's layer-invariant row geometry so it is built once per forward;
+    ``qsa_selection`` retains its logical candidates alongside physical slots.
     """
 
     prefill: Any | None = None
     decode: Any | None = None
     qsa_metadata: Any | None = None
+    qsa_selection: Any | None = None
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
         self.qsa_metadata = None
+        self.qsa_selection = None
 
 
 class CachePoolBinding:
     """A node's bound cache pool."""
+
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a node that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
 
     def _init_pool_binding(self) -> None:
         self.cache_pool: CachePool | None = None
@@ -138,6 +151,110 @@ class CachePoolBinding:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
 
+    def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
+        was written at (``PagedAttention.fp8_kv_scales``)."""
+        return False
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """This node's own per-slot rows a retraction snapshot images.
+
+        Backend-private state keyed by ``req_pool_index`` -- a recurrent
+        ring, a partial index pool not yet in a page -- is the exception
+        (``AGENTS.md``); a backend that keeps some lists it here, in a fixed
+        order, so a restore carries it with the pages. Paged state is in
+        cache groups and never listed. A node lists its own rows only; the
+        tree is flattened by :meth:`slot_state_exporters`. A leaf's default
+        is empty.
+        """
+        del slot
+        return []
+
+    def slot_state_exporters(self) -> tuple[CachePoolBinding, ...]:
+        """This node and every node below it, each imaging its own rows.
+
+        The model executor lists these in the blob, so a composite's rows and
+        its children's are separate segments laid out once by the Host cache
+        executor rather than re-measured at every export.
+        """
+        exporters = [self]
+        for child in self.child_backends():
+            exporters.extend(child.slot_state_exporters())
+        return tuple(exporters)
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # Backend rows are rewritten by every forward and prepared at a PD
+        # landing, never keyed by request: always valid, nothing to mark.
+        del request_id
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
+    def prepare_cache_batch(
+        self, request_slots: torch.Tensor, *, num_extends: int, stream: torch.Stream
+    ) -> None:
+        """Begin KV offloading access for this target batch's request slots.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Clear last-step read/write mappings, mask null/padded requests, and
+        order residency work on stream. This does not allocate history.
+        num_extends identifies prefill rows, which offloaded arenas reject.
+        """
+        for child in self.child_backends():
+            child.prepare_cache_batch(
+                request_slots, num_extends=num_extends, stream=stream
+            )
+
+    def writeback_accepted_kv(self, accept_lengths: torch.Tensor) -> None:
+        """Persist accepted KV from offloading compute buffers to Host history.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Join writeback to the execution stream before publishing completion.
+        accept_lengths counts accepted target-input rows, not output tokens.
+        """
+        for child in self.child_backends():
+            child.writeback_accepted_kv(accept_lengths)
+
+    def invalidate_cache_residency(
+        self, request_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Fence KV offloading work and invalidate reused request-slot tags.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Reset hot-cache tags, seed state, and LRU on stream. This does not
+        erase authoritative history or release scheduler-owned cache blocks.
+        """
+        for child in self.child_backends():
+            child.invalidate_cache_residency(request_slots, stream=stream)
+
+    def prefetch_sparse_kv(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Overlap sparse KV offloading loads for this producer's consumers.
+
+        layer identifies the selection producer. Its recipe declares which
+        offloaded consumer fields share selection. Load those fields on the
+        prefetch stream when overlap is enabled; otherwise do nothing.
+        Each consumer must still call prepare_sparse_kv_access to join its
+        ready event and publish compute slots before projection/attention.
+        """
+
 
 class AttentionBackend(CachePoolBinding, ABC):
     """The runner-facing contract; see the module docstring.
@@ -145,10 +262,24 @@ class AttentionBackend(CachePoolBinding, ABC):
     A subclass that skips ``__init__`` calls ``_init_pool_binding()`` itself.
     """
 
-    # Cache families this node consumes from the pool contract (startup
-    # validation: every published family must have a consumer); composites
-    # union their children's.
-    cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Cache-group kinds this node consumes from the pool contract (startup
+    # validation: every published kind must have a consumer); composites
+    # union their children's. Paged backends read rows of either history kind.
+    cache_consumer_attn_kinds: frozenset[str] = frozenset(
+        {"full_history", "sliding_window"}
+    )
+
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        """Whether every State group this node consumes stores in-forward checkpoints.
+
+        With ``--enable-state-checkpoint-in-forward``, the state at a checkpoint
+        goes into the third block of an extend row. A node consuming no State
+        group has none to miss; a State consumer opts in, and a composite answers
+        for its children.
+        """
+        return "state" not in self.cache_consumer_attn_kinds
+
     # Only backends whose model skips incomplete-prefill outputs opt in.
     skips_incomplete_prefill_outputs: bool = False
     # MLA sharded history reads/writes and global attention-partial merging,
@@ -195,6 +326,15 @@ class AttentionBackend(CachePoolBinding, ABC):
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Allocate graph-stable target verify buffers and return their bytes.
+
+        ``max_bs`` is the serving batch capacity; ``draft_token_num`` is the
+        verify width. Composites delegate to their verify consumers. Backends
+        without verify buffers return zero.
+        """
+        return 0
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
         """Allocate the query-context-parallel history gather workspace and
@@ -244,8 +384,10 @@ class AttentionBackend(CachePoolBinding, ABC):
 
         ``capture`` only retains startup buffers at their captured addresses;
         it must not select different computation. Returns the same answer as
-        :meth:`admits_prefill_graph`; the prefill capture raises if an override
-        refuses a shape that query admitted. Other backends keep
+        :meth:`admits_prefill_graph`, except that a forward writing in-forward
+        State checkpoints keeps its live metadata and gets False; the prefill
+        capture raises if an override refuses a shape that query admitted.
+        Other backends keep
         their existing metadata and attention breaks. Call on the consumer
         stream, after the scheduler-derived metadata is built and before any
         layer consumes it.
@@ -498,8 +640,12 @@ class AttentionBackend(CachePoolBinding, ABC):
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for one mode's requests: the EXTEND span
-        or the DECODE window."""
+        """Return this layer's authoritative history write slots.
+
+        Index-K uses these before selection, independently of KV offloading.
+        Offloaded latent KV writers use the compute slots returned by
+        prepare_sparse_kv_access instead. This query does not copy KV.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} owns no paged write locations"
         )
@@ -525,6 +671,26 @@ class AttentionBackend(CachePoolBinding, ABC):
             raise ValueError(f"{locations.numel()} write slots for {rows} rows")
         return locations
 
+    def prepare_sparse_kv_access(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Prepare sparse KV offloading and return this layer's compute writes.
+
+        selection contains history row IDs, including masks and duplicates;
+        positions contains token positions. Decode loads history or joins
+        prefetch, then publishes hot reads/writes. Extend reserves projection
+        staging; sparse-prefill iteration later flushes and gathers history.
+        Use the returned slots for KV projection before attention. Layers
+        without offloading return ordinary history writes without copying KV.
+        Wrappers route by layer and preserve the returned tensor.
+        """
+        return self.write_locations(layer, forward_mode)
+
     # ------------------------------------------------------------------
     # PD / speculative side state
     # ------------------------------------------------------------------
@@ -540,14 +706,14 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        """Commit live acceptance after drafted decode/mixed execution or replay.
+        """Commit live acceptance after decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
         lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted

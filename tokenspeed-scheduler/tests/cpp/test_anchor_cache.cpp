@@ -31,23 +31,36 @@ void anchor_done(Scheduler& scheduler, const std::string& id, std::vector<std::i
     event.With(forward::ExtendResult{.request_id = id, .tokens = std::move(tokens)});
     scheduler.Advance(std::move(event));
 }
+static void AckRecovery(Scheduler& scheduler, const ExecutionPlan& plan) {
+    for (const auto& operation : plan.Operations()) {
+        const auto* transfers = std::get_if<CacheOperation>(&operation);
+        if (!transfers) continue;
+        ExecutionEvent completed;
+        if (const auto* stores = std::get_if<SnapshotStoreBatch>(transfers))
+            for (auto id : stores->op_ids) completed.With(cache::SnapshotDone{id});
+        if (const auto* loads = std::get_if<SnapshotRestoreBatch>(transfers))
+            for (auto id : loads->op_ids) completed.With(cache::RestoreDone{id});
+        scheduler.Advance(std::move(completed));
+    }
+}
 TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
     {
         BlockPool device(1, std::vector<std::int32_t>{1});
         BlockPool host(1, std::vector<std::int32_t>{2});
         CacheGroupSpec spec{};
-        spec.kind = AttnKind::kSlidingWindow;
+        spec.attn_kind = AttnKind::kSlidingWindow;
         spec.sliding_window = 4;
         spec.block_granularity = 2;
         spec.cache_blocks_per_lcm_block = 1;
-        auto coordinator = MakeCoordinator(std::span<const CacheGroupSpec>(&spec, 1), 2, device, false, &host, true);
+        auto coordinator = MakeCoordinator(std::span<const CacheGroupSpec>(&spec, 1), 2, device, false, &host,
+                                           /*snapshot_pool=*/nullptr, true);
         const std::vector<std::uint32_t> requested{0, 0};
-        auto allocation = coordinator.AcquireHostBlocks(requested);
+        auto allocation = coordinator.AcquireHostBlocks(requested, std::vector<std::int32_t>(requested.size(), 0));
         ASSERT_TRUE(allocation.blocks.size() == 2 && allocation.blocks[0] && allocation.blocks[1]);
         ASSERT_TRUE(coordinator.ResolveHostBlockId(0, allocation.blocks[0]->Location()) == 1);
         ASSERT_TRUE(coordinator.ResolveHostBlockId(0, allocation.blocks[1]->Location()) == 2);
         ASSERT_TRUE(host.NumEmptyLcmBlocks() == 0);
-        ASSERT_TRUE(!coordinator.AcquireHostBlock(0));
+        ASSERT_TRUE(!coordinator.AcquireHostBlock(0, 0));
         allocation.blocks.clear();
         ASSERT_TRUE(host.NumEmptyLcmBlocks() == 1);
     }
@@ -60,15 +73,15 @@ TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
             spec.block_granularity = 2;
             spec.cache_blocks_per_lcm_block = 1;
         }
-        auto coordinator = MakeCoordinator(specs, 2, device, false, &host, true);
-        auto a = coordinator.AcquireHostBlock(0);
-        auto b = coordinator.AcquireHostBlock(0);
+        auto coordinator = MakeCoordinator(specs, 2, device, false, &host, /*snapshot_pool=*/nullptr, true);
+        auto a = coordinator.AcquireHostBlock(0, 0);
+        auto b = coordinator.AcquireHostBlock(0, 0);
         coordinator.CacheHostBlock(a, CacheKey{.group_id = 0, .content_hash = "a"});
         coordinator.CacheHostBlock(b, CacheKey{.group_id = 0, .content_hash = "b"});
         a.reset();
         b.reset();
         ASSERT_TRUE(coordinator.NumHostCachedBlocks() == 2);
-        auto other = coordinator.AcquireHostBlock(1);
+        auto other = coordinator.AcquireHostBlock(1, 0);
         ASSERT_TRUE(other && coordinator.NumHostCachedBlocks() == 0);
         ASSERT_TRUE(coordinator.ResolveHostBlockId(1, other->Location()) == 1);
     }
@@ -80,17 +93,21 @@ TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
     config.max_batch_size = 1;
     config.disable_l2_cache = true;
     config.enable_l3_storage = false;
-    config.cache_groups.push_back(CacheGroupConfig{.group_id = "history",
-                                                   .block_granularity = 2,
-                                                   .total_pages = 128,
-                                                   .retention = CacheGroupConfig::Retention::FullHistory,
-                                                   .family = CacheGroupFamily::History});
-    config.cache_groups.push_back(CacheGroupConfig{.group_id = "window",
-                                                   .block_granularity = 2,
-                                                   .total_pages = 128,
-                                                   .retention = CacheGroupConfig::Retention::SlidingWindow,
-                                                   .sliding_window_tokens = 4,
-                                                   .family = CacheGroupFamily::History});
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "history",
+        .block_granularity = 2,
+        .total_pages = 128,
+        .attn_kind = AttnKind::kFull,
+    });
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "window",
+        .block_granularity = 2,
+        .total_pages = 128,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 4,
+    });
+    SetTestSnapshotPool(config);
+    config.debug_force_retraction_interval = 6;
     Scheduler scheduler(config);
     RequestSpec spec{};
     spec.request_id = "seed";
@@ -113,12 +130,17 @@ TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
     auto replay = scheduler.NextExecutionPlan();
     ASSERT_TRUE(anchor_forward(replay).extend_prefix_lens[0] == 6 && anchor_forward(replay).input_lengths[0] == 6);
     anchor_done(scheduler, "replay", {42});
-    ExecutionEvent retract;
-    retract.With(forward::Retract{.request_id = "replay"});
-    scheduler.Advance(std::move(retract));
-    auto recovery = scheduler.NextExecutionPlan();
-    ASSERT_TRUE(anchor_forward(recovery).extend_prefix_lens[0] <= 6);
+    auto decode = scheduler.NextExecutionPlan();
     anchor_done(scheduler, "replay", {43});
+    const auto image = scheduler.NextExecutionPlan();
+    ASSERT_EQ(scheduler.RetractedSize(), 1);
+    AckRecovery(scheduler, image);
+    const auto restored = scheduler.NextExecutionPlan();
+    AckRecovery(scheduler, restored);
+    const auto recovery = scheduler.NextExecutionPlan();
+    EXPECT_EQ(anchor_forward(recovery).prefill_lengths.front(), 12);
+    EXPECT_EQ(anchor_forward(recovery).decode_input_ids.front(), 43);
+    anchor_done(scheduler, "replay", {44});
     ExecutionEvent end_replay;
     end_replay.With(forward::Finish{.request_id = "replay"});
     scheduler.Advance(std::move(end_replay));
@@ -139,17 +161,20 @@ TEST(AnchorCache, TieredAnchorPreservesResidentWindowHit) {
     config.max_batch_size = 1;
     config.disable_l2_cache = true;
     config.enable_l3_storage = false;
-    config.cache_groups.push_back(CacheGroupConfig{.group_id = "history",
-                                                   .block_granularity = 2,
-                                                   .total_pages = 128,
-                                                   .retention = CacheGroupConfig::Retention::FullHistory,
-                                                   .family = CacheGroupFamily::History});
-    config.cache_groups.push_back(CacheGroupConfig{.group_id = "window",
-                                                   .block_granularity = 2,
-                                                   .total_pages = 128,
-                                                   .retention = CacheGroupConfig::Retention::SlidingWindow,
-                                                   .sliding_window_tokens = 4,
-                                                   .family = CacheGroupFamily::History});
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "history",
+        .block_granularity = 2,
+        .total_pages = 128,
+        .attn_kind = AttnKind::kFull,
+    });
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "window",
+        .block_granularity = 2,
+        .total_pages = 128,
+        .attn_kind = AttnKind::kSlidingWindow,
+        .sliding_window_tokens = 4,
+    });
+    SetTestSnapshotPool(config);
     Scheduler scheduler(config);
     RequestSpec spec{};
     spec.request_id = "seed";
@@ -187,23 +212,28 @@ TEST(AnchorCache, ProducerNamespaceCrossFloorLifecycle) {
             config.max_batch_size = 1;
             config.disable_l2_cache = !host;
             config.enable_l3_storage = false;
-            config.cache_groups.push_back(CacheGroupConfig{.group_id = "source-history",
-                                                           .block_granularity = 2,
-                                                           .total_pages = 128,
-                                                           .retention = CacheGroupConfig::Retention::FullHistory,
-                                                           .family = CacheGroupFamily::History});
-            config.cache_groups.push_back(CacheGroupConfig{.group_id = "source-window",
-                                                           .block_granularity = 2,
-                                                           .total_pages = 128,
-                                                           .retention = CacheGroupConfig::Retention::SlidingWindow,
-                                                           .sliding_window_tokens = 4,
-                                                           .family = CacheGroupFamily::History});
-            config.cache_groups.push_back(CacheGroupConfig{.group_id = "source-tail",
-                                                           .block_granularity = 2,
-                                                           .total_pages = 128,
-                                                           .retention = CacheGroupConfig::Retention::SlidingWindow,
-                                                           .sliding_window_tokens = 2,
-                                                           .family = CacheGroupFamily::History});
+            config.cache_groups.push_back(CacheGroupConfig{
+                .group_id = "source-history",
+                .block_granularity = 2,
+                .total_pages = 128,
+                .attn_kind = AttnKind::kFull,
+            });
+            config.cache_groups.push_back(CacheGroupConfig{
+                .group_id = "source-window",
+                .block_granularity = 2,
+                .total_pages = 128,
+                .attn_kind = AttnKind::kSlidingWindow,
+                .sliding_window_tokens = 4,
+            });
+            config.cache_groups.push_back(CacheGroupConfig{
+                .group_id = "source-tail",
+                .block_granularity = 2,
+                .total_pages = 128,
+                .attn_kind = AttnKind::kSlidingWindow,
+                .sliding_window_tokens = 2,
+            });
+            SetTestSnapshotPool(config);
+            if (terminal == 2) config.debug_force_retraction_interval = 4;
             Scheduler scheduler(config);
             RequestSpec donor{};
             donor.request_id = "donor";
@@ -234,7 +264,7 @@ TEST(AnchorCache, ProducerNamespaceCrossFloorLifecycle) {
                         for (auto id : loads->op_ids) {
                             ++loaded;
                             ExecutionEvent done;
-                            done.With(cache::LoadBackDone(id, true));
+                            done.With(cache::LoadBackDone{id});
                             scheduler.Advance(std::move(done));
                         }
                     }
@@ -252,12 +282,18 @@ TEST(AnchorCache, ProducerNamespaceCrossFloorLifecycle) {
             ExecutionEvent end;
             if (terminal == 0) end.With(forward::Finish{.request_id = "donor"});
             if (terminal == 1) end.With(forward::Abort{.request_id = "donor"});
-            if (terminal == 2) end.With(forward::Retract{.request_id = "donor"});
             scheduler.Advance(std::move(end));
             if (terminal == 2) {
-                auto recovery = scheduler.NextExecutionPlan();
+                auto decode = scheduler.NextExecutionPlan();
+                acknowledge(decode);
+                anchor_done(scheduler, "donor", {43});
+                const auto image = scheduler.NextExecutionPlan();
+                acknowledge(image);
+                AckRecovery(scheduler, image);
+                const auto recovery = scheduler.NextExecutionPlan();
                 acknowledge(recovery);
-                ASSERT_LE(anchor_forward(recovery).extend_prefix_lens[0], 6);
+                AckRecovery(scheduler, recovery);
+                ASSERT_EQ(scheduler.RequestTokenSize("donor"), 14);
                 ExecutionEvent abort;
                 abort.With(forward::Abort{.request_id = "donor"});
                 scheduler.Advance(std::move(abort));

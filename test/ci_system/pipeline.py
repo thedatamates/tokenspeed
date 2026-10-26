@@ -36,7 +36,17 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 # after startup (a per-batch constexpr) fails the run instead of stalling it.
 SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
 JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
+SUPPORTED_TRIGGERS = {
+    "per-commit",
+    "post-submit",
+    "manual",
+    "nightly",
+    "debug",
+    "slurm",
+}
+# Task triggers each scan trigger selects. `per-commit` tasks run on pull
+# requests and on pushes to main; `post-submit` tasks run only on pushes.
+SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
@@ -51,7 +61,16 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = (
+    "all",
+    "amd",
+    "amd-mi350",
+    "amd-mi450",
+    "nvidia",
+    "nvidia-arm",
+    "nvidia-x86",
+    "npu",
+)
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -85,6 +104,7 @@ AMD_RUNNER_PREFIXES = (
     "amd-mi450-",
     "amd-mi45x-",
 )
+AMD_MI450_RUNNER_PREFIXES = ("amd-mi450-", "amd-mi45x-")
 # A pool whose label names cpu instead of a GPU count holds no accelerator.
 CPU_ONLY_RUNNER_MARKER = "-cpu-"
 NVIDIA_ARM_RUNNER_PREFIXES = (
@@ -108,6 +128,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_npu_runner(runner: str) -> bool:
+    return runner == "tokenspeed-npu-arm64"
+
+
 def is_cpu_only_runner(runner: str) -> bool:
     return CPU_ONLY_RUNNER_MARKER in runner
 
@@ -119,8 +143,18 @@ def is_nvidia_arm_runner(runner: str) -> bool:
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
+    if runner_group == "npu":
+        return is_npu_runner(runner)
+    if is_npu_runner(runner):
+        return False
     if runner_group == "amd":
         return is_amd_runner(runner)
+    if runner_group == "amd-mi450":
+        return runner.startswith(AMD_MI450_RUNNER_PREFIXES)
+    if runner_group == "amd-mi350":
+        return is_amd_runner(runner) and not runner.startswith(
+            AMD_MI450_RUNNER_PREFIXES
+        )
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
     if runner_group == "nvidia-arm":
@@ -399,9 +433,10 @@ def build_matrix(
         raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
+    task_triggers = SCAN_TRIGGER_TASK_TRIGGERS.get(trigger, {trigger})
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
-        if trigger and trigger not in task["triggers"]:
+        if trigger and task_triggers.isdisjoint(task["triggers"]):
             continue
         is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
         if multi_node == "only" and not is_multi_node:
@@ -758,6 +793,9 @@ def setup_runner(
         return local_env, pgm
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
+    if is_npu_runner(runner):
+        # The existing NPU entry owns its deployed environment and host lock.
+        return local_env, pgm
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -1270,15 +1308,19 @@ def check_eval_score_threshold(
     }
 
 
-PERF_CSV_HEADER = (
-    "config,Conc.,Latency (tps/user),Throughput (tps/gpu),"
-    "Approx Cache Hit,Decoded Tok/Iter"
+PERF_THROUGHPUT_METRICS = (
+    "Throughput (tps/gpu)",
+    "Output Throughput (tok/min/gpu)",
 )
-PERF_REFERENCE_METRICS = ("Latency (tps/user)", "Throughput (tps/gpu)")
+PERF_CSV_HEADERS = tuple(
+    f"config,Conc.,Latency (tps/user),{metric},Approx Cache Hit,Decoded Tok/Iter"
+    for metric in PERF_THROUGHPUT_METRICS
+)
 
 
 def extract_perf_summary_rows(output: str) -> List[Dict[str, str]] | None:
-    idx = output.find(PERF_CSV_HEADER)
+    positions = [output.find(header) for header in PERF_CSV_HEADERS]
+    idx = min((position for position in positions if position >= 0), default=-1)
     if idx < 0:
         return None
     block = output[idx:]
@@ -1339,7 +1381,7 @@ def check_perf_reference(
             ) from exc
         if not isinstance(ref_pair, list) or len(ref_pair) != 2:
             raise ValueError(
-                f"perf_reference[{conc_key}] must be [tps_user, tps_gpu]; "
+                f"perf_reference[{conc_key}] must be [tps_user, throughput_per_gpu]; "
                 f"got {ref_pair!r}"
             )
         match = next((r for r in rows if int(r["Conc."]) == conc), None)
@@ -1347,7 +1389,10 @@ def check_perf_reference(
             failures.append(f"conc={conc}: no matching row in perf summary")
             continue
         entry: Dict[str, Any] = {"conc": conc}
-        for metric, ref in zip(PERF_REFERENCE_METRICS, ref_pair):
+        throughput_metric = next(
+            metric for metric in PERF_THROUGHPUT_METRICS if metric in match
+        )
+        for metric, ref in zip(("Latency (tps/user)", throughput_metric), ref_pair):
             ref_v = float(ref)
             actual = float(match[metric])
             floor = ref_v * threshold
@@ -1406,7 +1451,11 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
     lines = [header, rule]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
-        thru = entry.get("Throughput (tps/gpu)") or {}
+        thru = (
+            entry.get("Throughput (tps/gpu)")
+            or entry.get("Output Throughput (tok/min/gpu)")
+            or {}
+        )
         lines.append(
             f"{entry['conc']:>4}  "
             f"{lat.get('actual', 0):>10.2f} "
@@ -1436,7 +1485,11 @@ def format_perf_reference_markdown_table(checks: List[Dict[str, Any]]) -> List[s
     ]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
-        thru = entry.get("Throughput (tps/gpu)") or {}
+        thru = (
+            entry.get("Throughput (tps/gpu)")
+            or entry.get("Output Throughput (tok/min/gpu)")
+            or {}
+        )
         lines.append(
             f"| {entry['conc']} "
             f"| {lat.get('actual', 0):.2f} "
@@ -1822,6 +1875,8 @@ def execute_task(
         )
     declared_runner = runner
     runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
+    if is_npu_runner(runner) and (task["type"] != "ut" or setup_mode != "ci"):
+        raise ValueError("NPU operator tasks require type=ut and --setup-mode=ci")
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -1830,6 +1885,15 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
+    if setup_mode == "ci" and runner.startswith("b200v2-"):
+        # Use the same persistent root as package_cache.sh.
+        cache_root = env.get("CI_CACHE_ROOT") or str(
+            Path(env.get("FLASHINFER_CACHE_DIR") or "/raid/cache/flashinfer").parent
+        )
+        env.setdefault(
+            "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR",
+            os.path.join(cache_root, "tokenspeed", "flashinfer-autotune"),
+        )
     if task["type"] in SERVING_TASK_TYPES:
         # Only the task itself may relax the check; a value inherited from
         # the runner's environment must not.
@@ -2060,7 +2124,7 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         _stop_managed_server()
-        if setup_mode == "ci" and not keep_runner_state:
+        if setup_mode == "ci" and not keep_runner_state and not is_npu_runner(runner):
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)

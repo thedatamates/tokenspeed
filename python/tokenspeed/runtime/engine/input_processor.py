@@ -34,8 +34,13 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
+from tokenspeed.runtime.engine.logprobs import (
+    LogprobServability,
+    resolve_logprob_start_len,
+)
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    prompt_ends_in_reasoning,
+    reasoning_block_markers,
     structural_tag_for_reasoning_json_schema,
 )
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
@@ -56,8 +61,31 @@ class InputProcessor:
 
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
+        # Token ids of the reasoning block's opener and closer, used to tell
+        # whether a prompt ends inside an open block. None when the server
+        # wraps no reasoning or the markers are not single tokens.
+        self._reasoning_marker_ids: tuple[int, int] | None = (
+            self._find_reasoning_marker_ids()
+        )
 
-    def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
+    def _find_reasoning_marker_ids(self) -> tuple[int, int] | None:
+        reasoning_parser = self.engine.server_args.reasoning_parser
+        tokenizer = self.engine.tokenizer
+        if not reasoning_parser or tokenizer is None:
+            return None
+        markers = reasoning_block_markers(reasoning_parser)
+        if markers is None:
+            return None
+        ids = [tokenizer.convert_tokens_to_ids(marker) for marker in markers]
+        if not all(isinstance(i, int) for i in ids):
+            return None
+        if list(tokenizer.convert_ids_to_tokens(ids)) != list(markers):
+            return None
+        return ids[0], ids[1]
+
+    def _maybe_wrap_json_schema_for_reasoning(
+        self, sampling: dict, input_ids: list[int] | None
+    ) -> None:
         # Without this, xgrammar locks onto ``{`` at token 0 and the
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
@@ -69,7 +97,20 @@ class InputProcessor:
             schema = sampling["json_schema"]
             if isinstance(schema, str):
                 schema = json.loads(schema)
-            wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
+            # The reply either continues a reasoning block that the prompt
+            # opened or may open one itself. Without marker ids or prompt
+            # ids, assume the prompt opened it, as before.
+            marker_ids = self._reasoning_marker_ids
+            prompt_opens_reasoning = (
+                marker_ids is None
+                or input_ids is None
+                or prompt_ends_in_reasoning(input_ids, *marker_ids)
+            )
+            wrapped = structural_tag_for_reasoning_json_schema(
+                reasoning_parser,
+                schema,
+                prompt_opens_reasoning=prompt_opens_reasoning,
+            )
         except Exception as exc:
             self.engine.logger.warning(
                 f"reasoning-parser={reasoning_parser!s}: failed to wrap json_schema ("
@@ -108,11 +149,15 @@ class InputProcessor:
         - non-integer pins (bool/float/str) are a caller error and raise on
           EVERY engine shape — checked first, before the mode branches below.
         - engines without attention DP: the pin is meaningless; drop it.
-        - disaggregation engines: the bootstrap_room residue is the
-          authoritative rank carrier on BOTH the prefill and decode sides
-          (pd/mooncake must re-derive the same rank from the room), so the
-          pin is dropped; a conflicting pin is logged, never rejected —
-          rejecting would turn gateway/room version skew into a 400 storm.
+        - prefill engines: the bootstrap_room residue is the authoritative
+          rank carrier (the decode side's pd/mooncake re-derives the prefill
+          rank from the room), so the pin is dropped; a conflicting pin is
+          logged, never rejected — rejecting would turn gateway/room version
+          skew into a 400 storm.
+        - decode engines: an in-range pin is kept and places the request
+          (ts-client's routing), since any decode rank finds the prefill
+          rank from the room; an out-of-range pin is logged and dropped,
+          never rejected, leaving the room residue to place the request.
         - colocated attention-DP engines: an out-of-range pin is a caller
           error and raises (surfacing as a request-level failure).
         """
@@ -135,6 +180,19 @@ class InputProcessor:
             obj.data_parallel_rank = None
             return
         dp_size = mapping.attn.dp_size
+
+        if server_args.disaggregation_mode == "decode":
+            kept = [
+                rank if rank is None or 0 <= rank < dp_size else None
+                for rank in rank_list
+            ]
+            if kept != rank_list:
+                self.engine.logger.warning(
+                    f"data_parallel_rank={ranks!s} is outside [0, {dp_size:d}) on a "
+                    "decode engine; the bootstrap_room places the request — pin ignored.",
+                )
+            obj.data_parallel_rank = kept if isinstance(ranks, list) else kept[0]
+            return
 
         if server_args.disaggregation_mode != "null":
             rooms = obj.bootstrap_room
@@ -177,36 +235,35 @@ class InputProcessor:
                     f"data_parallel_rank must be in [0, {dp_size}), got {rank}"
                 )
 
+    def _logprob_servability(self) -> LogprobServability:
+        return LogprobServability.of(
+            self.engine.server_args,
+            supports_prompt_logprobs=self.engine.supports_prompt_logprobs,
+            vocab_size=self.engine.model_config.vocab_size,
+        )
+
     def _verify_prompt_logprobs_servable(
         self, input_ids: list[int], multimodal_inputs
     ) -> None:
-        """Refuse a request whose prompt logprobs this engine cannot compute.
+        """Refuse, as a 400, a request whose prompt logprobs this engine
+        cannot compute (``LogprobServability.prompt_logprobs_refusal``)."""
+        reason = self._logprob_servability().prompt_logprobs_refusal(
+            input_ids, multimodal_inputs is not None
+        )
+        if reason is not None:
+            raise ValueError(reason)
 
-        Everything the data plane would otherwise trip over is a 400 here:
-        the engine's capability (a model that narrows its prefill rows has no
-        activations for the prompt positions -- ``AsyncLLM.supports_prompt_logprobs``,
-        reported by the scheduler at startup), a multimodal prompt (its media
-        positions carry content-hash ids, not tokens, so they have no logprob)
-        and a client-supplied token id outside the vocabulary (its logprob
-        column does not exist).
-        """
-        if not self.engine.supports_prompt_logprobs:
-            raise ValueError(
-                "logprob_start_len >= 0 (prompt logprobs) is not supported by this "
-                "engine: the model narrows its prefill rows, so it cannot score "
-                "every prompt position. Use logprob_start_len=-1."
-            )
-        if multimodal_inputs is not None:
-            raise ValueError(
-                "logprob_start_len >= 0 (prompt logprobs) is not supported for "
-                "multimodal prompts; use logprob_start_len=-1."
-            )
-        vocab_size = self.engine.model_config.vocab_size
-        if min(input_ids) < 0 or max(input_ids) >= vocab_size:
-            raise ValueError(
-                "prompt logprobs need every prompt token id inside the vocabulary "
-                f"[0, {vocab_size}); input_ids contains one outside it."
-            )
+    def _verify_top_logprobs_servable(
+        self, top_logprobs_num: int, sampling_params: SamplingParams
+    ) -> int:
+        """Refuse a top-k logprob request this engine cannot serve
+        (``LogprobServability.top_logprobs_refusal``); return k."""
+        reason = self._logprob_servability().top_logprobs_refusal(
+            top_logprobs_num, sampling_params.max_new_tokens
+        )
+        if reason is not None:
+            raise ValueError(reason)
+        return top_logprobs_num
 
     async def tokenize_batch(
         self,
@@ -340,7 +397,7 @@ class InputProcessor:
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 
-        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params)
+        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params, input_ids)
 
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)
@@ -374,9 +431,8 @@ class InputProcessor:
             # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
             # the SGLang capability knobs here for parity.
             if obj.top_logprobs_num:
-                raise ValueError(
-                    "top_logprobs_num > 0 (output top-k logprobs) is not supported "
-                    "yet; use top_logprobs_num=0 (the sampled token's logprob)."
+                top_logprobs_num = self._verify_top_logprobs_servable(
+                    obj.top_logprobs_num, sampling_params
                 )
             if obj.token_ids_logprob:
                 raise ValueError("token_ids_logprob is not supported yet.")

@@ -11,7 +11,9 @@ from ci_path_filter import (
 from pipeline import load_yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NVIDIA_GROUPS = tuple(group for group in RUNNER_GROUPS if group != "amd")
+NVIDIA_GROUPS = tuple(
+    group for group in RUNNER_GROUPS if group not in ("amd-mi350", "amd-mi450")
+)
 KERNEL = "tokenspeed-kernel/python/tokenspeed_kernel"
 
 
@@ -58,9 +60,10 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         f"{KERNEL}/ops/attention/mha/__init__.py",
         f"{KERNEL}/ops/attention/mha/triton.py",
         f"{KERNEL}/ops/attention/mha/_triton/decode.py",
-        f"{KERNEL}/ops/gemm/triton_gemv.py",
+        f"{KERNEL}/ops/gemm/triton.py",
         f"{KERNEL}/thirdparty/__init__.py",
         "python/tokenspeed/runtime/sampling/backends/flashinfer.py",
+        "tokenspeed-engine/crates/ts-control/src/event_loop.rs",
     ],
 )
 def test_shared_paths_require_every_group(path):
@@ -79,13 +82,13 @@ def test_shared_paths_require_every_group(path):
         "test/ci_system/install_deps_rocm.sh",
         f"{KERNEL}/ops/attention/mha/gluon.py",
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
-        f"{KERNEL}/ops/moe/gluon/mxfp4.py",
+        f"{KERNEL}/ops/moe/gluon.py",
         f"{KERNEL}/ops/communication/iris.py",
     ],
 )
 def test_amd_owned_paths_require_only_amd(path):
     assert path_vendor(path, REPO_ROOT) == "amd"
-    assert required_groups(path) == {"amd"}
+    assert required_groups(path) == {"amd-mi350", "amd-mi450"}
 
 
 @pytest.mark.parametrize(
@@ -98,10 +101,12 @@ def test_amd_owned_paths_require_only_amd(path):
         "test/ci_system/flashinfer_jit_cache_installer.py",
         f"{KERNEL}/ops/attention/mha/cuda.py",
         f"{KERNEL}/ops/attention/mha/flashinfer.py",
+        f"{KERNEL}/ops/attention/qsa/flashinfer_prims.py",
+        f"{KERNEL}/thirdparty/flashinfer/qsa_prims.py",
         f"{KERNEL}/ops/attention/rmha/_cute_dsl/rel_decode.py",
         f"{KERNEL}/ops/attention/gdn/_flashinfer/adapter.py",
-        f"{KERNEL}/ops/moe/deep_gemm/_triton/mega_moe_stage.py",
-        f"{KERNEL}/ops/moe/flashinfer/trtllm_mxfp4.py",
+        f"{KERNEL}/ops/moe/_deep_gemm/mega_moe_stage.py",
+        f"{KERNEL}/ops/moe/flashinfer.py",
         f"{KERNEL}/ops/communication/_cuda/a2a_fp8.cuh",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.py",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.cu",
@@ -119,6 +124,9 @@ def test_nvidia_owned_paths_require_only_nvidia_groups(path):
     [
         f"{KERNEL}/ops/layernorm/ascend.py",
         "test/ci_system/install_triton_ascend.sh",
+        "test/ci_system/npu/changes.py",
+        "test/ci/npu/manifest.json",
+        "test/ci/npu/tests/scatter-test.py",
     ],
 )
 def test_npu_owned_paths_require_no_gpu_group(path):
@@ -161,12 +169,19 @@ def test_deleted_kernel_solution_file_keeps_its_vendor(tmp_path):
 @pytest.mark.parametrize(
     ("labels", "expected"),
     [
-        (["amd-mi35x-1gpu-test", "amd-mi355-1gpu-bench"], {"amd"}),
+        (["amd-mi35x-1gpu-test", "amd-mi355-1gpu-bench"], {"amd-mi350"}),
+        (["amd-mi450-1gpu", "amd-mi45x-cpu-test"], {"amd-mi450"}),
+        (["tokenspeed-npu-arm64"], set()),
+        (["tokenspeed-npu-arm64", "b200-1gpu"], {"nvidia-x86"}),
+        (
+            ["tokenspeed-npu-arm64", "amd-mi35x-1gpu-test", "amd-mi450-1gpu"],
+            {"amd-mi350", "amd-mi450"},
+        ),
         (["b200-4gpu", "h100-1gpu"], {"nvidia-x86"}),
         (["gb200-4gpu"], {"nvidia-arm"}),
         (["slurm-gb200-4gpu"], {"nvidia-gb200-slurm"}),
         (["slurm-gb300-4gpu"], {"nvidia-gb300-slurm"}),
-        (["b200-1gpu", "amd-mi35x-1gpu-test"], {"nvidia-x86", "amd"}),
+        (["b200-1gpu", "amd-mi35x-1gpu-test"], {"nvidia-x86", "amd-mi350"}),
     ],
 )
 def test_task_yaml_requires_groups_of_its_runner_labels(tmp_path, labels, expected):
@@ -181,7 +196,9 @@ def test_task_yaml_requires_groups_of_its_runner_labels(tmp_path, labels, expect
 
 
 def test_existing_task_yaml_requires_only_its_runner_groups():
-    assert required_groups("test/ci/perf/kernel-benchmark-amd-gfx950.yaml") == {"amd"}
+    assert required_groups("test/ci/perf/kernel-benchmark-amd-gfx950.yaml") == {
+        "amd-mi350"
+    }
 
 
 @pytest.mark.parametrize(
@@ -257,9 +274,23 @@ def test_unrelated_paths_run_nothing():
         assert not should_run({"assets/logo.png"}, group, "pull_request", REPO_ROOT)
 
 
-@pytest.mark.parametrize("runner_group", RUNNER_GROUPS)
-def test_workflow_classifies_the_checkout_after_installing_pyyaml(runner_group):
-    workflow = load_yaml(REPO_ROOT / VENDOR_WORKFLOWS[runner_group])
+VENDOR_WORKFLOW_CASES = [
+    (group, workflow)
+    for group, workflows in VENDOR_WORKFLOWS.items()
+    for workflow in workflows
+]
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_yaml_requires_only_its_runner_group(runner_group, workflow_path):
+    assert required_groups(workflow_path) == {runner_group}
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_classifies_the_checkout_after_installing_pyyaml(
+    runner_group, workflow_path
+):
+    workflow = load_yaml(REPO_ROOT / workflow_path)
     steps = next(
         job["steps"]
         for job in workflow["jobs"].values()

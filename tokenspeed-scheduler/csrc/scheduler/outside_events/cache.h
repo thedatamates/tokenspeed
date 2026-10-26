@@ -29,18 +29,25 @@ struct WriteBackDone {
     std::uint32_t op_id{};
 };
 
+// A prefix load-back landed: every row was copied. Its destinations were
+// published at admission (Host-warm hits); the ACK drops the op's pins.
 struct LoadBackDone {
-    std::uint32_t op_id;
-    // False when L3 prefetch did not fill the Host sources. CompleteLoadBack
-    // must not CacheHostBlock empty pages. Both fields are constructor
-    // arguments so a caller cannot ACK an op_id and silently publish.
-    bool success;
+    std::uint32_t op_id{};
+};
 
-    LoadBackDone() = delete;
-    LoadBackDone(std::uint32_t op_id, bool success) : op_id(op_id), success(success) {}
+// A retraction image's tail leg (SnapshotStoreOperation) completed its D2H
+// copies and the slot-state export.
+struct SnapshotDone {
+    std::uint32_t op_id{};
+};
+
+// A SnapshotRestoreOperation completed every H2D row and the slot-state
+// import: the restored request is schedulable again.
+struct RestoreDone {
+    std::uint32_t op_id{};
 };
 
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone>;
 }  // namespace tokenspeed

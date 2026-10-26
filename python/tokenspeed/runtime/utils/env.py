@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
@@ -55,6 +56,7 @@ global_server_args_dict: dict = {
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
     "disable_pdl": ServerArgs.disable_pdl,
+    "disable_autotune": ServerArgs.disable_autotune,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
@@ -86,6 +88,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
@@ -115,6 +118,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "speculative_algorithm": server_args.speculative_algorithm,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
+            "disable_autotune": server_args.disable_autotune,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
@@ -260,7 +264,6 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
-
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
@@ -268,6 +271,8 @@ class Envs:
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
+    TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     # torch.cuda sync-debug mode armed once serving starts (after capture and
     # tuning, which synchronize legitimately): "warn" reports every host
@@ -286,12 +291,28 @@ class Envs:
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
-    # Shared-expert parallelism. Keep raw strings so every rank can agree
-    # before strict validation; EnvInt would silently default malformed input.
-    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
+    # Shared-expert parallelism.
+    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvInt(1)
+    # Independent projection groups retain attention's local token ownership.
+    TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE = EnvInt(1)
+    TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
+    # Seconds a blocking node of rank >= 1 gives its schedulers to exit on
+    # SIGTERM before it kills them, when it is stopped.
+    TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT = EnvFloat(10.0)
+    # The ts-host binary each engine rank runs; by default the one installed
+    # with the tokenspeed-engine wheel (``tokenspeed_engine.host_binary()``).
+    TOKENSPEED_HOST_BINARY = EnvStr(None)
+    # The Mooncake library the Rust host's PD peer loads
+    # (libtokenspeed_transfer_engine.so); by default the one installed with
+    # the tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_LIBRARY = EnvStr(None)
+    # The Mooncake store library the Rust host's L3 executor loads
+    # (libmooncake_store.so); by default the one installed with the
+    # tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_STORE_LIBRARY = EnvStr(None)
 
     # Mooncake
     TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH = EnvStr(None)

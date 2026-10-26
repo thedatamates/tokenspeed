@@ -41,7 +41,6 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: 
     MambaForwardMetadata,
 )
 from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (  # noqa: E402
-    _checkpoint_slot_batch,
     _clone_metadata,
     prepare_capacity_prefill_metadata,
 )
@@ -76,78 +75,67 @@ def test_metadata_snapshot_does_not_alias():
     )
 
 
-@pytest.mark.parametrize("count", [0, 1, 2])
-def test_checkpoint_slots_keep_shape_and_mask_inactive_requests(count):
-    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-        _build_prefill_checkpoint_batch,
-    )
-
-    source = metadata("cpu", 1)
-    lengths = torch.tensor([868, 869])
-    prefixes = torch.tensor([50304, 50304])
-    source.extend_seq_lens_cpu = lengths
-    source.cu_extend_seq_lens_cpu = torch.cat(
-        (torch.zeros(1, dtype=torch.int64), lengths.cumsum(0))
-    )
-    source.prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
-        lengths, prefixes, count, 128, "cpu"
-    )
-    fixed = _checkpoint_slot_batch(source, 2048, 254, 2)
-    assert fixed.rows.tolist() == [0, 1]
-    assert fixed.tail_seq_lens_cpu.tolist() == [
-        [100, 101][row] if row < count else 1 for row in range(2)
-    ]
-    assert fixed.state_update_rows.tolist() == [
-        row if row < count else -1 for row in range(2)
-    ]
-    assert fixed.body_token_indices.shape == (2048,)
-    assert fixed.tail_token_indices.shape == (254,)
-    body = fixed.body_token_indices[fixed.body_token_indices >= 0]
-    tail = fixed.tail_token_indices[fixed.tail_token_indices >= 0]
-    torch.testing.assert_close(
-        torch.cat((body, tail)).sort().values, torch.arange(1737)
-    )
-    assert not fixed.use_token_views
-    sources = fixed.output_sources
-    packed_destinations = torch.cat(
-        (fixed.body_token_indices, fixed.tail_token_indices)
-    )
-    torch.testing.assert_close(packed_destinations[sources[:1737]], torch.arange(1737))
-    assert torch.all(sources[1737:] == -1)
-    assert (
-        source.prefill_checkpoint_batch is None
-        if count == 0
-        else source.prefill_checkpoint_batch.rows.numel() == count
+def _live_metadata(lengths, device):
+    lengths = torch.tensor(lengths)
+    host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    bounds = host.to(device=device, dtype=torch.int32)
+    return MambaForwardMetadata(
+        query_start_loc=bounds,
+        scan_query_start_loc=bounds.long(),
+        query_start_loc_int64=bounds.long(),
+        extend_seq_lens_cpu=lengths,
+        cu_extend_seq_lens_cpu=host,
+        state_in_blocks_by_group={
+            "state": torch.zeros(len(lengths), dtype=torch.int32, device=device)
+        },
+        state_out_blocks_by_group={
+            "state": torch.arange(1, len(lengths) + 1, dtype=torch.int32, device=device)
+        },
     )
 
 
-@pytest.mark.parametrize("count", [0, 1, 3])
-def test_checkpoint_slots_pad_requests_without_source_tokens_or_state_updates(count):
-    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-        _build_prefill_checkpoint_batch,
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("live", [1, 2, 3])
+def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
+    """A retained shape keeps its request capacity: every unused slot scans one
+    row past the live tokens and writes no block, while convolution gives it
+    no work at all."""
+    lengths = [129, 130, 131][:live]
+    retained = prepare_capacity_prefill_metadata(
+        _live_metadata([100] * 4, "cuda"), 512, None
     )
+    source = _live_metadata(lengths, "cuda")
+    assert prepare_capacity_prefill_metadata(source, 512, retained) is retained
+    total = sum(lengths)
+    padding = 4 - live
+    host = source.cu_extend_seq_lens_cpu.tolist()
+    expected_scan = host + [total + 1 + i for i in range(padding)]
+    assert retained.scan_query_start_loc.tolist() == expected_scan
+    assert retained.query_start_loc_int64.tolist() == expected_scan
+    assert retained.cu_extend_seq_lens_cpu.tolist() == expected_scan
+    assert retained.query_start_loc.tolist() == host + [total] * padding
+    assert retained.extend_seq_lens_cpu.tolist() == lengths + [1] * padding
+    assert retained.state_out_blocks_by_group["state"].tolist() == (
+        list(range(1, live + 1)) + [-1] * padding
+    )
+    assert retained.prefill_token_extent == 512
+    with pytest.raises(ValueError, match="exceed the captured capacity"):
+        prepare_capacity_prefill_metadata(_live_metadata([510], "cuda"), 512, retained)
 
-    source = metadata("cpu", 1)
-    lengths = torch.tensor([129, 130, 131])
-    source.extend_seq_lens_cpu = lengths
-    source.cu_extend_seq_lens_cpu = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
-    source.prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
-        lengths, lengths.new_zeros(3), count, 128, "cpu"
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_capacity_scrub_zeroes_rows_past_the_live_total():
+    """The padded rows are zeroed by a device-side bound, never a Python int
+    the capture would freeze."""
+    retained = prepare_capacity_prefill_metadata(
+        _live_metadata([2, 2, 2], "cuda"), 8, None
     )
-    fixed = _checkpoint_slot_batch(source, 512, 508, 4)
-    assert fixed.body_seq_lens_cpu[-1] == fixed.tail_seq_lens_cpu[-1] == 1
-    assert fixed.state_update_rows.tolist() == [
-        row if row < count else -1 for row in range(4)
-    ]
-    for mapping, bounds in [
-        (fixed.body_token_indices, fixed.body_cu_seqlens_cpu),
-        (fixed.tail_token_indices, fixed.tail_cu_seqlens_cpu),
-    ]:
-        assert mapping[bounds[-2] : bounds[-1]].tolist() == [-1]
-    packed = torch.cat((fixed.body_token_indices, fixed.tail_token_indices))
-    assert packed[fixed.output_sources[:390]].tolist() == list(range(390))
-    assert torch.all(fixed.output_sources[390:] == -1)
-    assert source.extend_seq_lens_cpu.tolist() == [129, 130, 131]
+    prepare_capacity_prefill_metadata(_live_metadata([3, 2], "cuda"), 8, retained)
+    rows = torch.ones(8, 4, device="cuda")
+    extra = torch.ones(8, device="cuda")
+    retained.scrub_padding(rows, None, extra)
+    assert rows[:5].eq(1).all() and rows[5:].eq(0).all()
+    assert extra[:5].eq(1).all() and extra[5:].eq(0).all()
 
 
 def test_hybrid_initializes_prefill_graph_state_on_both_children():
@@ -193,7 +181,6 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     leaf = object.__new__(Leaf)
     configure_prefill(leaf)
     leaf.cache_pool = object()
-    leaf._prefix_granularity = 128
     leaf.forward_metadata = metadata("cuda", 1)
     full = object.__new__(Leaf)
     full.forward_metadata = None
@@ -270,7 +257,6 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
     backend.cache_pool = object()
-    backend._prefix_granularity = 128
     original = metadata("cuda", 1)
     backend.forward_metadata = original
     backend.prepare_prefill_metadata(8, 1, ForwardMode.EXTEND, capture=False)
@@ -283,11 +269,12 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
     retained = backend.forward_metadata
     assert isinstance(retained, type(eager))
     assert retained.capacity == eager.capacity
-    for name in ("body_token_indices", "tail_token_indices", "output_token_sources"):
-        torch.testing.assert_close(
-            getattr(retained.prefill_checkpoint_batch, name),
-            getattr(eager.prefill_checkpoint_batch, name),
-        )
+    for name in (
+        "scan_query_start_loc",
+        "query_start_loc_int64",
+        "cu_extend_seq_lens_cpu",
+    ):
+        torch.testing.assert_close(getattr(retained, name), getattr(eager, name))
     for bucket in (8, 16, 32, 8):
         backend.forward_metadata = metadata("cuda", 2)
         backend.prepare_prefill_metadata(bucket, 1, ForwardMode.EXTEND, capture=False)
@@ -300,9 +287,7 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
-    from dataclasses import fields, replace
-
+def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
@@ -314,28 +299,29 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         ForwardMode,
     )
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
-    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
-    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-        _build_prefill_checkpoint_batch,
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
     )
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 
     if not cutedsl_kda_supported():
         pytest.skip("native CuteDSL KDA requires NVIDIA SM100 or SM103")
     torch.manual_seed(42)
-    # Eight BF16 beta heads keep eager tail views 16-byte aligned even when
-    # the body has one token, as required by the native scan ABI.
     bucket, heads, dim = 2048, 8, 128
     channels = heads * dim
     conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
     states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
     initial_conv, initial_states = conv.clone(), states.clone()
-    raw = torch.randn(bucket, 3 * channels, device="cuda", dtype=torch.bfloat16)
+    # The live input of the captured projection: merged rows [q|k|v|g|f_a|b],
+    # padded to the 128-row grid.
+    projection = torch.randn(
+        bucket, 4 * channels + 2 * dim, device="cuda", dtype=torch.bfloat16
+    )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
-        _prefix_granularity=128,
         kda_backend="cutedsl_kda",
         kda_recurrent_layout="v_major",
     )
@@ -344,11 +330,6 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
         states,
-    )
-    backend._layer_prefill_checkpoint_blocks = lambda layer_id: (
-        backend.forward_metadata.state_checkpoint_blocks_by_group["state"]
-        if backend.forward_metadata.state_checkpoint_blocks_by_group is not None
-        else None
     )
     kwargs = dict(
         conv_weights=torch.randn(3 * channels, 4, device="cuda", dtype=torch.bfloat16)
@@ -360,28 +341,43 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         attention_tp_size=1,
         head_k_dim=dim,
         head_v_dim=dim,
-        g_raw=torch.randn(bucket, channels, device="cuda", dtype=torch.bfloat16),
-        beta_raw=torch.randn(bucket, heads, device="cuda", dtype=torch.bfloat16),
+        f_b_weight=torch.randn(channels, dim, device="cuda", dtype=torch.bfloat16)
+        * 0.1,
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.zeros(channels, device="cuda"),
         lower_bound=-5.0,
         layer_id=0,
         seq_len=bucket,
     )
+    # Layer 1 would be full attention; this forward has only the KDA layer 0.
+    full = object.__new__(KdaAttnBackend)
+    full.forward_metadata = None
+    full.device = torch.device("cuda")
+    hybrid = HybridLinearAttnBackend(full, backend, [1])
 
-    def forward():
-        return backend.forward_extend(
+    def forward(compact):
+        # As in the model: the captured projection writes fresh rows (the
+        # capacity scrub zeroes padded rows in place), the attention gets
+        # sibling views of them and the output gate is read after it.
+        # ``compact`` is the q|k|v copy the model used to make.
+        rows = projection.clone()
+        mixed_qkv = rows[:, : 3 * channels]
+        core = hybrid.forward(
             None,
             None,
             None,
             None,
             None,
-            backend.forward_metadata.extend_seq_lens_cpu.numel(),
             ForwardMode.EXTEND,
-            save_kv_cache=True,
-            mixed_qkv=raw.clone(),
+            backend.forward_metadata.extend_seq_lens_cpu.numel(),
+            True,
+            None,
+            mixed_qkv=mixed_qkv.contiguous() if compact else mixed_qkv,
+            f_a_out=rows[:, 4 * channels : 4 * channels + dim],
+            beta_raw=rows[:, 4 * channels + dim : 4 * channels + dim + heads],
             **kwargs,
         )
+        return core.flatten(1) * rows[: core.shape[0], 3 * channels : 4 * channels]
 
     def reset():
         conv.copy_(initial_conv)
@@ -391,15 +387,6 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         lengths = torch.tensor(lengths)
         host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
         bounds = host.to(device="cuda", dtype=torch.int32)
-        checkpoint = _build_prefill_checkpoint_batch(
-            lengths, torch.tensor(prefixes), lengths.numel(), 128, "cuda"
-        )
-        if checkpoint is not None:
-            checkpoint = replace(
-                checkpoint,
-                body_query_start_loc=checkpoint.body_query_start_loc.long(),
-                tail_query_start_loc=checkpoint.tail_query_start_loc.long(),
-            )
         pages = (
             torch.arange(lengths.numel(), device="cuda", dtype=torch.int32) + page_shift
         )
@@ -417,45 +404,35 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
                 )
             },
             state_out_blocks_by_group={"state": pages},
-            state_checkpoint_blocks_by_group=(
-                {"state": pages + 4} if checkpoint is not None else None
-            ),
-            prefill_checkpoint_batch=checkpoint,
             conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
                 bounds, lengths, CAUSAL_CONV1D_BLOCK_M
             ),
         )
 
     cases = []
-    # Reuse ONE capture across changing checkpoint counts, rows, and lengths.
-    for checkpoint_count in range(batch_size + 1):
+    # Reuse ONE capture across changing resumed-row counts, rows, and lengths;
+    # prefix hits end at arbitrary tokens.
+    for resumed in range(batch_size + 1):
         for tail_lengths, prefix in [([837, 325, 197, 197], 0), ([70] * 4, 127)]:
-            lengths = tail_lengths[:checkpoint_count] + [128] * (
-                batch_size - checkpoint_count
-            )
-            prefixes = [prefix] * checkpoint_count + [0] * (
-                batch_size - checkpoint_count
-            )
+            lengths = tail_lengths[:resumed] + [128] * (batch_size - resumed)
+            prefixes = [prefix] * resumed + [0] * (batch_size - resumed)
             cases.extend([(lengths, prefixes), (lengths[::-1], prefixes[::-1])])
         cases.append(
-            (
-                [128] * batch_size,
-                [127] * checkpoint_count + [0] * (batch_size - checkpoint_count),
-            )
+            ([128] * batch_size, [127] * resumed + [0] * (batch_size - resumed))
         )
     if batch_size == 1:
-        cases.extend([([837], [50304]), ([769], [0]), ([1023], [128])])
+        cases.extend([([837], [50303]), ([769], [0]), ([1023], [129])])
     if batch_size == 2:
-        cases.extend([([868, 869], [50304, 50304]), ([869, 868], [50304, 50304])])
+        cases.extend([([868, 869], [50303, 50303]), ([869, 868], [50303, 50303])])
     if batch_size == 4:
         # Reuse BS4 storage across full -> padded -> full transitions. Compare
         # every state block, including the null page and the previous fourth row.
         for actual_bs in (3, 1, 2, 3):
             cases.extend(
                 [
-                    ([64 + i for i in range(actual_bs)], [50304] * actual_bs),
+                    ([64 + i for i in range(actual_bs)], [50303] * actual_bs),
                     ([128] * actual_bs, [0] * actual_bs),
-                    ([837] + [128] * (actual_bs - 1), [50304] * actual_bs),
+                    ([837] + [128] * (actual_bs - 1), [50303] * actual_bs),
                 ]
             )
         cases.append(([2045, 1, 1], [0, 0, 0]))
@@ -479,8 +456,8 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids
     owner._land_input_embeds = lambda *args: None
-    owner.attn_backend = backend
-    owner._run_inner = lambda bucket: (forward(), None)
+    owner.attn_backend = hybrid
+    owner._run_inner = lambda bucket: (forward(compact=False), None)
 
     def dummy(bucket, bs):
         backend.forward_metadata = live_metadata([bucket // bs] * bs, [0] * bs, 2)
@@ -496,48 +473,79 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
     assert capture.num_segments == 1
-    fixed = backend._prefill_metadata[bucket, batch_size].prefill_checkpoint_batch
-    addresses = {
-        field.name: getattr(fixed, field.name).data_ptr()
-        for field in fields(fixed)
-        if isinstance(getattr(fixed, field.name), torch.Tensor)
+    # The ordinary capture: projection graph, eager attention break, gate graph.
+    ordinary, ordinary_captured = owner._captures[bucket, None]
+    ordinary_output = ordinary_captured.hidden_states
+    assert ordinary.num_segments == 3
+    # Compared bytewise below; same dtypes make same-shape byte views.
+    assert output.dtype == ordinary_output.dtype == torch.bfloat16
+    fixed = backend._prefill_metadata[bucket, batch_size]
+    retained = {
+        "query_start_loc": fixed.query_start_loc,
+        "scan_query_start_loc": fixed.scan_query_start_loc,
+        "query_start_loc_int64": fixed.query_start_loc_int64,
+        "state_in": fixed.state_in_blocks_by_group["state"],
+        "state_out": fixed.state_out_blocks_by_group["state"],
     }
+    addresses = {name: tensor.data_ptr() for name, tensor in retained.items()}
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
     )
     for index, (lengths, prefixes) in enumerate(cases * 2):
+        # New live input rows for every forward.
+        projection.normal_()
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
         reset()
-        expected = forward()[: sum(lengths)].clone()
+        expected = forward(compact=True)[: sum(lengths)].clone()
+        assert expected.dtype == torch.bfloat16
         expected_conv, expected_states = conv.clone(), states.clone()
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
         backend.forward_metadata = prepare_capacity_prefill_metadata(
-            source, bucket, 128, None
+            source, bucket, None
         )
         reset()
-        fresh_eager = forward()[: sum(lengths)].clone()
-        torch.testing.assert_close(fresh_eager, expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        fresh_eager = forward(compact=False)[: sum(lengths)].clone()
+        assert torch.equal(fresh_eager.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
+        # The ordinary capture hands the eager break views of the projection
+        # its graph just wrote, on that transient metadata (an uncaptured
+        # request count) or on the plain one (forwards the capacity layout
+        # does not admit, such as MIXED batches).
+        for metadata in (backend.forward_metadata, source):
+            backend.forward_metadata = metadata
+            reset()
+            ordinary.replay(valid_rows=sum(lengths))
+            assert torch.equal(
+                ordinary_output[: sum(lengths)].view(torch.uint8),
+                expected.view(torch.uint8),
+            )
+            assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+            assert torch.equal(
+                states.view(torch.uint8), expected_states.view(torch.uint8)
+            )
+            assert torch.count_nonzero(ordinary_output[sum(lengths) :]) == 0
         backend.forward_metadata = source
         backend.prepare_prefill_metadata(
             bucket, batch_size, ctx.forward_mode, capture=False
         )
         reset()
-        eager = forward()[: sum(lengths)].clone()
-        torch.testing.assert_close(eager, expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        eager = forward(compact=False)[: sum(lengths)].clone()
+        assert torch.equal(eager.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
         reset()
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
-            name: getattr(fixed, name).data_ptr() for name in addresses
+            name: tensor.data_ptr() for name, tensor in retained.items()
         }
-        torch.testing.assert_close(output[: sum(lengths)], expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        assert torch.equal(
+            output[: sum(lengths)].view(torch.uint8), expected.view(torch.uint8)
+        )
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
 
 

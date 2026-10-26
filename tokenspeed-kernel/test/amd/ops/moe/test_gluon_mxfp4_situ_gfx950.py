@@ -25,10 +25,8 @@ from unittest import mock
 
 import pytest
 import torch
-from kimi3_reference import (
-    dequantize_mxfp4,
-    mxfp4_moe_reference,
-)
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from utils import is_cdna4, make_mxfp4_moe_weights, make_round_robin_topk
 
 if not is_cdna4():
@@ -37,12 +35,34 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
+    routed_input_scale_rmsnorm_sum_gathered,
+)
 from tokenspeed_kernel.selection import kernel_override  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (  # noqa: E402
     _compact_mxfp4_scale_tile,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (  # noqa: E402
+    gluon_moe_sorting,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (  # noqa: E402
+    invoke_gluon_mxfp4_moe_stage2_1x2,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.preprocess import (  # noqa: E402
+    _make_gdot128_scale_alias,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (  # noqa: E402
+    gluon_local_route_map,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (  # noqa: E402
+    swizzle_cdna4_mxfp4_scale,
+)
+
+# noqa: E402
 
 _A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
 
@@ -99,7 +119,7 @@ def test_compact_scale_tile_rejects_partial_upcast_groups() -> None:
 
 def _a8w4_ep_plan(intermediate_size: int) -> dict:
     with kernel_override("moe", "apply", _A8W4_EP_APPLY):
-        return tokenspeed_kernel.moe_plan(
+        return kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -114,6 +134,7 @@ def _a8w4_ep_plan(intermediate_size: int) -> dict:
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
 
 
@@ -152,7 +173,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+    import tokenspeed_kernel.ops.moe.gluon as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     num_local_experts = 2
@@ -222,7 +243,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     )
     plan = _a8w4_ep_plan(intermediate_size)
     assert plan["apply_kernel_name"] == _A8W4_EP_APPLY
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     decode_calls = []
     decode = gluon_mxfp4.gluon_a16w4_situ_warp_decode_ep_gfx950
 
@@ -241,7 +262,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
         device=hidden_states.device,
     )
     module._situ_output_buffer = output_storage[:, :latent_size]
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -257,7 +278,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     local_weights = torch.where(
         local_mask, topk_weights, torch.zeros_like(topk_weights)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -282,7 +303,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
 def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+    import tokenspeed_kernel.ops.moe.gluon as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260903)
     num_tokens, top_k = 1, 1
@@ -311,7 +332,7 @@ def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
     plan = _a8w4_ep_plan(intermediate_size)
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
 
     def reject_a16(*_args, **_kwargs):
         raise AssertionError("unsupported hidden width must use the A8 fallback")
@@ -321,7 +342,7 @@ def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
         "gluon_a16w4_situ_warp_decode_ep_gfx950",
         reject_a16,
     )
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -329,7 +350,7 @@ def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -383,7 +404,7 @@ def test_gdot_decode_accepts_padded_w2_scale_gfx950() -> None:
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -410,7 +431,7 @@ def test_ep_idle_forward_returns_empty_output_gfx950() -> None:
     module._situ_output_buffer = output
 
     plan = _a8w4_ep_plan(3072)
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -450,7 +471,7 @@ def test_ep_unclipped_situ_uses_a16_fallback_gfx950() -> None:
     )
     topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32, device="cuda")
     topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32, device="cuda")
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -465,11 +486,12 @@ def test_ep_unclipped_situ_uses_a16_fallback_gfx950() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
 
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     assert hasattr(module, "w13_weight")
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -477,7 +499,7 @@ def test_ep_unclipped_situ_uses_a16_fallback_gfx950() -> None:
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -519,7 +541,7 @@ def test_ep_decode_all_remote_routes_return_zero_gfx950(
     topk_weights = torch.full(
         (num_tokens, 16), 1.0 / 16, dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -534,9 +556,10 @@ def test_ep_decode_all_remote_routes_return_zero_gfx950(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, module)
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -576,7 +599,7 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
     router_logits = torch.zeros(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -589,9 +612,10 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, module)
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -599,7 +623,7 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -668,7 +692,7 @@ def test_grouped_atomic_combine_matches_partial_reduction_gfx950(
     )
     atomic = run()
 
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -718,10 +742,12 @@ def _make_local_ep_module(
     return module
 
 
-def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
+@pytest.mark.parametrize("num_tokens", [33, 65])
+def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950(
+    num_tokens: int,
+) -> None:
     """The larger-M fallback consumes global IDs without torch localization."""
     generator = torch.Generator(device="cuda").manual_seed(20260723)
-    num_tokens = 33
     num_experts = 8
     ep_size = 8
     ep_rank = 3
@@ -755,7 +781,7 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         num_experts,
         top_k,
     )
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -770,9 +796,10 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, module)
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -794,7 +821,7 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         module.w13_weight,
         module.w13_weight_scale,
@@ -839,7 +866,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     router_logits = torch.zeros(
         num_tokens, num_experts, device="cuda", dtype=torch.float32
     )
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -854,6 +881,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
 
     partials = []
@@ -864,9 +892,9 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
             ep_size=ep_size,
             top_k=top_k,
         )
-        tokenspeed_kernel.moe_process_weights(plan, module)
+        kernel_moe_process_weights(plan, module)
         partials.append(
-            tokenspeed_kernel.moe_apply(
+            kernel_moe_apply(
                 plan,
                 hidden_states,
                 module,
@@ -877,7 +905,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         )
     actual = torch.stack([partial.float() for partial in partials]).sum(0)
     actual = actual.to(torch.bfloat16)
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -898,7 +926,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as mxfp4_module
+    import tokenspeed_kernel.ops.moe.gluon as mxfp4_module
 
     grouped = mxfp4_module.gluon_a16w4_situ_grouped_ep_gfx950
     grouped_calls = 0
@@ -937,7 +965,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     )
     topk_weights, topk_ids = make_round_robin_topk(num_tokens, 8, top_k)
     router_logits = torch.zeros((num_tokens, 8), dtype=torch.float32, device="cuda")
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -952,9 +980,10 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    expected = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, module)
+    expected = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -967,7 +996,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     module._situ_output_buffer = output
 
     def apply() -> torch.Tensor:
-        result = tokenspeed_kernel.moe_apply(
+        result = kernel_moe_apply(
             plan,
             hidden_states,
             module,
@@ -1034,7 +1063,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
     router_logits = torch.zeros(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -1049,10 +1078,11 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, module)
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -1060,7 +1090,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1078,7 +1108,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         output = torch.empty_like(actual)
         module._situ_output_buffer = output
 
-        buffered = tokenspeed_kernel.moe_apply(
+        buffered = kernel_moe_apply(
             plan,
             hidden_states,
             module,
@@ -1091,7 +1121,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = tokenspeed_kernel.moe_apply(
+            captured = kernel_moe_apply(
                 plan,
                 hidden_states,
                 module,
@@ -1105,7 +1135,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "num_experts", "top_k", "block_m", "compact_route_programs"),
+    ("num_tokens", "num_experts", "top_k", "block_m", "use_minimum_route_chunks"),
     [
         (257, 17, 4, 64, False),
         (4097, 3, 1, 64, False),
@@ -1120,7 +1150,7 @@ def test_route_sort_contract_gfx950(
     num_experts: int,
     top_k: int,
     block_m: int,
-    compact_route_programs: bool,
+    use_minimum_route_chunks: bool,
 ) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
         _max_padded_route_capacity,
@@ -1149,7 +1179,8 @@ def test_route_sort_contract_gfx950(
         1,
         torch.bfloat16,
         block_m,
-        compact_route_programs=compact_route_programs,
+        use_minimum_route_chunks=use_minimum_route_chunks,
+        runtime_rows=False,
     )
     valid_extent, reported_tokens = num_valid.cpu().tolist()
     assert reported_tokens == num_tokens
@@ -1218,9 +1249,10 @@ def test_package_prefill_sort_localizes_ep_routes_gfx950() -> None:
             32,
             torch.bfloat16,
             64,
-            compact_route_programs=False,
+            use_minimum_route_chunks=False,
             expert_start=expert_start,
             out=output,
+            runtime_rows=False,
         )
     )
 
@@ -1261,7 +1293,8 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
         1,
         torch.bfloat16,
         block_m,
-        compact_route_programs=False,
+        use_minimum_route_chunks=False,
+        runtime_rows=False,
     )
 
     expected_capacity = _max_padded_route_capacity(
@@ -1324,6 +1357,7 @@ def test_stage1_quantized_output_scale_panels_gfx950(
             output_quantized=True,
             out_scale=out_scale,
             output_k=output_k,
+            num_warps=max(1, block_m // 32),
         )
     if error:
         kernel.__getitem__.assert_not_called()
@@ -1424,7 +1458,7 @@ def test_package_prefill_intermediate_padding_gfx950(
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1504,7 +1538,8 @@ def test_stage2_logical_k_ignores_padding_gfx950(
         n,
         torch.bfloat16,
         sort_block_m,
-        compact_route_programs=False,
+        use_minimum_route_chunks=False,
+        runtime_rows=False,
     )
     output_storage = torch.full(
         (tokens, n + 16), 42, dtype=torch.bfloat16, device="cuda"
@@ -1602,6 +1637,8 @@ def test_stage2_logical_k_ignores_padding_gfx950(
             valid,
             out,
             topk,
+            True,
+            initialize_unowned_routes=True,
             w2_scale=w_scale,
             a2_scale=a_scale,
             sorted_weights=sorted_weights,
@@ -1640,6 +1677,121 @@ def test_stage2_logical_k_ignores_padding_gfx950(
             assert error.norm() / reference.float().norm() < 0.01
 
 
+def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
+    tokens, topk, experts, width, k = 33, 2, 2, 256, 256
+    generator = torch.Generator(device="cuda").manual_seed(20261003)
+    x = torch.randint(
+        0,
+        256,
+        (tokens * topk, k // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    w = torch.randint(
+        0,
+        256,
+        (experts, width, k // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    w_scale = _make_gdot128_scale_alias(
+        swizzle_cdna4_mxfp4_scale(
+            torch.full((experts, width, k // 32), 124, dtype=torch.uint8, device="cuda")
+        ),
+        logical_k_packed=None,
+    )
+    weights = torch.full((tokens, topk), 0.5, device="cuda")
+    norm_weight = torch.ones(width, dtype=torch.bfloat16, device="cuda")
+    base_ids = torch.arange(tokens * topk, dtype=torch.int32, device="cuda").view(
+        tokens, topk
+    )
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        # NaNs in unwritten route rows expose accidental reads after ownership changes.
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        for ids in (base_ids % 4, torch.zeros_like(base_ids)):
+            sorted_ids, sorted_weights, sorted_experts, valid, out = gluon_moe_sorting(
+                ids,
+                weights,
+                experts,
+                width,
+                torch.bfloat16,
+                32,
+                expert_start=2,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+            )
+            a_scale = _make_gdot128_scale_alias(
+                swizzle_cdna4_mxfp4_scale(
+                    torch.full(
+                        (1, sorted_ids.numel(), k // 32),
+                        124,
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )
+                ),
+                logical_k_packed=None,
+            ).squeeze(0)
+            outputs = []
+            for initialize in (True, False):
+                outputs.append(
+                    invoke_gluon_mxfp4_moe_stage2_1x2(
+                        x,
+                        None,
+                        w,
+                        sorted_ids,
+                        sorted_experts,
+                        valid,
+                        out,
+                        topk,
+                        False,
+                        initialize_unowned_routes=initialize,
+                        w2_scale=w_scale,
+                        a2_scale=a_scale,
+                        sorted_weights=sorted_weights,
+                        block_m=32,
+                        sort_block_m=32,
+                        b_preshuffled=False,
+                        b_gdot128=False,
+                        force_reduce=True,
+                        input_sorted=False,
+                        a_format="e2m1",
+                    )
+                )
+            initialized, uninitialized = outputs
+            route_map = gluon_local_route_map(ids, 2, experts)
+            owned = route_map >= 0
+            torch.testing.assert_close(
+                uninitialized[owned], initialized[owned], rtol=0, atol=0
+            )
+            assert torch.isnan(uninitialized[~owned]).all()
+            reduced = [
+                routed_input_scale_rmsnorm_sum_gathered(
+                    routes,
+                    route_map,
+                    tokens,
+                    topk,
+                    weights,
+                    norm_weight,
+                    1e-6,
+                    0.0,
+                    False,
+                    None,
+                )
+                for routes in outputs
+            ]
+            torch.testing.assert_close(reduced[1], reduced[0], rtol=0, atol=0)
+            assert torch.isfinite(reduced[1]).all()
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [
@@ -1652,18 +1804,19 @@ def test_stage2_logical_k_ignores_padding_gfx950(
         (128, 128),
         (129, 64),
         (192, 64),
-        (193, 128),
+        (320, 64),
+        (321, 128),
     ],
 )
-def test_package_prefill_block_m_selection_gfx950(
+def test_grouped_moe_block_m_selection_gfx950(
     num_tokens: int,
     expected: int,
 ) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
-        _select_package_prefill_block_m,
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
+        _select_grouped_moe_block_m,
     )
 
-    assert _select_package_prefill_block_m(num_tokens, 16, 16) == expected
+    assert _select_grouped_moe_block_m(num_tokens, 16, 16) == expected
 
 
 @pytest.mark.parametrize("block_m", [16, 32, 64])
@@ -1677,7 +1830,7 @@ def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
     num_experts: int,
 ) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import prefill_stage2
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import tuning
 
     stage2 = prefill_stage2.invoke_gluon_mxfp4_moe_stage2_1x2
     selected_combine_modes = []
@@ -1715,7 +1868,7 @@ def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
         top_k,
     )
     router_logits = torch.empty((num_tokens, 0), dtype=torch.float32, device="cuda")
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -1730,15 +1883,16 @@ def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
 
     monkeypatch.setattr(
-        fused_moe,
-        "_select_package_prefill_block_m",
+        tuning,
+        "_select_grouped_moe_block_m",
         lambda *_args: block_m,
     )
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -1747,11 +1901,11 @@ def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
         topk_ids=topk_ids,
     )
     monkeypatch.setattr(
-        fused_moe,
-        "_select_package_prefill_block_m",
+        tuning,
+        "_select_grouped_moe_block_m",
         lambda *_args: 128,
     )
-    block128 = tokenspeed_kernel.moe_apply(
+    block128 = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -1767,7 +1921,7 @@ def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
 def test_ep_situ_package_prefill_matches_reference_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+    import tokenspeed_kernel.ops.moe.gluon as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260830)
     # Exercise a ragged MXFP8 tile beyond this plan's four-row A16 decode path.
@@ -1810,7 +1964,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     router_logits = torch.empty((num_tokens, 0), dtype=torch.float32, device="cuda")
     plan = _a8w4_ep_plan(intermediate_size)
     assert plan["apply_kernel_name"] == _A8W4_EP_APPLY
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     output_storage = torch.empty(
         (num_tokens, latent_size + 7168),
         dtype=hidden_states.dtype,
@@ -1835,7 +1989,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
         record_prefill,
     )
 
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -1852,7 +2006,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1871,7 +2025,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = tokenspeed_kernel.moe_apply(
+        captured = kernel_moe_apply(
             plan,
             hidden_states,
             module,
@@ -1903,7 +2057,7 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
     )
     topk_weights, topk_ids = make_round_robin_topk(num_tokens, 16, 16)
     router_logits = torch.zeros(num_tokens, 16, dtype=torch.float32, device="cuda")
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -1918,9 +2072,10 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    routed_reference = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, module)
+    routed_reference = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -1937,7 +2092,7 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
     shared_reference = shared_input @ shared_weight.T
     shared_out = torch.empty_like(shared_reference)
 
-    routed, shared = tokenspeed_kernel.moe_apply(
+    routed, shared = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -1960,7 +2115,7 @@ def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_routed, captured_shared = tokenspeed_kernel.moe_apply(
+        captured_routed, captured_shared = kernel_moe_apply(
             plan,
             hidden_states,
             module,
@@ -2038,7 +2193,7 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
     )
     router_logits = torch.empty((num_tokens, 0), dtype=torch.float32, device="cuda")
     plan = _a8w4_ep_plan(intermediate_size)
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     output_storage = torch.empty(
         (num_tokens, latent_size + 7168),
         dtype=hidden_states.dtype,
@@ -2061,7 +2216,7 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
         record_package_prefill,
     )
 
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -2081,7 +2236,7 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -2184,8 +2339,8 @@ def test_partial_reduce_matches_reference_gfx950(
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("compact_route_programs", [False, True])
-def test_route_sort_reuses_compilation_gfx950(compact_route_programs: bool) -> None:
+@pytest.mark.parametrize("use_minimum_route_chunks", [False, True])
+def test_route_sort_reuses_compilation_gfx950(use_minimum_route_chunks: bool) -> None:
     from contextlib import ExitStack
 
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_sorting
@@ -2200,7 +2355,8 @@ def test_route_sort_reuses_compilation_gfx950(compact_route_programs: bool) -> N
             1,
             torch.bfloat16,
             16,
-            compact_route_programs=compact_route_programs,
+            use_minimum_route_chunks=use_minimum_route_chunks,
+            runtime_rows=False,
         )
         assert valid[1].item() == tokens
         counts = torch.bincount(ids.flatten().to(torch.int64), minlength=16)
@@ -2221,7 +2377,7 @@ def test_route_sort_reuses_compilation_gfx950(compact_route_programs: bool) -> N
         run(tokens)
     with ExitStack() as stack:
         for kernel in (
-            moe_sorting._moe_sorting_small_histogram_prefix_kernel,
+            moe_sorting.gluon_mxfp4_moe_sort_histogram_prefix_gfx950,
             moe_sorting._moe_sorting_stage1_kernel,
             moe_sorting._moe_sorting_stage2_kernel,
             moe_sorting._moe_sorting_stage3_kernel,
@@ -2282,7 +2438,7 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
             situ_beta=4.0,
             situ_linear_beta=25.0,
         )
-        expected = mxfp4_moe_reference(
+        expected = mxfp4_situ_moe_experts(
             x,
             raw["w13_weight"],
             raw["w13_scale"],

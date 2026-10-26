@@ -39,10 +39,13 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
-    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_replay_supported,
+    kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -171,7 +174,7 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
-        shard_count = self.attn_config.dcp_size
+        shard_count = self.attn_config.kvp_size
         return tuple(
             (
                 (
@@ -313,94 +316,22 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def replay_kda(self) -> bool:
-        """Whether verify commits by replaying from one conv checkpoint row."""
-        if self.server_args.speculative_algorithm is None:
-            return False
-        from tokenspeed_kernel.ops.attention.kda import (
-            kda_recurrent_layout,
-            kda_replay_commit_supported,
-        )
-
-        _, recurrent_shape = self._kda_shapes
-        heads, head_dim, _ = recurrent_shape
-        return bool(
-            kda_replay_commit_supported(
-                self.attn_config.dtype,
-                recurrent_layout=kda_recurrent_layout(),
-                num_heads=heads,
-                head_dim=head_dim,
-            )
-        )
-
-    @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
+        """Whether target decode uses replay, including the one-token window."""
+        return kda_replay_supported(self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-        ):
-            # Verify staging exists for the target's verify step; the prefill
-            # role only ever writes committed prompt state.
+        if self.server_args.disaggregation_mode == "prefill":
             return 0
-        if self.replay_kda:
-            conv_shape, recurrent_shape = self._kda_shapes
-            heads, head_dim, _ = recurrent_shape
-            # Replay starts from the committed convolution checkpoint and
-            # reconstructs the accepted recurrent state.
-            from tokenspeed_kernel.ops.attention.kda import (
-                kda_batched_replay_uses_raw_gate,
-            )
-
-            replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
-                self.attn_config.dtype,
-                num_heads=heads,
-                head_dim=head_dim,
-            )
-            # Raw-g replay reuses the committed convolution pool as verify scratch.
-            conv_bytes = (
-                0
-                if replay_uses_raw_gate
-                else self.attn_config.max_bs
-                * sum(
-                    field.payload_bytes
-                    for spec, fields in self.groups()
-                    if spec.group_id != FULL_ATTENTION
-                    for field in fields
-                    if field.field_id.endswith(".conv_state")
-                )
-            )
-            rows = self.attn_config.max_bs * int(
-                self.server_args.speculative_num_draft_tokens
-            )
-            layer_count = sum(
-                field.field_id.endswith(".conv_state")
-                for spec, fields in self.groups()
-                if spec.group_id != FULL_ATTENTION
-                for field in fields
-            )
-            payload_bytes_per_row = (
-                conv_shape[0] + head_dim + heads
-            ) * torch.bfloat16.itemsize
-            # Fused raw-g capture stores BF16; other replay paths need FP32 scratch.
-            gate_itemsize = (
-                torch.bfloat16.itemsize
-                if replay_uses_raw_gate
-                else torch.float32.itemsize
-            )
-            payload_bytes_per_row += heads * head_dim * gate_itemsize
-            return conv_bytes + layer_count * rows * payload_bytes_per_row
-        verify_rows = self.attn_config.max_bs * (
-            int(self.server_args.speculative_num_draft_tokens) + 1
-        )
-        return verify_rows * sum(
-            field.payload_bytes
-            for spec, fields in self.groups()
-            if spec.group_id != FULL_ATTENTION
-            for field in fields
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if width == 1 and not self.replay_kda:
+            return 0
+        return kda_verify_workspace_bytes(
+            self.attn_config,
+            self.groups(),
+            draft_token_num=width,
+            replay_kda=self.replay_kda,
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----

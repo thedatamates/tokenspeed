@@ -22,17 +22,23 @@
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
+    AbortReason,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     CapacityModel,
     ExecutionEvent,
     ExecutionPlan,
     RequestSpec,
     Scheduler,
+    SchedulerAbort,
     SchedulerConfig,
 )
+
+StorageStats = _ext.StorageStats
+StorageConfig = _ext.StorageConfig
+StoragePressure = _ext.StoragePressure
+StorageKind = _ext.StorageKind
 
 PD = _ext.PD
 Cache = _ext.Cache
@@ -62,14 +68,19 @@ __all__ = [
     # Core
     "Scheduler",
     "SchedulerConfig",
+    "StorageConfig",
+    "StoragePressure",
+    "StorageStats",
+    "StorageKind",
     "RequestSpec",
-    "CacheRetention",
+    "AttnKind",
     "CacheGroupConfig",
-    "CacheGroupFamily",
     "CacheTransferPolicy",
     "CapacityModel",
     # Execution plan & operations
     "ExecutionPlan",
+    "SchedulerAbort",
+    "AbortReason",
     "Forward",
     "PD",
     "Cache",

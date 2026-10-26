@@ -3,8 +3,8 @@
 Locks the contract Phase G.1 established: when the task driving a
 streaming generator is cancelled (e.g. FastAPI cancelling its route
 coroutine because the client disconnected), the generator's
-``finally`` drops the rid from ``rid_to_state`` and fires exactly one
-``AbortReq`` at the scheduler. No dangling per-request state. No
+``finally`` drops the rid from ``rid_to_state`` and asks the engine to
+abort it exactly once. No dangling per-request state. No
 reliance on ``fastapi.Request.is_disconnected()``.
 
 This test uses a stub that bypasses ZMQ / ModelConfig / HF tokenizer
@@ -14,7 +14,8 @@ bring-up — the same pattern as
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,21 +25,21 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 import asyncio  # noqa: E402
 import types  # noqa: E402
-from typing import Any, Dict  # noqa: E402
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
 from tokenspeed.runtime.engine.output_processor import ReqState  # noqa: E402
 
 
-class _FakeScheduler:
-    """Captures ``AbortReq``s the stub AsyncLLM pushes on cancellation."""
+class _FakeFrontend:
+    """Captures the aborts the stub AsyncLLM sends the engines; the real one
+    is the ``tokenspeed_engine`` frontend, which needs running engines."""
 
     def __init__(self) -> None:
-        self.aborts: list = []
+        self.aborts: list[str] = []
 
-    def send_pyobj(self, obj: Any) -> None:
-        self.aborts.append(obj)
+    async def abort(self, rid: str) -> None:
+        self.aborts.append(rid)
 
 
 class _StubAsyncLLM(AsyncLLM):
@@ -46,20 +47,18 @@ class _StubAsyncLLM(AsyncLLM):
 
     Populates only the attributes ``_wait_one_response`` + ``abort_request``
     read: ``rid_to_state``, ``log_requests``, ``enable_metrics``,
-    ``tokenizer``, ``model_config``, and an ``engine_core_client`` whose
-    ``send_to_scheduler`` is a capture fake so the test can assert the
-    ``AbortReq`` was sent.
+    ``tokenizer``, ``model_config``, ``_abort_tasks``, and a capture fake
+    ``frontend`` so the test can assert the abort was sent.
     """
 
     def __init__(self) -> None:
-        self.rid_to_state: Dict[str, ReqState] = {}
+        self.rid_to_state: dict[str, ReqState] = {}
         self.log_requests = False
         self.enable_metrics = False
         self.tokenizer = None
         self.model_config = types.SimpleNamespace(is_multimodal_gen=False)
-        self.engine_core_client = types.SimpleNamespace(
-            send_to_scheduler=_FakeScheduler()
-        )
+        self._abort_tasks = set()
+        self.frontend = _FakeFrontend()
 
 
 class _StubReqObj:
@@ -86,11 +85,12 @@ def _fresh_state(obj: _StubReqObj) -> ReqState:
     )
 
 
-class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
+class TestWaitOneResponseCancellation:
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_cancelled_before_first_output_cleans_up(self) -> None:
         """Cancel while ``_wait_one_response`` is blocked on the first
-        event. Expect: rid dropped from ``rid_to_state``; one ``AbortReq``
-        sent to the scheduler.
+        event. Expect: rid dropped from ``rid_to_state``; one abort sent to
+        the engine.
         """
         mgr = _StubAsyncLLM()
         obj = _StubReqObj(rid="r-cancel-1", stream=True)
@@ -111,24 +111,22 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
+        with pytest.raises((asyncio.CancelledError)):
             await task
 
-        # Finally block cleanup.
-        self.assertNotIn(obj.rid, mgr.rid_to_state)
-        aborts = mgr.engine_core_client.send_to_scheduler.aborts
-        self.assertEqual(
-            len(aborts),
-            1,
-            f"expected exactly one AbortReq on cancel, got {len(aborts)}",
-        )
-        # The AbortReq should carry the right rid.
-        self.assertEqual(getattr(aborts[0], "rid", None), obj.rid)
+        # Finally block cleanup; the abort is sent from its own task.
+        assert (obj.rid) not in (mgr.rid_to_state)
+        await asyncio.gather(*mgr._abort_tasks)
+        assert mgr.frontend.aborts == [obj.rid]
+        # A finished abort is not kept.
+        await asyncio.sleep(0)
+        assert not mgr._abort_tasks
 
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_normal_finish_does_not_fire_abort(self) -> None:
-        """When the generator exits on ``state.finished`` (scheduler's
-        terminal frame), no ``AbortReq`` should fire — the scheduler
-        already knows the request is done.
+        """When the generator exits on ``state.finished`` (the engine's
+        terminal frame), no abort should fire — the engine already knows the
+        request is done.
         """
         mgr = _StubAsyncLLM()
         obj = _StubReqObj(rid="r-finish-1", stream=True)
@@ -156,21 +154,33 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
                 "meta_info": {"id": obj.rid, "finish_reason": None},
             },
             stream=True,
+            cumulative=False,
         )
         state.event.set()
 
         results = await task
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["text"], "hello")
-        self.assertNotIn(obj.rid, mgr.rid_to_state)
+        assert (len(results)) == (1)
+        assert (results[0]["text"]) == ("hello")
+        assert (obj.rid) not in (mgr.rid_to_state)
         # Normal finish ⇒ no abort.
-        self.assertEqual(
-            len(mgr.engine_core_client.send_to_scheduler.aborts),
-            0,
-            "normal finish should not schedule an AbortReq",
-        )
+        assert not mgr._abort_tasks
+        assert mgr.frontend.aborts == []
+
+
+class TestAbortTasks:
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_finished_aborts_are_not_kept(self) -> None:
+        """Every abort runs on a task of its own; once it has reached the
+        engine nothing of it stays behind, however many requests ended."""
+        mgr = _StubAsyncLLM()
+        for i in range(1000):
+            mgr._abort_on_engine(f"r{i}")
+        await asyncio.gather(*mgr._abort_tasks)
+        await asyncio.sleep(0)
+        assert len(mgr.frontend.aborts) == 1000
+        assert not mgr._abort_tasks
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

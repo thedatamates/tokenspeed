@@ -17,7 +17,7 @@
 
 """FlashInfer gated delta net (GDN) prefill + decode/MTP kernels.
 
-Prefill: fast-path for GDN chunked prefill on Blackwell (sm100/sm103) + CUDA 13
+Prefill: fast-path for GDN chunked prefill on Hopper/Blackwell + CUDA 13
 + bf16 + head_dim==128. The caller gates on ``is_supported`` and must fail fast
 when the fast-path is unavailable; this module has no Triton fallback for it.
 
@@ -46,6 +46,7 @@ import torch
 from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
 from tokenspeed_kernel.platform import (
@@ -81,11 +82,8 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # flashinfer's gdn_prefill treats compute-capability major 10 as the
-    # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
-    # prefill kernel being present; it raises NotImplementedError otherwise.
-    # Mirror that here so the caller does not commit to a crashing fast-path.
-    return platform.is_blackwell and cuda_major >= 13
+    # FlashInfer provides separate SM90 and Blackwell prefill kernels.
+    return (platform.is_hopper or platform.is_blackwell) and cuda_major >= 13
 
 
 def is_supported(
@@ -108,20 +106,6 @@ def is_decode_available() -> bool:
     return platform.is_hopper_plus
 
 
-def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
-    """Whether ``gdn_decode_step``/``gdn_decode_mtp`` support this shape/dtype.
-
-    Both kernels require K == V == 128 and a float16/bfloat16 q/k/v dtype. The
-    recurrent state pool may be float32 or bfloat16; FlashInfer dispatches the
-    latter to its dedicated BF16-state kernel.
-    """
-    return (
-        is_decode_available()
-        and head_dim == SUPPORTED_HEAD_DIM
-        and dtype in (torch.float16, torch.bfloat16)
-    )
-
-
 CHUNK_SIZE = 64
 
 flashinfer_gdn_chunk_prefill = error_fn
@@ -134,7 +118,7 @@ if is_available():
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -146,6 +130,7 @@ if is_available():
             "num_v_gte_num_q": frozenset({True}),
             "output_h": frozenset({False, True}),
             "qk_l2norm": frozenset({False, True}),
+            "state_checkpoints": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_chunk_prefill(
@@ -161,8 +146,9 @@ if is_available():
         qk_l2norm: bool = False,
         output_final_state: bool = True,
         output_h: bool = False,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ):
-        """Run one chunked GDN prefill on the sm100 kernel.
+        """Run one chunked GDN prefill on Hopper or Blackwell.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
         g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the
@@ -184,6 +170,10 @@ if is_available():
 
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
+
+        ``state_checkpoints`` hands the kernel a caller-owned float32 buffer
+        and its cumulative counts instead (``GdnStateCheckpoints``): no host
+        synchronization, any interval that is a multiple of 64.
         """
         batched = q.dim() == 4
         q3 = q.squeeze(0) if batched else q
@@ -204,8 +194,25 @@ if is_available():
         # only a dtype cast + contiguity are needed, no transpose.
         fi_initial_state = initial_state.float().contiguous()
 
-        state_checkpoints = None
+        checkpoint_every_n_tokens = CHUNK_SIZE if output_h else 0
+        checkpoint_states = None
         checkpoint_cu_starts = None
+        if state_checkpoints is not None:
+            if output_h:
+                raise ValueError("output_h and state_checkpoints are exclusive")
+            if (
+                state_checkpoints.every_n_tokens <= 0
+                or state_checkpoints.every_n_tokens % CHUNK_SIZE
+            ):
+                raise ValueError(
+                    "state checkpoint interval must be a positive multiple of "
+                    f"{CHUNK_SIZE}, got {state_checkpoints.every_n_tokens}"
+                )
+            if state_checkpoints.states.dtype != torch.float32:
+                raise ValueError("state checkpoints are stored as float32")
+            checkpoint_every_n_tokens = state_checkpoints.every_n_tokens
+            checkpoint_states = state_checkpoints.states
+            checkpoint_cu_starts = state_checkpoints.cu_starts
         if output_h:
             per_seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
             # flashinfer-native checkpoint count: only full chunks emit a checkpoint.
@@ -214,7 +221,7 @@ if is_available():
             H_state = fi_initial_state.shape[1]
             V_state = fi_initial_state.shape[-2]
             K_state = fi_initial_state.shape[-1]
-            state_checkpoints = torch.empty(
+            checkpoint_states = torch.empty(
                 total_h_ckpts,
                 H_state,
                 V_state,
@@ -239,9 +246,9 @@ if is_available():
             initial_state=fi_initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            state_checkpoints=state_checkpoints,
+            state_checkpoints=checkpoint_states,
             checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             # WORKAROUND: FlashInfer 0.6.18's CP cache uses the stale
             # cute.compile[...] syntax, which CUTLASS DSL 4.7.1 no longer
             # supports. Remove this when custom_compile_cache is fixed
@@ -267,7 +274,7 @@ if is_available():
         return GdnChunkPrefillResult(
             out=out,
             final_state=final_state,
-            h=state_checkpoints,
+            h=checkpoint_states,
             h_cu_starts=checkpoint_cu_starts,
             h_layout=GdnCheckpointLayout.FLASHINFER,
         )
@@ -297,6 +304,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "strided_qkv": frozenset({False}),
         },
     )
     def flashinfer_gdn_decode_step(
@@ -366,6 +374,8 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "separate_output_state": frozenset({False}),
+            "strided_qkv": frozenset({False}),
         },
     )
     def flashinfer_gdn_decode_mtp(
@@ -384,7 +394,9 @@ if is_decode_available():
         use_qk_l2norm: bool = True,
         intermediate_states_buffer: torch.Tensor | None = None,
         output_state_indices: torch.Tensor | None = None,
-        parent_indices: torch.Tensor | None,
+        output_state: torch.Tensor | None = None,
+        tree_ancestors: torch.Tensor | None,
+        replay_payload: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one multi-token (T>1) GDN MTP verify step, K-last pool+indices.
 
@@ -421,9 +433,13 @@ if is_decode_available():
 
         Returns the [B, T, HV, V] decode output (q.dtype).
         """
-        if parent_indices is not None:
+        if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError(
                 "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+            )
+        if output_state is not None:
+            raise NotImplementedError(
+                "FlashInfer GDN MTP kernels write states into initial_state only"
             )
         # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
         A_log = A_log.detach().float()

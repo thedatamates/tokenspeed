@@ -102,6 +102,7 @@ def _recipe(
     )
     return Glm53FlashRecipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=8192,
             disaggregation_mode="null",
@@ -151,7 +152,7 @@ def test_lcm_reference_geometry_is_exact() -> None:
         mla_cache_dtype=torch.float8_e4m3fn,
     ).bind(7)
     assert plan.prefix_granularity == 64
-    assert plan.lcm_block_bytes == 7_031_808
+    assert plan.lcm_block_bytes == 7_077_888
     assert len(plan.planes) == 12
     assert {
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
@@ -200,6 +201,30 @@ def test_mtp_layout_reserves_a_separate_index_plane() -> None:
     Glm53FlashRecipe.check_layout(
         type("Recipe", (), {"group_ids": group_ids})(), layout
     )
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "mla_cache_dtype", "draft_layers"),
+    [
+        (8, torch.float8_e4m3fn, 0),
+        (4, torch.float8_e4m3fn, 0),
+        (4, torch.bfloat16, 0),
+        (4, torch.float8_e4m3fn, 1),
+    ],
+)
+def test_kda_layers_share_one_page_stride(
+    tp_size: int, mla_cache_dtype: torch.dtype, draft_layers: int
+) -> None:
+    # Batched KDA replay addresses every layer's state pages with one stride.
+    layout = _layout(
+        tp_size=tp_size, mla_cache_dtype=mla_cache_dtype, draft_layers=draft_layers
+    )
+    strides = {
+        field.page_stride_bytes
+        for field in layout.fields
+        if field.group_id.startswith(LINEAR_ATTENTION)
+    }
+    assert len(strides) == 1
 
 
 def test_dsa_and_kda_components_own_independent_tp_geometry() -> None:
@@ -286,7 +311,7 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
     # linear-attention state group holds its fixed per-request working set.
     assert pages[FULL_ATTENTION] == 131_072 // 64 + 16
     state_ids = [
-        spec.group_id for spec in recipe._group_specs if spec.family == "state"
+        spec.group_id for spec in recipe._group_specs if spec.attn_kind == "state"
     ]
     assert state_ids and all(pages[gid] == 16 * 4 for gid in state_ids)
     expected = sum(-(-pages[gid] // packing[gid]) for gid in pages)

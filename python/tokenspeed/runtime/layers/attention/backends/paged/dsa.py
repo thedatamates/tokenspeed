@@ -31,7 +31,8 @@ from tokenspeed_kernel.ops.attention.dsa import (
     select_dsa_prefill_topk_for_rows,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -154,6 +155,7 @@ class DSABackend(PagedAttentionBackend):
     """
 
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
+    _make_dense_leaf = staticmethod(_make_dense_leaf)
 
     # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
     # inside the captured prefill segment, but the prefill graph rebinds only
@@ -162,18 +164,24 @@ class DSABackend(PagedAttentionBackend):
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
+        if len(config.kvp_group) > 1 and (
+            spec.index_topk <= 0 or spec.index_topk & (spec.index_topk - 1)
+        ):
+            raise ValueError("DSA KVP candidate topk must be a positive power of two")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
-        self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
-        self.dcp_block_granularity: int | None = None
-        self.dcp_virtual_block_count: int | None = None
-        if len(self.dcp_group) > 1 and spec.index_kpool is not None:
-            raise ValueError("DSA DCP does not yet support KPool selection")
+        self._dense_backend = self._make_dense_leaf(
+            config, spec, platform, kernel_page_size
+        )
+        self.kvp_group = tuple(config.kvp_group)
+        self.kvp_rank = config.kvp_rank
+        self.kvp_block_granularity: int | None = None
+        self.kvp_virtual_block_count: int | None = None
+        if len(self.kvp_group) > 1 and spec.index_kpool is not None:
+            raise ValueError("DSA KVP does not yet support KPool selection")
         # Query context parallelism: the extend rows this rank computes are a
         # shard of the chunk and attend the gathered history of their
-        # requests; the gather splits by page owner (the DCP group, or this
+        # requests; the gather splits by page owner (the KVP group, or this
         # rank alone) and lands in a workspace sized for one whole history.
         self.qcp_group = tuple(config.qcp_group)
         self.qcp_rank = config.qcp_rank
@@ -198,16 +206,64 @@ class DSABackend(PagedAttentionBackend):
         self.q_data_type = config.dtype
         self.num_attention_heads = spec.num_attention_heads
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
-        # rl-bitwise pins the sparse decode onto the batch-invariant no-split
-        # leaves; without one registered, selection fails at the first decode
-        # instead of silently serving an occupancy-split kernel.
+        # Plan from static geometry; sparse request sizes never select a new core.
         self.batch_invariant: bool = (
             global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
-        self.kernel_solution: str | None = "aok" if self.batch_invariant else None
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
+        self.kernel_solution: str | None = None
+        self.prefill_kernel_plan = None
+        self.decode_kernel_plan = None
+        if self.batch_invariant:
+            signature = format_signature(q=dense_tensor_format(self.q_data_type))
+            traits = {
+                "qk_nope_head_dim": self.qk_nope_head_dim,
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "page_size": self.kernel_page_size,
+                "has_kv_cache": True,
+                "has_sparse_kv_cache": False,
+                "logit_cap": False,
+                "topk_layout": "global_slots",
+                "slot_order": self.slot_order,
+                "return_lse": frozenset({False, len(self.kvp_group) > 1}),
+            }
+            variable = frozenset({"batch_size", "tokens", "topk", "max_seqlen_k"})
+            self.prefill_kernel_plan = KernelPlan.select(
+                "attention",
+                "dsa_prefill",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={**traits, "q_len": 1},
+                variable_traits=variable,
+                solution=None,
+                declared_traits=(
+                    frozenset({"slot_order"})
+                    if self.slot_order == "sorted"
+                    else frozenset()
+                ),
+                ignore_layout=False,
+            )
+            self.decode_kernel_plan = KernelPlan.select(
+                "attention",
+                "dsa_decode",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={
+                    **traits,
+                    "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
+                },
+                variable_traits=variable,
+                solution=None,
+                declared_traits=(
+                    frozenset({"slot_order"})
+                    if self.slot_order == "sorted"
+                    else frozenset()
+                ),
+                ignore_layout=False,
+            )
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
@@ -220,7 +276,15 @@ class DSABackend(PagedAttentionBackend):
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
         if len(self.qcp_group) > 1:
+            # The sharded extend arm gathers each request's history in the
+            # eager attention break; a captured prefill would replay the
+            # dummy's gather. Overrides the KPool consumer's declaration too.
+            self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
             self._probe_history_gather_topk_leaf(spec)
+        # Planned sparse cores are captured only if they declare cuda_graph.
+        self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
+            prefill=self.prefill_kernel_plan, decode=self.decode_kernel_plan
+        )
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm
@@ -268,12 +332,12 @@ class DSABackend(PagedAttentionBackend):
     ) -> None:
         super().configure_runtime(**kwargs)
         if (
-            shard_count != len(self.dcp_group)
+            shard_count != len(self.kvp_group)
             or block_granularity % self.kernel_page_size
         ):
-            raise ValueError("DSA cache geometry does not match DCP topology")
-        self.dcp_block_granularity = block_granularity
-        self.dcp_virtual_block_count = virtual_block_count
+            raise ValueError("DSA cache geometry does not match KVP topology")
+        self.kvp_block_granularity = block_granularity
+        self.kvp_virtual_block_count = virtual_block_count
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
         """Allocate the gathered-history workspace of the sharded extend arm.
@@ -331,15 +395,15 @@ class DSABackend(PagedAttentionBackend):
         self._history_workspace = workspace
 
     def cache_placement(self, layer) -> CachePlacement | None:
-        if len(self.dcp_group) == 1:
+        if len(self.kvp_group) == 1:
             return None
-        if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
-            raise RuntimeError("DSA DCP cache geometry is not configured")
+        if self.kvp_block_granularity is None or self.kvp_virtual_block_count is None:
+            raise RuntimeError("DSA KVP cache geometry is not configured")
         return CachePlacement(
-            self.dcp_block_granularity,
-            self.dcp_virtual_block_count,
-            self.dcp_group,
-            self.dcp_rank,
+            self.kvp_block_granularity,
+            self.kvp_virtual_block_count,
+            self.kvp_group,
+            self.kvp_rank,
         )
 
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
@@ -423,12 +487,23 @@ class DSABackend(PagedAttentionBackend):
     def child_backends(self):
         return (self._dense_backend,)
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # KPool keeps each request's incomplete index pool in a request-local
+        # tail outside the index-K pages. The tail workspace is one arena
+        # allocation shared by the target and draft views, so the target
+        # backend images it once and a draft backend lists nothing.
+        if self.kpool_runtime is None or self.is_draft:
+            return []
+        if self.cache_pool is None:
+            raise RuntimeError("DSA KPool slot state needs a bound cache pool")
+        return self.cache_pool.kpool_tail_slot_rows(slot)
+
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None
         self.query_shard_metadata = None
-        self.dcp_block_granularity = None
-        self.dcp_virtual_block_count = None
+        self.kvp_block_granularity = None
+        self.kvp_virtual_block_count = None
         if self.kpool_runtime is not None:
             self.kpool_runtime.reset_forward(None)
 
@@ -932,7 +1007,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
-        if len(self.dcp_group) > 1:
+        if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
         if metadata is not None and metadata.seq_lens_k is not None:
@@ -1047,13 +1122,13 @@ class DSABackend(PagedAttentionBackend):
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        use_dcp = len(self.dcp_group) > 1
+        use_dcp = len(self.kvp_group) > 1
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
             if not keep_all_heads:
-                q_view = gather_query_heads(q_view, self.dcp_group)
+                q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -1075,6 +1150,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            kernel_plan=self.prefill_kernel_plan,
             slot_order=self.slot_order,
         )
         if use_dcp:
@@ -1082,8 +1158,8 @@ class DSABackend(PagedAttentionBackend):
             out = combine_attention_partials(
                 local_output,
                 local_lse,
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=keep_all_heads,
             )
@@ -1155,6 +1231,7 @@ class DSABackend(PagedAttentionBackend):
                 k_scale=1.0,
                 return_lse=False,
                 solution=self.kernel_solution,
+                kernel_plan=self.prefill_kernel_plan,
                 slot_order=self.slot_order,
             )
         return out
@@ -1265,7 +1342,7 @@ class DSABackend(PagedAttentionBackend):
         max_seqlen_k = int(
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
-        use_dcp = len(self.dcp_group) > 1
+        use_dcp = len(self.kvp_group) > 1
         # The combine's form follows the query's heads: every head
         # (head-replicated attention weights, as the drafter's steps on a
         # query-sharding engine without head TP carry) keeps all heads -- no
@@ -1279,7 +1356,7 @@ class DSABackend(PagedAttentionBackend):
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
             if not keep_all_heads:
-                q_view = gather_query_heads(q_view, self.dcp_group)
+                q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
@@ -1298,6 +1375,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
         )
         if use_dcp:
@@ -1305,8 +1383,8 @@ class DSABackend(PagedAttentionBackend):
             out = combine_attention_partials(
                 local_output,
                 local_lse,
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=keep_all_heads,
             ).to(
@@ -1315,4 +1393,5 @@ class DSABackend(PagedAttentionBackend):
         return out.reshape(-1, heads * layer.v_head_dim)
 
 
-register_backend("dsa", {AttentionArch.DSA}, DSABackend)
+if not current_platform().is_npu:
+    register_backend("dsa", {AttentionArch.DSA}, DSABackend)

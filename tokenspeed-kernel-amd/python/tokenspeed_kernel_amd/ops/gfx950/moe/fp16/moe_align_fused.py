@@ -35,7 +35,7 @@ atomics). One kernel:
   * ``gl.gather`` of the per-expert block offset + scatter each slot to
     ``block_off[e]*block_m + rank``.
 
-Sync-free: outputs sized at the compile-time bound ``EM_MAX = (M*topk)*block_m``;
+Sync-free: outputs sized at the bound of bucketed routes * block_m;
 ``num_valid`` (real EM) is on-device and the GEMM stages early-out on the padded
 tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
 """
@@ -50,12 +50,7 @@ def _next_pow2(x: int) -> int:
     return 1 << max(0, (x - 1)).bit_length()
 
 
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
+@gluon.jit(do_not_specialize=("G", "sentinel"))
 def _fused_align_kernel(
     ids_ptr,  # [G] int32  flat topk_ids
     wts_ptr,  # [G] fp32   flat topk_weights
@@ -67,12 +62,12 @@ def _fused_align_kernel(
     num_experts,
     block_m,
     sentinel,
+    nb_max,
+    em_max,
     TOPK: gl.constexpr,
-    GP: gl.constexpr,  # next_pow2(G)  (>= NB_MAX == G)
+    GP: gl.constexpr,  # next_pow2(G) == nb_max
     EP: gl.constexpr,  # next_pow2(num_experts)
     EXPERT_START: gl.constexpr,
-    NB_MAX: gl.constexpr,  # == G (max blocks) == sei length
-    EM_MAX: gl.constexpr,  # == NB_MAX * block_m
     INIT_TILE: gl.constexpr,
 ):
     LG: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])  # [GP]
@@ -81,15 +76,15 @@ def _fused_align_kernel(
     LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])  # 2D rank
 
     # ---- in-kernel init of the full output (folds away a separate launch) ----
-    for r0 in gl.static_range(0, EM_MAX, INIT_TILE):
+    for r0 in range(0, em_max, INIT_TILE):
         r = r0 + gl.arange(0, INIT_TILE, layout=LR)
-        rm = r < EM_MAX
+        rm = r < em_max
         gl.store(
             sti_ptr + r, gl.full([INIT_TILE], sentinel, gl.int32, layout=LR), mask=rm
         )
         gl.store(sw_ptr + r, gl.full([INIT_TILE], 0.0, gl.float32, layout=LR), mask=rm)
     jb = gl.arange(0, GP, layout=LG)
-    gl.store(sei_ptr + jb, gl.full([GP], -1, gl.int32, layout=LG), mask=jb < NB_MAX)
+    gl.store(sei_ptr + jb, gl.full([GP], -1, gl.int32, layout=LG), mask=jb < nb_max)
     gl.barrier()  # order init stores before the (overlapping) scatter below
 
     g = gl.arange(0, GP, layout=LG)
@@ -110,7 +105,7 @@ def _fused_align_kernel(
     # single-block collapse: 1 block per hit expert (count<=M<=block_m)
     hit = valid_e & (counts > 0)
     blocks_pe = hit.to(gl.int32)
-    block_off = gl.associative_scan(blocks_pe, 0, _add) - blocks_pe  # exclusive
+    block_off = gl.cumsum(blocks_pe, 0) - blocks_pe  # exclusive
     num_blocks = gl.sum(blocks_pe, 0)
     gl.store(nv_ptr, num_blocks * block_m)  # EM
 
@@ -171,7 +166,8 @@ def moe_align_block_size_fused(
     sentinel = M
     assert M <= block_m, f"fused small-M align needs M ({M}) <= block_m ({block_m})"
 
-    NB_MAX = G
+    # Bucket static bounds so changing live token counts reuses compiled code.
+    NB_MAX = _next_pow2(max(1, G))
     EM_MAX = NB_MAX * block_m
     GP = _next_pow2(G)
     EP = _next_pow2(num_experts)
@@ -194,13 +190,13 @@ def moe_align_block_size_fused(
         num_experts,
         block_m,
         sentinel,
+        NB_MAX,
+        EM_MAX,
         TOPK=topk,
         GP=GP,
         EP=EP,
         EXPERT_START=expert_start,
-        NB_MAX=NB_MAX,
-        EM_MAX=EM_MAX,
-        INIT_TILE=_next_pow2(min(1024, EM_MAX)),
+        INIT_TILE=1024,
         num_warps=4,
     )
     return sti, sei, sw, nv
