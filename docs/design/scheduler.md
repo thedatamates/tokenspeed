@@ -664,6 +664,12 @@ shortest path out of head-of-line — largest first, freeing the most at once;
 then decode work by most newly releasable LCM blocks and fewest **generated**
 tokens — the needed pages with the fewest victims disturb the fewest clients,
 and among equal frees the client that has streamed least is interrupted.
+Request ID breaks remaining decode ties. Compute each candidate's releasable
+capacity once per victim selection, before sorting: the estimate walks block
+tables and builds temporary maps. The comparator uses that stored count,
+generated-token count and a borrowed request ID; it does not allocate or
+recompute cache ownership. Counts are recomputed on the next selection so
+changes to block ownership are reflected.
 Only candidates whose image fits are ranked (the abort fallback above takes
 over when none does). Exempt in both tiers: a request whose reserve already
 covers its whole generation (`Request::ReserveCoversGeneration`) — retracting

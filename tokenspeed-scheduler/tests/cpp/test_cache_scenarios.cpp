@@ -2289,6 +2289,43 @@ protected:
     ExecutionPlan retract_round_;
 };
 
+class EqualReleaseVictimSuite : public RetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = RetractSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 17;
+        for (auto& group : cfg.cache_groups) group.total_pages = 17;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(EqualReleaseVictimSuite, RequestIdBreaksEqualCapacityAndGenerationTies) {
+    // Long IDs also exercise the borrowed string tie-breaker. Submission
+    // order deliberately disagrees with lexical order.
+    const std::string first = "z-" + std::string(64, 'x');
+    const std::string second = "a-" + std::string(64, 'x');
+    Submit(MakeRequestSpec(first, 3));
+    Submit(MakeRequestSpec(second, 3, 101));
+    for (int round = 0; round < 3; ++round) {
+        const auto plan = PlanOnce();
+        const auto* forward = FindForwardBatch(plan);
+        ASSERT_NE(forward, nullptr);
+        ASSERT_EQ(forward->request_ids.size(), 2u);
+        SendForwardDone(first, {42 + round});
+        SendForwardDone(second, {142 + round});
+    }
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    const auto blocked = PlanOnce();
+    ASSERT_TRUE(blocked.aborts.empty());
+    const auto* store = FindSnapshotStore(blocked);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{second});
+    const auto* forward = FindForwardBatch(blocked);
+    ASSERT_NE(forward, nullptr);
+    EXPECT_EQ(forward->request_ids, std::vector<std::string>{first});
+}
+
 class NamespacedRetractSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

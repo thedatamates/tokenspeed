@@ -31,6 +31,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -798,24 +799,35 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
     // hashes the candidate's completed pages) runs for as few candidates as
     // possible -- normally one.
     std::vector<Request*> ranked;
-    std::vector<Request*> decodes;
+    struct DecodeCandidate {
+        Request* request;
+        std::int32_t releasable_blocks;
+    };
+    std::vector<DecodeCandidate> decodes;
     Request* newest = nullptr;
     for (Request* request : candidates) {
         if (!retractable(*request)) {
             continue;
         }
         newest = request;  // candidates arrive in submission order
-        (request->Is<fsm::Prefilling>() ? ranked : decodes).push_back(request);
+        if (request->Is<fsm::Prefilling>()) {
+            ranked.push_back(request);
+        } else {
+            decodes.push_back({request, coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef())});
+        }
     }
     std::ranges::stable_sort(ranked,
                              [](const Request* a, const Request* b) { return a->TokenSize() > b->TokenSize(); });
-    const auto decode_rank = [this](const Request* request) {
-        return std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
-                          request->GeneratedTokens(), request->Id()};
+    // Estimating released capacity walks block tables and allocates maps. Do
+    // it once per candidate; sorting must not repeat it or copy request IDs.
+    const auto decode_rank = [](const DecodeCandidate& candidate) {
+        return std::tuple{-candidate.releasable_blocks, candidate.request->GeneratedTokens(),
+                          std::string_view{candidate.request->Id()}};
     };
-    std::ranges::stable_sort(
-        decodes, [&decode_rank](const Request* a, const Request* b) { return decode_rank(a) < decode_rank(b); });
-    ranked.insert(ranked.end(), decodes.begin(), decodes.end());
+    std::ranges::stable_sort(decodes, {}, decode_rank);
+    for (const DecodeCandidate& candidate : decodes) {
+        ranked.push_back(candidate.request);
+    }
     for (Request* request : ranked) {
         if (imageFits(*request)) {
             return VictimChoice{.victim = request, .image_fits = true};
