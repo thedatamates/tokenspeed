@@ -89,6 +89,10 @@ public:
     BlockPool& operator=(const BlockPool&) = delete;
     ~BlockPool() noexcept { FatalCheck(NumOccupiedSlots() == 0, "BlockPool destroyed with live block references"); }
 
+    // Invalidates skipped pinned entries when any block becomes uniquely owned.
+    // This is a version only; placement does not track owners or eviction eligibility.
+    std::uint64_t UnpinEpoch() const noexcept { return unpin_epoch_; }
+
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
@@ -268,6 +272,7 @@ public:
     }
 
 private:
+    std::uint64_t unpin_epoch_{0};
     using ParentOrder = std::pair<std::int32_t, std::int32_t>;  // -occupancy, parent ID
     struct GroupAvailability {
         std::int32_t packing{0};
@@ -418,7 +423,7 @@ private:
     }
 
     CacheBlockRef createBlockRef(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
-        auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
+        auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location, unpin_epoch_);
         // Allocate the control before mutating the pool, then commit the
         // location before publishing its RAII owner: CacheBlock destruction
         // releases this location and therefore requires it to be occupied.

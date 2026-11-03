@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "cache/prefix/prefix_hasher.h"
+#include "scheduler/request.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -42,6 +43,34 @@ token_span Tokens(const std::vector<std::int32_t>& v) {
 }
 key_span Keys(const std::vector<std::string>& v) {
     return key_span(v.data(), v.size());
+}
+
+TEST(RequestPromptHashesTest, RetryAndExtensionPreserveTheHashChainAndCacheIdentity) {
+    RequestSpec spec{.request_id = "request", .tokens = {1, 2, 3, 4, 5, 6}};
+    spec.cache_namespace = "tenant-a";
+    Request request(spec, 2, Role::kFused);
+    const auto first_hash = HashPrefixPage(std::span(spec.tokens).first(2), request.CacheSeed(false));
+    EXPECT_TRUE(request.PromptPrefixHashes(0, false).empty());
+    EXPECT_EQ(request.PromptPrefixHashes(1, false).front(), first_hash);
+    const auto expected = ComputePrefixHashes(request.FullPrefixPages(false), request.CacheSeed(false));
+    for (int retry = 0; retry < 3; ++retry) {
+        const auto hashes = request.PromptPrefixHashes(3, false);
+        EXPECT_EQ(std::vector<std::string>(hashes.begin(), hashes.end()), expected);
+    }
+    // A local probe can exclude the last full page after a complete D-role probe.
+    EXPECT_EQ(request.PromptPrefixHashes(1, false).front(), first_hash);
+    const auto private_hashes = request.PromptPrefixHashes(3, true);
+    const auto private_expected = ComputePrefixHashes(request.FullPrefixPages(false), request.CacheSeed(true));
+    EXPECT_EQ(std::vector<std::string>(private_hashes.begin(), private_hashes.end()), private_expected);
+    EXPECT_NE(private_hashes.front(), first_hash);
+    EXPECT_EQ(request.PromptPrefixHashes(3, false).back(), expected.back());
+
+    Request next_lifetime(spec, 2, Role::kFused);
+    EXPECT_EQ(next_lifetime.PromptPrefixHashes(3, false).back(), expected.back());
+    EXPECT_NE(next_lifetime.PromptPrefixHashes(3, true).back(), private_hashes.back());
+    spec.cache_namespace = "tenant-b";
+    Request other_namespace(spec, 2, Role::kFused);
+    EXPECT_NE(other_namespace.PromptPrefixHashes(3, false).back(), expected.back());
 }
 
 // ---- hex helpers --------------------------------------------------------

@@ -71,6 +71,13 @@ cached position has none, so the runtime admits it with the bound set to `s`
 and the positions `>= s` are recomputed as ordinary prefill input whatever the
 cache holds. The bound limits the probe itself, not a later trim, so excluded
 hit pages are never claimed and the recomputed suffix lands on private pages.
+The immutable submitted prompt's hash chain is retained by `Request`, lazily
+extended to the requested number of full pages, with separate shared and private
+cache identities. Admission retries borrow those hashes, but re-probe current
+Device/Host state every time. Hashes for matched progress are copied only after
+admission succeeds. The submitted token prefix never changes as decode extends
+the token container, and a reused request ID starts a new hash-cache lifetime.
+
 Only a `Submitted` prompt is probed: a retracted request is never re-probed;
 it comes back by restoring its image (§4), so no position whose logits were
 produced is ever matched against another request's pages or recomputed. The

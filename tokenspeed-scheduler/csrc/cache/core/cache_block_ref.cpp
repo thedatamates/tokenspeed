@@ -44,6 +44,10 @@ void CacheBlockControl::retain() noexcept {
 void CacheBlockControl::release() noexcept {
     FatalCheck(strong_count_ != 0, "CacheBlockControl release requires a live reference");
     --strong_count_;
+    if (strong_count_ == 1) {
+        FatalCheck(unpin_epoch_ != std::numeric_limits<std::uint64_t>::max(), "cache unpin epoch exhausted");
+        ++unpin_epoch_;
+    }
     if (strong_count_ == 0) {
         delete this;
     }

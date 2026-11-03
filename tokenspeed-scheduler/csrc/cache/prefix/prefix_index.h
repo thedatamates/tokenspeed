@@ -73,11 +73,11 @@ public:
 
     // Non-owning traversal state, bound on first use to one index/pool. The
     // index and pool must outlive it; do not insert, erase, or re-key entries
-    // in that tier until traversal is finished. Use a fresh cursor per plan.
+    // in that tier or release pins until traversal is finished. Use a fresh cursor per plan.
     class EvictionCursor {
         friend class PrefixCacheIndex;
         const CacheEntries* cache_index_{nullptr};
-        EvictionOrderMap::const_iterator next_;
+        std::size_t next_candidate_{0};
     };
 
     // One unpinned entry, paired with the metadata an eviction policy reads.
@@ -127,6 +127,7 @@ public:
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        cache_index.eviction_scan.unpin_epoch.reset();
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
         }
@@ -224,32 +225,54 @@ public:
     bool NextEvictionEpoch(const BlockPool& pool, EvictionCursor& cursor, std::vector<EvictionCandidate>& out) const {
         if (cursor.cache_index_ == nullptr) {
             cursor.cache_index_ = findCacheEntries(pool);
-            if (cursor.cache_index_ == nullptr) {
-                return false;
+            if (cursor.cache_index_ == nullptr) return false;
+            auto& scan = cursor.cache_index_->eviction_scan;
+            if (scan.unpin_epoch != pool.UnpinEpoch()) {
+                scan.candidates.clear();
+                scan.next = cursor.cache_index_->by_eviction_order.begin();
+                scan.unpin_epoch = pool.UnpinEpoch();
             }
-            cursor.next_ = cursor.cache_index_->by_eviction_order.begin();
         }
+        auto& scan = cursor.cache_index_->eviction_scan;
         const auto end = cursor.cache_index_->by_eviction_order.end();
-        while (cursor.next_ != end) {
-            const std::int32_t retention_class = cursor.next_->first.retention_class;
-            const std::uint64_t epoch = cursor.next_->first.last_access_epoch;
-            const std::size_t initial_size = out.size();
-            for (; cursor.next_ != end && cursor.next_->first.retention_class == retention_class &&
-                   cursor.next_->first.last_access_epoch == epoch;
-                 ++cursor.next_) {
-                const CacheEntry& cache_entry = *cursor.next_->second;
-                if (cache_entry.block_ref.unique()) {
-                    out.push_back(EvictionCandidate{
-                        .location = cache_entry.block_ref->Location(),
-                        .metadata = metadataOf(cache_entry),
-                    });
+        // Cache only the traversal, never ownership. A new pin is checked on
+        // every read; releasing a pin invalidates skipped entries for the next
+        // cursor. Extend lazily so finding one victim need not scan the index.
+        const auto peek = [&](std::optional<std::pair<std::int32_t, std::uint64_t>> limit) {
+            while (true) {
+                if (cursor.next_candidate_ < scan.candidates.size()) {
+                    const auto entry = scan.candidates[cursor.next_candidate_];
+                    if (entry->second->block_ref.unique()) return entry;
+                    ++cursor.next_candidate_;
+                } else {
+                    while (scan.next != end) {
+                        if (limit &&
+                            std::pair{scan.next->first.retention_class, scan.next->first.last_access_epoch} != *limit)
+                            return end;
+                        const auto entry = scan.next++;
+                        if (entry->second->block_ref.unique()) {
+                            scan.candidates.push_back(entry);
+                            break;
+                        }
+                    }
+                    if (cursor.next_candidate_ == scan.candidates.size()) return end;
                 }
             }
-            if (out.size() != initial_size) {
-                return true;
-            }
-        }
-        return false;
+        };
+        auto entry = peek(std::nullopt);
+        if (entry == end) return false;
+        const auto retention_class = entry->first.retention_class;
+        const auto epoch = entry->first.last_access_epoch;
+        do {
+            out.push_back(EvictionCandidate{
+                .location = entry->second->block_ref->Location(),
+                .metadata = metadataOf(*entry->second),
+            });
+            ++cursor.next_candidate_;
+            entry = peek(std::pair{retention_class, epoch});
+        } while (entry != end && entry->first.retention_class == retention_class &&
+                 entry->first.last_access_epoch == epoch);
+        return true;
     }
 
     std::int32_t NumEntries(const BlockPool& pool) const {
@@ -391,6 +414,12 @@ private:
         std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
         std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
         EvictionOrderMap by_eviction_order;
+        struct EvictionScan {
+            std::optional<std::uint64_t> unpin_epoch;
+            std::vector<EvictionOrderMap::const_iterator> candidates;
+            EvictionOrderMap::const_iterator next;
+        };
+        mutable EvictionScan eviction_scan;
     };
 
     static CachedBlockMetadata metadataOf(const CacheEntry& cache_entry) noexcept {
@@ -425,6 +454,7 @@ private:
         entry_it->was_acquired = was_acquired;
         const EvictionOrder next = evictionOrder(*entry_it);
         if (previous != next) {
+            cache_index.eviction_scan.unpin_epoch.reset();
             cache_index.by_eviction_order.erase(previous);
             cache_index.by_eviction_order.emplace(next, entry_it);
         }
@@ -464,6 +494,7 @@ private:
         return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
+        cache_index.eviction_scan.unpin_epoch.reset();
         cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());

@@ -295,10 +295,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t candidate_prefix_pages = config_.role == Role::kD
                                                     ? request->PrefillSize() / prefix_granularity
                                                     : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
-    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    std::vector<std::string> hashes =
-        ComputePrefixHashes(prefix_pages, request->CacheSeed(config_.disable_prefix_cache));
+    const auto hashes = request->PromptPrefixHashes(candidate_prefix_pages, config_.disable_prefix_cache);
 
     AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
@@ -319,12 +316,11 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // hashed page.
     const std::int32_t hit_prefix_pages =
         std::max(match.probe.device.full_page_tokens, match.probe.host.full_page_tokens) / prefix_granularity;
-    match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
+    match.prefix_hashes = hashes.first(static_cast<std::size_t>(hit_prefix_pages));
 
     const std::int32_t extension_pages =
         std::max(match.probe.host.full_page_tokens - match.probe.device.full_page_tokens, 0) / prefix_granularity;
-    const auto extension_begin = hashes.begin() + match.probe.device.full_page_tokens / prefix_granularity;
-    match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
+    match.extension_hashes = hashes.subspan(match.probe.device.full_page_tokens / prefix_granularity, extension_pages);
     return match;
 }
 
@@ -523,7 +519,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         }
     }
     fsm::CacheProgress cache_progress{
-        .prefix_hashes = std::move(match.prefix_hashes),
+        .prefix_hashes = std::vector<std::string>(match.prefix_hashes.begin(), match.prefix_hashes.end()),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
     };

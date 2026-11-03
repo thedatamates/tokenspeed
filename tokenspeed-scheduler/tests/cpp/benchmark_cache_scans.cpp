@@ -31,6 +31,8 @@
 #include "cache/core/block_table.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/prefix/prefix_index.h"
+#include "scheduler/request.h"
+#include "cache/prefix/prefix_hasher.h"
 
 namespace tokenspeed {
 namespace {
@@ -262,6 +264,21 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
     });
 }
 
+void MeasurePromptHashRetries(std::int32_t tokens, std::int32_t iterations) {
+    RequestSpec spec{.request_id = "hash-retry", .tokens = std::vector<std::int32_t>(tokens, 42)};
+    Request request(spec, 128, Role::kFused);
+    const auto pages = (tokens - 1) / 128;
+    Measure("prompt_hash_recomputed", tokens, pages, iterations, [&] {
+        auto spans = request.FullPrefixPages(false);
+        spans.resize(static_cast<std::size_t>(pages));
+        const auto hashes = ComputePrefixHashes(spans, request.CacheSeed(false));
+        return static_cast<std::uint64_t>(hashes.back().size());
+    });
+    request.PromptPrefixHashes(pages, false);  // first construction is not a retry
+    Measure("prompt_hash_retry_cached", tokens, pages, iterations,
+            [&] { return static_cast<std::uint64_t>(request.PromptPrefixHashes(pages, false).back().size()); });
+}
+
 void MeasureAvailableLcmBlocks(std::int32_t pool_size, std::int32_t iterations) {
     BlockPool pool(pool_size, {1});
     CacheCoordinator coordinator = MakeAdmissionCoordinator(pool);
@@ -387,6 +404,9 @@ int main() {
         tokenspeed::MeasureAdmission(pool_size, iterations);
         tokenspeed::MeasurePinnedAdmission(pool_size, std::min(iterations, 100));
         tokenspeed::MeasureAvailableLcmBlocks(pool_size, iterations);
+    }
+    for (const std::int32_t tokens : {16384, 65536, 262144}) {
+        tokenspeed::MeasurePromptHashRetries(tokens, 100);
     }
     for (const std::int32_t pool_size : tokenspeed::kHostPoolSizes) {
         const std::int32_t iterations = std::max(3, 1000000 / pool_size);

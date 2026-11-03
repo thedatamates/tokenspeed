@@ -67,7 +67,8 @@ namespace internal_cache_block_ref {
 // destroyed together with the control when the last CacheBlockRef releases it.
 class CacheBlockControl {
 public:
-    CacheBlockControl(BlockPool& owner_pool, CacheBlockLocation location) noexcept : object_{owner_pool, location} {}
+    CacheBlockControl(BlockPool& owner_pool, CacheBlockLocation location, std::uint64_t& unpin_epoch) noexcept
+        : object_{owner_pool, location}, unpin_epoch_{unpin_epoch} {}
     CacheBlockControl(const CacheBlockControl&) = delete;
     CacheBlockControl& operator=(const CacheBlockControl&) = delete;
     CacheBlockControl(CacheBlockControl&&) = delete;
@@ -88,6 +89,7 @@ private:
 
     CacheBlock object_;
     std::uint32_t strong_count_{1};
+    std::uint64_t& unpin_epoch_;
 };
 
 }  // namespace internal_cache_block_ref

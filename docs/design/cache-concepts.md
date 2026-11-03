@@ -104,8 +104,11 @@ to the global empty-parent FIFO rather than any group.
 The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
 by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
-the holders; the pool does not track it, and `CacheBlockRef` does not report
-it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+the holders; the pool does not track those identities or counts. A pool-scoped
+unpin epoch advances when a block's reference count drops to one. It is only an
+invalidation version, not an occupancy or eligibility count: retaining a new pin
+still requires the index to check current ownership. Anything that needs
+"held only by the cache" asks `PrefixCacheIndex`
 (`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
 eviction policy and leak checks, not for per-step accounting.
 
@@ -114,6 +117,17 @@ request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
+
+Under pressure, the prefix index lazily retains the ordered traversal's unpinned
+candidates and its scan frontier. New admission cursors reuse that work while
+the index and pool's unpin epoch are unchanged. Every returned candidate is
+checked against its current ownership, so a newly pinned block is never offered.
+An unpin invalidates previously skipped entries; insertion, removal and re-keying
+invalidate stored iterators. Cached traversal holds no block references and stops
+at the current access epoch rather than eagerly scanning the rest of the index.
+Cursors are local to one read-only planning operation; mutations or released
+pins require a fresh cursor. This keeps repeated failed admissions from walking
+the same pinned cache over and over without changing eviction order.
 
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block

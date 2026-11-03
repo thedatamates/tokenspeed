@@ -74,6 +74,19 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
     }
 }
 
+std::span<const std::string> Request::PromptPrefixHashes(std::int32_t pages, bool private_cache) {
+    _assert(pages >= 0 && pages <= submitted_prompt_size_ / prefix_granularity_,
+            "hashes must lie inside the submitted prompt");
+    auto& hashes = prompt_prefix_hashes_[private_cache ? 1 : 0];
+    hashes.reserve(static_cast<std::size_t>(pages));
+    while (hashes.size() < static_cast<std::size_t>(pages)) {
+        const auto begin = static_cast<std::int32_t>(hashes.size()) * prefix_granularity_;
+        hashes.push_back(HashPrefixPage(TokenSlice(begin, prefix_granularity_),
+                                        hashes.empty() ? CacheSeed(private_cache) : hashes.back()));
+    }
+    return std::span<const std::string>(hashes).first(static_cast<std::size_t>(pages));
+}
+
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{

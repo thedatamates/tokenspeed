@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <limits>
@@ -61,6 +62,9 @@ public:
     const std::string& CacheSeed(bool private_cache) const {
         return private_cache ? private_cache_seed_ : shared_cache_seed_;
     }
+
+    // Immutable prompt hashes, extended lazily and kept separate by cache identity.
+    std::span<const std::string> PromptPrefixHashes(std::int32_t pages, bool private_cache);
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -349,6 +353,7 @@ private:
     std::string private_cache_seed_;
     std::string shared_cache_seed_;
     TokenContainer token_container_;
+    std::array<std::vector<std::string>, 2> prompt_prefix_hashes_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};

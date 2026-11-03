@@ -156,6 +156,34 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) 
     EXPECT_EQ(DrainEvictionOrder(index, pool).size(), 2u);
 }
 
+TEST(PrefixCacheIndexEvictionOrderTest, RepeatedScansObservePinAndUnpinTransitions) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex index(kGroupId, /*prefix_closed=*/true);
+    auto first = pool.AcquireBlock(kGroupId);
+    auto second = pool.AcquireBlock(kGroupId);
+    const auto first_location = first->Location();
+    const auto second_location = second->Location();
+    index.Register(pool, first, KeyOf("first"), 1, -1, CacheBoundaryKind::kChunk, nullptr);
+    index.Register(pool, second, KeyOf("second"), 2, -1, CacheBoundaryKind::kChunk, nullptr);
+    EXPECT_TRUE(DrainEvictionOrder(index, pool).empty());
+    EXPECT_TRUE(DrainEvictionOrder(index, pool).empty());
+
+    // A transfer may still own a block after the request lets it go.
+    auto transfer = first;
+    first.reset();
+    EXPECT_TRUE(DrainEvictionOrder(index, pool).empty());
+    transfer.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{first_location}));
+
+    // A cached candidate can become pinned without changing index metadata.
+    first = index.Find(pool, KeyOf("first"));
+    EXPECT_TRUE(DrainEvictionOrder(index, pool).empty());
+    second.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{second_location}));
+    first.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{first_location, second_location}));
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextEpoch) {
     BlockPool pool(5, {1});
     PrefixCacheIndex index(kGroupId, /*prefix_closed=*/true);
