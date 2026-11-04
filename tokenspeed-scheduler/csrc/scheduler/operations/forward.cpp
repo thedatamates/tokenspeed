@@ -1150,7 +1150,7 @@ std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuil
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     std::optional<std::span<const std::string>> host_prefix;
     if (const auto anchor = victim.HostCacheAnchorTokens()) {
-        const std::span<const std::string> hashes{victim.CacheProgress().prefix_hashes};
+        const std::span<const std::string> hashes{victim.CacheProgressRef().prefix_hashes};
         const auto pages = static_cast<std::size_t>(*anchor / coordinator_.PrefixGranularity());
         host_prefix = hashes.first(std::min(hashes.size(), pages));
     }
