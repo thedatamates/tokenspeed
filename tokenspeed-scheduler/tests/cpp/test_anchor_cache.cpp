@@ -53,12 +53,12 @@ TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
         spec.block_granularity = 2;
         spec.cache_blocks_per_lcm_block = 1;
         auto coordinator = MakeCoordinator(std::span<const CacheGroupSpec>(&spec, 1), 2, device, false, &host,
-                                           /*snapshot_pool=*/nullptr, true);
+                                           /*snapshot_pool=*/nullptr, true, false, /*checkpoint_retention_requests=*/0);
         const std::vector<std::uint32_t> requested{0, 0};
         auto allocation = coordinator.AcquireHostBlocks(requested, std::vector<std::int32_t>(requested.size(), 0));
         ASSERT_TRUE(allocation.blocks.size() == 2 && allocation.blocks[0] && allocation.blocks[1]);
-        ASSERT_TRUE(coordinator.ResolveHostBlockId(0, allocation.blocks[0]->Location()) == 1);
-        ASSERT_TRUE(coordinator.ResolveHostBlockId(0, allocation.blocks[1]->Location()) == 2);
+        ASSERT_TRUE(coordinator.Allocator(0).ResolveCacheBlockId(*allocation.blocks[0]) == 1);
+        ASSERT_TRUE(coordinator.Allocator(0).ResolveCacheBlockId(*allocation.blocks[1]) == 2);
         ASSERT_TRUE(host.NumEmptyLcmBlocks() == 0);
         ASSERT_TRUE(!coordinator.AcquireHostBlock(0, 0));
         allocation.blocks.clear();
@@ -73,17 +73,18 @@ TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
             spec.block_granularity = 2;
             spec.cache_blocks_per_lcm_block = 1;
         }
-        auto coordinator = MakeCoordinator(specs, 2, device, false, &host, /*snapshot_pool=*/nullptr, true);
+        auto coordinator = MakeCoordinator(specs, 2, device, false, &host, /*snapshot_pool=*/nullptr, true, false,
+                                           /*checkpoint_retention_requests=*/0);
         auto a = coordinator.AcquireHostBlock(0, 0);
         auto b = coordinator.AcquireHostBlock(0, 0);
-        coordinator.CacheHostBlock(a, CacheKey{.group_id = 0, .content_hash = "a"});
-        coordinator.CacheHostBlock(b, CacheKey{.group_id = 0, .content_hash = "b"});
+        coordinator.CacheHostBlock(a, CacheKey{.group_id = 0, .content_hash = "a"}, std::nullopt);
+        coordinator.CacheHostBlock(b, CacheKey{.group_id = 0, .content_hash = "b"}, std::nullopt);
         a.reset();
         b.reset();
         ASSERT_TRUE(coordinator.NumHostCachedBlocks() == 2);
         auto other = coordinator.AcquireHostBlock(1, 0);
         ASSERT_TRUE(other && coordinator.NumHostCachedBlocks() == 0);
-        ASSERT_TRUE(coordinator.ResolveHostBlockId(1, other->Location()) == 1);
+        ASSERT_TRUE(coordinator.Allocator(1).ResolveCacheBlockId(*other) == 1);
     }
     SchedulerConfig config{};
     config.prefix_granularity = 2;
@@ -108,7 +109,7 @@ TEST(AnchorCache, PackedHostEvictionReplayAndNamespaceIsolation) {
     });
     SetTestSnapshotPool(config);
     config.debug_force_retraction_interval = 6;
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     RequestSpec spec{};
     spec.request_id = "seed";
     spec.tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
@@ -175,7 +176,7 @@ TEST(AnchorCache, TieredAnchorPreservesResidentWindowHit) {
         .sliding_window_tokens = 4,
     });
     SetTestSnapshotPool(config);
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     RequestSpec spec{};
     spec.request_id = "seed";
     spec.tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
@@ -208,6 +209,7 @@ TEST(AnchorCache, ProducerNamespaceCrossFloorLifecycle) {
             config.prefix_granularity = 2;
             config.device_allocator.total_pages = 128;
             config.host_allocator.total_pages = host ? 128 : 0;
+            if (host) config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
             config.max_scheduled_tokens = 64;
             config.max_batch_size = 1;
             config.disable_l2_cache = !host;
@@ -234,7 +236,7 @@ TEST(AnchorCache, ProducerNamespaceCrossFloorLifecycle) {
             });
             SetTestSnapshotPool(config);
             if (terminal == 2) config.debug_force_retraction_interval = 4;
-            Scheduler scheduler(config);
+            Scheduler scheduler(WithHostPackingFromDevice(config));
             RequestSpec donor{};
             donor.request_id = "donor";
             donor.tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};

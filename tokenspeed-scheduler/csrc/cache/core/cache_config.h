@@ -61,8 +61,6 @@ struct CacheGroupConfig {
     // shard_count (the contract's virtual_packing). Each of the shard_count
     // owners holds one physical child for every shard_count virtual ones.
     std::int32_t cache_blocks_per_lcm_block{1};
-    // Separate physical tier geometry; omitted means the device packing.
-    std::optional<std::int32_t> host_cache_blocks_per_lcm_block;
     AttnKind attn_kind{AttnKind::kFull};
     // Set exactly for kSlidingWindow.
     std::optional<std::int32_t> sliding_window_tokens{};
@@ -80,6 +78,10 @@ struct CacheGroupConfig {
     // Cyclic owners of this group's virtual blocks; the pool balances new
     // children across them by request load. 1 keeps the group replicated.
     std::int32_t shard_count{1};
+    // State checkpoints may only be reused/published at multiples of this
+    // token count and must be produced by prefill. 1 preserves arbitrary
+    // natural checkpoints, including decode endpoints. No row span.
+    std::int32_t checkpoint_granularity{1};
 
     void Validate() const;
     // Validate() without the total_pages check: every field the capacity

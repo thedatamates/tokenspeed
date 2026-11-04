@@ -42,7 +42,7 @@ SchedulerConfig WidthConfig(std::int32_t budget) {
         .attn_kind = AttnKind::kFull,
     });
     SetTestSnapshotPool(config);
-    return config;
+    return WithHostPackingFromDevice(config);
 }
 const ForwardBatch& FirstBatch(const ExecutionPlan& plan) {
     for (const auto& operation : plan.Operations())
@@ -88,17 +88,17 @@ static void AckRecovery(Scheduler& scheduler, const ExecutionPlan& plan) {
 TEST(SelectedDecodeWidth, PartialCommitRetractionAndRestore) {
     auto config = WidthConfig(64);
     config.debug_force_retraction_interval = 5;
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     SubmitWidthRequest(scheduler, "a", {1, 2, 3, 4});
     SelectWidth(scheduler, "a", 1, 1);
     auto plan = scheduler.NextExecutionPlan();
     EXPECT_EQ(FirstBatch(plan).input_lengths, std::vector<std::int32_t>({4}));
-    EXPECT_EQ(FirstBatch(plan).block_tables.at("history")[0].size(), 3);
+    EXPECT_EQ(FirstBatch(plan).BlockTables().at("history")[0].size(), 3);
     CommitWidthTokens(scheduler, "a", {10});
     SelectWidth(scheduler, "a", 6, 1);
     plan = scheduler.NextExecutionPlan();
     EXPECT_EQ(FirstBatch(plan).input_lengths, std::vector<std::int32_t>({6}));
-    EXPECT_GE(FirstBatch(plan).block_tables.at("history")[0].size(), 5);
+    EXPECT_GE(FirstBatch(plan).BlockTables().at("history")[0].size(), 5);
     EXPECT_THROW(SelectWidth(scheduler, "a", 1, 1), std::invalid_argument);
     CommitWidthTokens(scheduler, "a", {11, 12});
     SelectWidth(scheduler, "a", 1, 1);
@@ -206,7 +206,7 @@ RetainedCapacityResult RunRetainedCapacityCase(std::optional<std::int32_t> selec
     config.max_batch_size = 1;
     config.device_allocator.total_pages = 24;
     config.cache_groups.front().total_pages = 24;
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     RequestSpec request{};
     request.request_id = "reserved-generation";
     request.tokens = {1, 2, 3, 4};
@@ -215,7 +215,7 @@ RetainedCapacityResult RunRetainedCapacityCase(std::optional<std::int32_t> selec
     if (selected_width) SelectWidth(scheduler, request.request_id, 1, 1);
     auto plan = scheduler.NextExecutionPlan();
     RetainedCapacityResult result;
-    result.initial_pages = FirstBatch(plan).block_tables.at("history").front().size();
+    result.initial_pages = FirstBatch(plan).BlockTables().at("history").front().size();
     result.high_water_pages = result.initial_pages;
     EXPECT_EQ(result.initial_pages, 18);
     CommitWidthTokens(scheduler, request.request_id, {10});
@@ -229,7 +229,7 @@ RetainedCapacityResult RunRetainedCapacityCase(std::optional<std::int32_t> selec
         }
         EXPECT_EQ(batch.request_ids, std::vector<std::string>({request.request_id}));
         EXPECT_EQ(batch.input_lengths, std::vector<std::int32_t>({selected_width.value_or(6)}));
-        const auto pages = batch.block_tables.at("history").front().size();
+        const auto pages = batch.BlockTables().at("history").front().size();
         result.high_water_pages = std::max(result.high_water_pages, pages);
         if (selected_width) {
             // There are 46 usable physical positions: full generation plus enough q6
@@ -288,18 +288,18 @@ TEST(SelectedDecodeWidth, ZeroRetainedResultReturnsItsWholeExplicitReservation) 
     auto config = WidthConfig(64);
     config.device_allocator.total_pages = 24;
     config.cache_groups.front().total_pages = 24;
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     scheduler.SubmitRequests({RequestSpec{.request_id = "zero", .tokens = {1, 2, 3, 4}, .max_new_tokens = 32}});
     SelectWidth(scheduler, "zero", 1, 1);
     auto plan = scheduler.NextExecutionPlan();
-    const auto pages = FirstBatch(plan).block_tables.at("history").front().size();
+    const auto pages = FirstBatch(plan).BlockTables().at("history").front().size();
     CommitWidthTokens(scheduler, "zero", {10});
     SelectWidth(scheduler, "zero", 6, 1);
     for (std::int32_t step = 0; step < 12; ++step) {
         plan = scheduler.NextExecutionPlan();
         const auto& batch = FirstBatch(plan);
         ASSERT_EQ(batch.request_ids, std::vector<std::string>({"zero"}));
-        EXPECT_EQ(batch.block_tables.at("history").front().size(), pages);
+        EXPECT_EQ(batch.BlockTables().at("history").front().size(), pages);
         CommitWidthTokens(scheduler, "zero", {});
     }
     FinishWidthRequest(scheduler, "zero");
@@ -310,7 +310,7 @@ TEST(SelectedDecodeWidth, PipelinedEmptyPrefillResultsDoNotRefundDecodeReservati
     auto config = WidthConfig(8);
     config.device_allocator.total_pages = 32;
     config.cache_groups.front().total_pages = 32;
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     scheduler.SubmitRequests({RequestSpec{.request_id = "chunks", .tokens = MakeTokens(20), .max_new_tokens = 32}});
     SelectWidth(scheduler, "chunks", 1, 1);
     for (const auto expected : {8, 8, 4}) {
@@ -325,7 +325,7 @@ TEST(SelectedDecodeWidth, PipelinedEmptyPrefillResultsDoNotRefundDecodeReservati
         const auto plan = scheduler.NextExecutionPlan();
         const auto& batch = FirstBatch(plan);
         ASSERT_EQ(batch.request_ids, std::vector<std::string>({"chunks"}));
-        EXPECT_EQ(batch.block_tables.at("history").front().size(), 26);
+        EXPECT_EQ(batch.BlockTables().at("history").front().size(), 26);
         CommitWidthTokens(scheduler, "chunks", {11});
     }
     FinishWidthRequest(scheduler, "chunks");
@@ -340,11 +340,11 @@ TEST(SelectedDecodeWidth, PartialCommitsFitExactBoundedGenerationWithHorizonFall
         config.device_allocator.total_pages = 130;
         config.cache_groups.front().block_granularity = 4;
         config.cache_groups.front().total_pages = 130;
-        Scheduler scheduler(config);
+        Scheduler scheduler(WithHostPackingFromDevice(config));
         scheduler.SubmitRequests({RequestSpec{.request_id = "bounded", .tokens = {1, 2, 3, 4}, .max_new_tokens = 512}});
         SelectWidth(scheduler, "bounded", 1, 1);
         auto plan = scheduler.NextExecutionPlan();
-        ASSERT_EQ(FirstBatch(plan).block_tables.at("history").front().size(), 129);
+        ASSERT_EQ(FirstBatch(plan).BlockTables().at("history").front().size(), 129);
         CommitWidthTokens(scheduler, "bounded", {10});
         std::int32_t generated = 1;
         while (generated < 512) {
@@ -354,7 +354,7 @@ TEST(SelectedDecodeWidth, PartialCommitsFitExactBoundedGenerationWithHorizonFall
             const auto& batch = FirstBatch(plan);
             ASSERT_EQ(batch.request_ids, std::vector<std::string>({"bounded"})) << "generated=" << generated;
             EXPECT_EQ(batch.input_lengths, std::vector<std::int32_t>({width}));
-            EXPECT_EQ(batch.block_tables.at("history").front().size(), 129);
+            EXPECT_EQ(batch.BlockTables().at("history").front().size(), 129);
             const auto retained = width == 6 ? retained_per_step : 1;
             CommitWidthTokens(scheduler, "bounded", std::vector<std::int32_t>(retained, 11));
             generated += retained;
@@ -380,7 +380,7 @@ TEST(SelectedDecodeWidth, PartialCommitRefundWorksAcrossSparseReplayableGroups) 
     replay.sliding_window_tokens = 16;
     replay.replayable = true;
     config.cache_groups.push_back(replay);
-    Scheduler scheduler(config);
+    Scheduler scheduler(WithHostPackingFromDevice(config));
     const auto prompt = MakeTokens(32);
     scheduler.SubmitRequests({RequestSpec{.request_id = "seed", .tokens = prompt, .max_new_tokens = 64}});
     SelectWidth(scheduler, "seed", 1, 1);
@@ -394,7 +394,7 @@ TEST(SelectedDecodeWidth, PartialCommitRefundWorksAcrossSparseReplayableGroups) 
     const auto& prefill = FirstBatch(plan);
     ASSERT_EQ(prefill.request_ids, std::vector<std::string>({"hit"}));
     EXPECT_GT(prefill.extend_prefix_lens.front(), 0);
-    const auto& replay_pages = prefill.block_tables.at("replay").front();
+    const auto replay_pages = prefill.BlockTables().at("replay").front();
     EXPECT_TRUE(std::ranges::any_of(replay_pages, [](std::int32_t page) { return page == 0; }));
     CommitWidthTokens(scheduler, "hit", {10});
     SelectWidth(scheduler, "hit", 6, 1);
@@ -402,7 +402,7 @@ TEST(SelectedDecodeWidth, PartialCommitRefundWorksAcrossSparseReplayableGroups) 
         plan = scheduler.NextExecutionPlan();
         const auto& batch = FirstBatch(plan);
         ASSERT_EQ(batch.request_ids, std::vector<std::string>({"hit"}));
-        EXPECT_EQ(batch.block_tables.at("history").front().size(), 12);
+        EXPECT_EQ(batch.BlockTables().at("history").front().size(), 12);
         CommitWidthTokens(scheduler, "hit", {11});
     }
     FinishWidthRequest(scheduler, "hit");

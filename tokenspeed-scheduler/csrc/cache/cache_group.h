@@ -37,10 +37,7 @@ namespace tokenspeed {
 class CacheGroup {
 public:
     CacheGroup(CacheGroupSpec spec, std::unique_ptr<GroupAllocator> allocator, std::unique_ptr<PrefixMatcher> matcher)
-        : spec_{spec},
-          allocator_{std::move(allocator)},
-          matcher_{std::move(matcher)},
-          index_{allocator_->Id(), matcher_->IsPrefixClosed()} {}
+        : spec_{spec}, allocator_{std::move(allocator)}, matcher_{std::move(matcher)}, index_{allocator_->Id()} {}
 
     CacheGroup(const CacheGroup&) = delete;
     CacheGroup& operator=(const CacheGroup&) = delete;

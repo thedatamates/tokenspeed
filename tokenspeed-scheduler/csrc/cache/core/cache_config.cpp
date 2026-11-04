@@ -54,16 +54,15 @@ void CacheGroupConfig::ValidateCapacityInputs() const {
     if (shard_count <= 0 || cache_blocks_per_lcm_block % shard_count != 0) {
         throw std::invalid_argument(where + "shard_count must be positive and divide parent packing");
     }
-    if (host_cache_blocks_per_lcm_block &&
-        (*host_cache_blocks_per_lcm_block <= 0 || *host_cache_blocks_per_lcm_block % shard_count != 0)) {
-        throw std::invalid_argument(where + "host packing must be positive and divisible by shard count");
-    }
     if (attn_kind == AttnKind::kSlidingWindow) {
         if (!sliding_window_tokens || *sliding_window_tokens <= 0) {
             throw std::invalid_argument(where + "sliding_window_tokens must be > 0 for sliding groups");
         }
     } else if (sliding_window_tokens) {
         throw std::invalid_argument(where + "only a sliding-window group carries sliding_window_tokens");
+    }
+    if (checkpoint_granularity < 1 || (attn_kind != AttnKind::kState && checkpoint_granularity != 1)) {
+        throw std::invalid_argument(where + "checkpoint_granularity requires a positive state-group grain");
     }
     if (replayable && attn_kind != AttnKind::kSlidingWindow) {
         throw std::invalid_argument(where +

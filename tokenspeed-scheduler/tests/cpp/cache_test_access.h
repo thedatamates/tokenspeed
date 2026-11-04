@@ -45,16 +45,44 @@ struct CacheCoordinatorTestAccess {
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
 
-    // The planner's Device eviction of one entry, with its tail cascade.
+    // The planner's Device eviction of one entry, with its tail cascade,
+    // counted as an admission's.
     static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
-        return coordinator.evictCachedBlock(group_id, location);
+        return coordinator.evictCachedBlock(group_id, location, &CacheCoordinator::DeviceEvictionStats::admission,
+                                            /*write_back_segment=*/nullptr);
+    }
+
+    static bool RecordDeviceEviction(CacheCoordinator& coordinator, const CacheKey& key,
+                                     CacheCoordinator::EvictedSegment& segment) {
+        const auto location = coordinator.locationOf(coordinator.pool_, key.group_id, key);
+        return location && coordinator.evictCachedBlock(key.group_id, *location,
+                                                        &CacheCoordinator::DeviceEvictionStats::admission, &segment);
     }
 
     // A Device-cached block, located rather than referenced: a held reference
     // would pin it against eviction.
     static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,
                                                               std::size_t group_index, const CacheKey& key) {
-        return coordinator.deviceLocationOf(group_index, key);
+        return coordinator.locationOf(coordinator.pool_, group_index, key);
+    }
+
+    // A Host LRU eviction of the entry under `key` (counted under lru), with
+    // its State cascade; false when it is pinned or absent.
+    static bool EvictHostCachedBlock(CacheCoordinator& coordinator, const CacheKey& key) {
+        const std::optional<CacheBlockLocation> location =
+            coordinator.locationOf(*coordinator.host_pool_, key.group_id, key);
+        if (!location) {
+            return false;
+        }
+        return coordinator.evictHostCachedBlock(key.group_id, *location, &CacheCoordinator::HostEvictionStats::lru);
+    }
+
+    static const BoundaryTree& BoundaryTreeOf(const CacheCoordinator& coordinator) {
+        return coordinator.boundary_tree_;
+    }
+
+    static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
+        return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
     }
 };
 
@@ -96,10 +124,14 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
 // Admits every History group with the same demand prototype as a new request;
 // a State group takes `state_step` (kRotate: a prefill step, the shape of a
 // first admission).
+// An admission that spends `copy_in_blocks`, the copy-in blocks the request
+// holds for the point its progress publishes (OwnerTail::kCopiedIn), and
+// reserves those of `copy_in_point` for the slots whose blocks it allocates
+// (AdmissionResult::copy_in_blocks).
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
-    GroupDemand prototype, const RequestProgress& progress,
-    StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
+    GroupDemand prototype, const RequestProgress& progress, StateStep state_step,
+    std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CacheCoordinator::CopyInPoint> copy_in_point) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (std::size_t i = 0; i < tables.size(); ++i) {
@@ -111,7 +143,17 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         }
         demands.push_back(demand);
     }
-    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt);
+    return coordinator.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point,
+                             /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
+                             /*session_id=*/{});
+}
+
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
+    CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
+    GroupDemand prototype, const RequestProgress& progress,
+    StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
+    return AdmitForTest(coordinator, tables, std::move(prefix), prototype, progress, state_step,
+                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
 }
 
 // The overloads without progress admit a request that has computed nothing

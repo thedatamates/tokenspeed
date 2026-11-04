@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import torch
@@ -40,13 +41,9 @@ from tokenspeed_kernel.ops.attention.mla import (
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
 from tokenspeed_kernel.ops.gemm import bmm, mm, plan_dense_gemm
-from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
-    nvfp4_gemm_swiglu_nvfp4_quant,
-)
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
@@ -57,10 +54,8 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.utils import get_layer_id
 
 _platform = current_platform()
-_is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
 _FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to 64
@@ -76,6 +71,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     all_to_all_head_scatter,
     all_to_all_transpose,
+    prepare_shard_exchange,
     token_all_gather,
     token_reduce_scatter,
 )
@@ -91,8 +87,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
-from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -101,6 +96,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
@@ -139,7 +135,8 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
 logger = get_colorful_logger(__name__)
 
@@ -177,6 +174,33 @@ def _prepare_mla_kv_b_proj_weights(
     )
 
 
+def absorb_mla_kv_b_proj(self_attn) -> None:
+    """Derive ``self_attn.w_kc``/``w_vc`` from its ``kv_b_proj``, dequantizing block FP8 first.
+
+    Args:
+        self_attn: An MLA attention module owning ``kv_b_proj`` and the
+            ``qk_nope_head_dim``/``v_head_dim`` split.
+    """
+    kv_b_proj = self_attn.kv_b_proj
+    w = kv_b_proj.weight
+    if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        method = kv_b_proj.quant_method
+        # The absorbed pair carries no scale, so only float block scales are taken.
+        if not (
+            isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and kv_b_proj.weight_scale_inv.is_floating_point()
+        ):
+            raise NotImplementedError(
+                f"MLA weight absorption needs a block-FP8 kv_b_proj with float "
+                f"scales, got {type(method).__name__}"
+            )
+        w = block_dequant(
+            w, kv_b_proj.weight_scale_inv, method.quant_config.weight_block_size
+        ).to(kv_b_proj.orig_dtype)
+    self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
+
+
 def _reject_query_shard(ctx: ForwardContext, where: str) -> None:
     """Fail loud when a sharded forward reaches an MLA path that attends every
     row of the span (the dense, expanded prologue with head-sharded weights);
@@ -189,7 +213,7 @@ def _reject_query_shard(ctx: ForwardContext, where: str) -> None:
         )
 
 
-class DeepseekV3MLP(nn.Module):
+class DeepseekV3MLP(GatedMLP):
     """Dense SwiGLU MLP sharded over the dense (or shared-expert) TP group.
 
     ``batch_invariant`` selects the TP-batch-invariant layout: ``down_proj``
@@ -212,18 +236,14 @@ class DeepseekV3MLP(nn.Module):
         *,
         batch_invariant: bool,
     ) -> None:
-        super().__init__()
-        self.mapping = mapping
         if is_shared_expert:
-            tp_rank = self.mapping.moe.tp_ep_rank
-            tp_size = self.mapping.moe.tp_ep_size
-            tp_group = self.mapping.moe.tp_ep_group
+            tp_rank = mapping.moe.tp_ep_rank
+            tp_size = mapping.moe.tp_ep_size
+            tp_group = mapping.moe.tp_ep_group
         else:
-            tp_rank = self.mapping.dense.tp_rank
-            tp_size = self.mapping.dense.tp_size
-            tp_group = self.mapping.dense.tp_group
-        self.batch_invariant = batch_invariant
-        self.tp_group = tp_group
+            tp_rank = mapping.dense.tp_rank
+            tp_size = mapping.dense.tp_size
+            tp_group = mapping.dense.tp_group
         if batch_invariant:
             if is_shared_expert:
                 raise ValueError(
@@ -239,7 +259,7 @@ class DeepseekV3MLP(nn.Module):
                     "the batch-invariant dense layout needs an unquantized down_proj"
                 )
 
-        self.gate_up_proj = MergedColumnParallelLinear(
+        gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
@@ -252,7 +272,7 @@ class DeepseekV3MLP(nn.Module):
         if batch_invariant:
             # Full K (the whole intermediate dim) on every rank; the output
             # is this rank's hidden shard of every gathered token.
-            self.down_proj = ColumnParallelLinear(
+            down_proj = ColumnParallelLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
@@ -263,7 +283,7 @@ class DeepseekV3MLP(nn.Module):
                 prefix=add_prefix("down_proj", prefix),
             )
         else:
-            self.down_proj = RowParallelLinear(
+            down_proj = RowParallelLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
@@ -274,20 +294,15 @@ class DeepseekV3MLP(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("down_proj", prefix),
             )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-        self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
-            envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
-            and _is_blackwell
-            and isinstance(self.gate_up_proj.quant_method, Nvfp4LinearMethod)
-            and isinstance(self.down_proj.quant_method, Nvfp4LinearMethod)
+        super().__init__(
+            gate_up_proj,
+            down_proj,
+            gated_activation(hidden_act),
+            fusions=(GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT,),
         )
-        self.gate_up_proj.interleave_linear_and_gate = (
-            self._use_nvfp4_gemm_swiglu_nvfp4_quant
-        )
+        self.mapping = mapping
+        self.batch_invariant = batch_invariant
+        self.tp_group = tp_group
 
     def forward(self, x):
         if self.batch_invariant:
@@ -301,30 +316,7 @@ class DeepseekV3MLP(nn.Module):
             x = all_gather(x, self.tp_group, dim=-1)
             x, _ = self.down_proj(x)
             return x
-
-        if x.size(0) == 0:
-            return x
-
-        if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x,
-                self.gate_up_proj.input_scale_inv,
-            )
-            x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-                x_fc1_fp4,
-                x_fc1_scale,
-                self.gate_up_proj.weight_swiglu_interleaved,
-                self.gate_up_proj.weight_scale_swiglu_interleaved,
-                self.gate_up_proj.alpha,
-                self.down_proj.input_scale_inv,
-            )
-            x, _ = self.down_proj((x_fp4, x_scale))
-            return x
-
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        return super().forward(x)
 
 
 class MoEGate(nn.Module):
@@ -683,12 +675,35 @@ class DeepseekV3AttentionMLA(nn.Module):
                 "the head-TP exchange; --attn-head-tp-size > 1 is not supported "
                 "for this model"
             )
+        if self.has_head_tp and torch.distributed.is_initialized():
+            # The decode legs' even exchanges: the absorbed query in, the
+            # latent attention output back, and (TP batch invariance) the
+            # o_proj rows. Collective: every rank builds the same layers, and
+            # layers sharing a width share one prepared exchange.
+            max_rows = int(global_server_args_dict["head_tp_exchange_max_rows"])
+            widths = [
+                num_heads * (kv_lora_rank + qk_rope_head_dim),
+                num_heads * kv_lora_rank,
+            ]
+            if self.o_proj_batch_invariant:
+                widths.append(hidden_size)
+            for channels in widths:
+                # Peer pointers and Lamport epochs belong to communication,
+                # not model weights. Discarding either breaks captured exchanges.
+                initialize_communication(
+                    partial(
+                        prepare_shard_exchange,
+                        self.head_tp_group,
+                        channels,
+                        max_rows,
+                        torch.get_default_dtype(),
+                    )
+                )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.config = config
         self.alt_stream = alt_stream
-        self.cli_factor = getattr(config, "cli_factor", 1)
         self.prefix = prefix
 
         # modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
@@ -736,6 +751,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
+            self.fused_qkv_a_proj_with_mqa = None
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1972,14 +1988,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         layer narrows it to the live rows on a narrowing step."""
         return residual
 
-    def input_layer_norm_fn(self, hidden_states, residual):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        return hidden_states, residual
-
     def forward_mlp(
         self,
         hidden_states,
@@ -2002,8 +2010,6 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 
 class DeepseekV3Model(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2013,7 +2019,6 @@ class DeepseekV3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -2021,7 +2026,6 @@ class DeepseekV3Model(nn.Module):
             config.hidden_size,
         )
         self.alt_stream = torch.cuda.Stream()
-        # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
                 DeepseekV3DecoderLayer(
@@ -2081,38 +2085,7 @@ class DeepseekV3Model(nn.Module):
 
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        model: DeepseekV3Model | None = None,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        self._model_override = model
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-
-    def resolve_model(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> DeepseekV3Model:
-        if self._model_override is not None:
-            return self._model_override
-        return self.model_cls(
-            config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
+    supports_aux_capture = True
 
     def post_init(self) -> None:
         self._routed_experts_weights_of_layer = LazyValue(
@@ -2128,6 +2101,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        self.require_aux_capture()
         # layer_ids are 0-indexed from the external API; +1 because a layer
         # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
@@ -2137,6 +2111,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.require_aux_capture()
         # DFlash checkpoints name 0-indexed target layer outputs. A layer
         # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
@@ -2215,16 +2190,6 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             ep_size=self.mapping.moe.ep_size,
         )
         for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 if num_nextn_layers > 0 and name.startswith("model.layers"):
@@ -2326,31 +2291,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
     def post_load_weights(self):
         """Derive the absorbed MLA weights; re-runs write into the same storage."""
         for layer_id in range(self.config.num_hidden_layers):
-            self_attn = self.model.layers[layer_id].self_attn
-            if hasattr(
-                self.quant_config, "weight_block_size"
-            ) and self_attn.kv_b_proj.weight.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                weight_block_size = self.quant_config.weight_block_size
-                if weight_block_size is not None:
-                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                        raise RuntimeError(
-                            "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
-                        )
-                    dtype = torch.get_default_dtype()
-                    w = block_dequant(
-                        self_attn.kv_b_proj.weight,
-                        self_attn.kv_b_proj.weight_scale_inv,
-                        weight_block_size,
-                    ).to(dtype)
-            else:
-                w = self_attn.kv_b_proj.weight
-
-            self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                w, self_attn
-            )
+            absorb_mla_kv_b_proj(self.model.layers[layer_id].self_attn)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -2441,7 +2382,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             reduce_attn_results=False,
         )
 
-        if hasattr(self.self_attn, "fused_qkv_a_proj_with_mqa"):
+        if self.self_attn.fused_qkv_a_proj_with_mqa is not None:
             q_lora_rank = getattr(config, "q_lora_rank", 0) or 0
             kv_lora_rank = getattr(config, "kv_lora_rank", 512)
             qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
@@ -2821,31 +2762,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         return super().load_weights(remapped)
 
     def post_load_weights(self):
-        self_attn = self.model.midlayer.self_attn
-        if (
-            self.quant_config is not None
-            and hasattr(self.quant_config, "weight_block_size")
-            and self_attn.kv_b_proj.weight.dtype
-            in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-        ):
-            weight_block_size = self.quant_config.weight_block_size
-            if weight_block_size is not None:
-                if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
-                    raise RuntimeError(
-                        "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
-                    )
-                dtype = torch.get_default_dtype()
-                w = block_dequant(
-                    self_attn.kv_b_proj.weight,
-                    self_attn.kv_b_proj.weight_scale_inv,
-                    weight_block_size,
-                ).to(dtype)
-            else:
-                w = self_attn.kv_b_proj.weight
-        else:
-            w = self_attn.kv_b_proj.weight
-
-        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
+        absorb_mla_kv_b_proj(self.model.midlayer.self_attn)
 
     def get_hot_token_id(self):
         return self.hot_token_id
