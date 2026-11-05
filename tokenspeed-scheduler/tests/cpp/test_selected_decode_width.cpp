@@ -168,7 +168,12 @@ TEST(SelectedDecodeWidth, OverlapSelectionPreservesEachPendingReservation) {
         EXPECT_EQ(FirstBatch(plan).BlockTables().at("history").front().size(), reserved_pages);
         CommitWidthTokens(scheduler, "overlap", {17});
     }
+    // Logical completion may precede retirement of an already planned batch.
+    // Such a request keeps its debit but cannot select any future input width.
+    scheduler.NextExecutionPlan();
     FinishWidthRequest(scheduler, "overlap");
+    EXPECT_THROW(SelectWidth(scheduler, "overlap", 1, 1), std::invalid_argument);
+    CommitWidthTokens(scheduler, "overlap", {});
     scheduler.NextExecutionPlan();
     EXPECT_EQ(scheduler.ActiveLcmBlocks(), 0);
 }
