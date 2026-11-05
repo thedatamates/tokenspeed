@@ -99,7 +99,8 @@ TEST(SelectedDecodeWidth, PartialCommitRetractionAndRestore) {
     plan = scheduler.NextExecutionPlan();
     EXPECT_EQ(FirstBatch(plan).input_lengths, std::vector<std::int32_t>({6}));
     EXPECT_GE(FirstBatch(plan).BlockTables().at("history")[0].size(), 5);
-    EXPECT_THROW(SelectWidth(scheduler, "a", 1, 1), std::invalid_argument);
+    EXPECT_NO_THROW(SelectWidth(scheduler, "a", 1, 1));
+    EXPECT_EQ(FirstBatch(plan).input_lengths, std::vector<std::int32_t>({6}));
     CommitWidthTokens(scheduler, "a", {11, 12});
     SelectWidth(scheduler, "a", 1, 1);
     plan = scheduler.NextExecutionPlan();
@@ -130,6 +131,46 @@ TEST(SelectedDecodeWidth, PartialCommitRetractionAndRestore) {
     CommitWidthTokens(scheduler, "a", {22});
     FinishWidthRequest(scheduler, "a");
     scheduler.NextExecutionPlan();
+}
+
+TEST(SelectedDecodeWidth, OverlapSelectionPreservesEachPendingReservation) {
+    auto config = WidthConfig(64);
+    config.overlap_schedule_depth = 1;
+    Scheduler scheduler(WithHostPackingFromDevice(config));
+    scheduler.SubmitRequests({RequestSpec{.request_id = "overlap", .tokens = {1, 2, 3, 4}, .max_new_tokens = 32}});
+    SelectWidth(scheduler, "overlap", 1, 1);
+    auto prefill = scheduler.NextExecutionPlan();
+    const auto reserved_pages = FirstBatch(prefill).BlockTables().at("history").front().size();
+    CommitWidthTokens(scheduler, "overlap", {10});
+
+    SelectWidth(scheduler, "overlap", 6, 1);
+    const auto wide = scheduler.NextExecutionPlan();
+    SelectWidth(scheduler, "overlap", 1, 1);
+    const auto narrow = scheduler.NextExecutionPlan();
+    EXPECT_EQ(FirstBatch(wide).input_lengths, std::vector<std::int32_t>({6}));
+    EXPECT_EQ(FirstBatch(narrow).input_lengths, std::vector<std::int32_t>({1}));
+    // The current selection is one, but this result belongs to the earlier six.
+    // Its four rejected positions must be refunded without touching the later debit.
+    CommitWidthTokens(scheduler, "overlap", {11, 12});
+    SelectWidth(scheduler, "overlap", 6, 1);
+    const auto next_wide = scheduler.NextExecutionPlan();
+    EXPECT_EQ(FirstBatch(next_wide).input_lengths, std::vector<std::int32_t>({6}));
+    EXPECT_EQ(FirstBatch(next_wide).BlockTables().at("history").front().size(), reserved_pages);
+    CommitWidthTokens(scheduler, "overlap", {13});
+    CommitWidthTokens(scheduler, "overlap", {14, 15, 16});
+    EXPECT_EQ(scheduler.RequestTokenSize("overlap"), 11);
+
+    // Repeated partial commits expose leaked debits even when initial generation
+    // headroom hid the first incorrect refund. All fit the original reservation.
+    for (std::int32_t step = 0; step < 12; ++step) {
+        const auto plan = scheduler.NextExecutionPlan();
+        ASSERT_EQ(FirstBatch(plan).request_ids, std::vector<std::string>({"overlap"}));
+        EXPECT_EQ(FirstBatch(plan).BlockTables().at("history").front().size(), reserved_pages);
+        CommitWidthTokens(scheduler, "overlap", {17});
+    }
+    FinishWidthRequest(scheduler, "overlap");
+    scheduler.NextExecutionPlan();
+    EXPECT_EQ(scheduler.ActiveLcmBlocks(), 0);
 }
 
 TEST(SelectedDecodeWidth, MixedBudgetSkipsNonfittingWideRequest) {

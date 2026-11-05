@@ -1626,10 +1626,12 @@ policy and its Host format from conservative anchor namespaces.
 ## Explicit per-request decode width
 
 An executor may send `UpdateDecodeWidth` through the ordinary `Advance` event
-path after all previous results for that request have landed. Both the selected
+path to select the input width of future plans. Both the selected
 input width and the retraction fallback are explicit: each is positive, the
 selected width cannot exceed configured decode capability, and fallback cannot
-exceed selected width. Unknown, finished or in-flight requests reject changes.
+exceed selected width. Unknown and finished requests reject changes. Pending
+forwards keep the widths and reservation debits recorded when they were planned;
+a later selection never changes their input shape or how their results settle.
 Without this event, configured decode width and legacy reserve feedback retain
 their existing meaning.
 
@@ -1641,8 +1643,11 @@ reserve hints; `UpdateReserveNumTokens` alone does not select execution width.
 Retraction restores the explicitly supplied fallback until the executor has
 rebuilt any required state and selects a new width.
 
-Publish accepted output tokens with `ExtendResult` before selecting the next
-width, and never mutate width after a plan has allocated its input rows. Events
+When selection depends on a result, publish its accepted output tokens with
+`ExtendResult` before selecting the width for a future plan. A plan already
+allocated has an immutable input shape, even if that result changes the selection.
+The executor must preserve native state and respect the worst-case remaining
+context/output budget for every forward it plans before earlier results arrive. Events
 identify the current request lifetime by its ordinary request ID: the caller
 must retire outstanding event receipts before reusing that ID. Per-request
 native state and sampling identity must not be inferred from batch row order.

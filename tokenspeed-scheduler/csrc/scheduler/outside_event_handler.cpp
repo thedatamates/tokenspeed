@@ -250,8 +250,10 @@ void Scheduler::handleEvent(const forward::UpdateDecodeWidth& event) {
     if (event.input_tokens < 1 || event.input_tokens > config_.decode_input_tokens || event.fallback_input_tokens < 1 ||
         event.fallback_input_tokens > event.input_tokens)
         throw std::invalid_argument("decode width outside explicit capability");
-    if (request->ResultsInFlight() != 0 || request->Is<fsm::Finished>())
-        throw std::invalid_argument("decode width requires drained live request");
+    if (request->Is<fsm::Finished>()) throw std::invalid_argument("decode width requires a live request");
+    // This selects future plans only. Each in-flight forward already owns its
+    // immutable input width and FIFO reservation debit; its result settles that
+    // debit, never the selection current when the result arrives.
     request->SelectDecodeWidth(event.input_tokens, event.fallback_input_tokens);
 }
 
