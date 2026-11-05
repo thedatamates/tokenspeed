@@ -1777,7 +1777,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // and takes no budget. In mixed mode resident decodes then take their token
 // budget -- a client is streaming them, and a long prefill chunk must not
 // starve them -- leaving the budget a pending local prefill cannot advance
-// without (MinPrefillChunkTokens); the prefill phases spend the rest. Outside
+// without (MinPrefillChunkTokens); the prefill phases spend the rest, then
+// decodes may use any unused prefill reserve. Outside
 // mixed mode prefill work runs alone, and decodes get a round only when no
 // prefill scheduled.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
@@ -1795,7 +1796,13 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
 
     scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
 
-    if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
+    if (build.pending_prefill_reserve > 0) {
+        // Prefills had their opportunity. A waiting prompt may lack a request
+        // slot or pages; keeping its unused reserve would prevent the resident
+        // decodes from finishing and releasing that capacity.
+        build.pending_prefill_reserve = 0;
+        scheduleDecodeBatch(feedback, build, candidates);
+    } else if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);
     }
 

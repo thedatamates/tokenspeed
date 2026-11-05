@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -7606,8 +7607,67 @@ TEST_F(BoundedReplayMixedSuite, DecodeBatchLeavesRoomForTheReplayWindow) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 24 - kReplayWindow);
     EXPECT_EQ(op->extend_replay_lens.at(0), kReplayWindow);
     EXPECT_EQ(op->input_lengths.at(0), kReplayWindow + 15);
-    EXPECT_EQ(op->request_ids.size(), 1u + 6u);
+    // The prefill uses 31 of its 32 reserved rows. One more decode can
+    // spend the unused row without reducing the prefill chunk.
+    EXPECT_EQ(op->request_ids.size(), 1u + 7u);
+    EXPECT_EQ(std::accumulate(op->input_lengths.begin(), op->input_lengths.end(), 0), MaxScheduledTokens());
 }
+
+// With the minimum replay budget, a waiting prompt reserves the whole round.
+// Once all request slots are occupied, resident decodes must still finish so
+// that the waiting prompt can acquire a slot.
+class BoundedReplayFullSlotsSuite : public BoundedReplayMixedSuite, public ::testing::WithParamInterface<int> {
+protected:
+    std::int32_t MaxScheduledTokens() const override { return 2 * kReplayWindow; }
+    std::int32_t MaxBatchSize() const override { return 2; }
+
+    SchedulerConfig MakeConfig() override {
+        auto cfg = BoundedReplayMixedSuite::MakeConfig();
+        cfg.overlap_schedule_depth = GetParam();
+        return cfg;
+    }
+};
+
+TEST_P(BoundedReplayFullSlotsSuite, WaitingPromptDoesNotPreventResidentCompletion) {
+    std::map<std::string, int> outputs;
+    for (int i = 0; i < 3; ++i) {
+        const std::string id = "r" + std::to_string(i);
+        outputs[id] = 0;
+        Submit(MakeSpecWithTokens(id, MakeTokens(/*count=*/4, /*start=*/100 + 10 * i)));
+    }
+
+    auto current = PlanOnce();
+    ASSERT_NE(FindForwardBatch(current), nullptr);
+    ASSERT_EQ(FindForwardBatch(current)->request_ids.size(), 2u);
+    for (int round = 0; round < 16; ++round) {
+        std::optional<ExecutionPlan> pending;
+        if (GetParam() != 0) pending = PlanOnce();
+        if (const auto* batch = FindForwardBatch(current)) {
+            EXPECT_LE(batch->request_ids.size(), 2u);
+            EXPECT_LE(std::accumulate(batch->input_lengths.begin(), batch->input_lengths.end(), 0),
+                      MaxScheduledTokens());
+            EXPECT_EQ(std::set<std::string>(batch->request_ids.begin(), batch->request_ids.end()).size(),
+                      batch->request_ids.size());
+            for (const auto& id : batch->request_ids) {
+                // Each prompt fits one chunk. Retire a speculative plan made
+                // before Finish without producing another token.
+                if (outputs.at(id) == 2) {
+                    SendForwardDone(id);
+                } else {
+                    SendForwardDone(id, {9000});
+                    if (++outputs.at(id) == 2) SendFinish(id);
+                }
+            }
+        }
+        current = pending ? std::move(*pending) : PlanOnce();
+    }
+    for (const auto& [id, count] : outputs) EXPECT_EQ(count, 2) << id;
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->PrefillSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(OverlapDepth, BoundedReplayFullSlotsSuite, ::testing::Values(0, 1));
 
 // PD: a replayable group travels like any sliding window -- the prefill role
 // replays locally on its own hits and transfers the retained tail; the decode

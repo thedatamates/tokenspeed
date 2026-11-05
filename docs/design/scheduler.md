@@ -1174,12 +1174,18 @@ restores like any other.
 restore resumes a streaming client and takes no budget — then decodes: a
 client is streaming them, and a long prefill chunk must not starve them of
 token budget; then the shared local-prefill phases (resident chunks, then new
-prompts) spend what remains, then `maybeRetractForCapacity`. The decode batch
-leaves `pending_prefill_reserve` untouched when a local prefill is pending:
+prompts) spend what remains. After those phases, release any unused prefill
+reserve and let not-yet-scheduled decodes spend the remaining budget, then run
+`maybeRetractForCapacity`. The initial decode batch leaves
+`pending_prefill_reserve` untouched when a local prefill is pending:
 the budget a hit chunk needs to re-feed its replay window and still advance
 (`MinPrefillChunkTokens`, §1.3; zero without replayable groups). A restore
 that failed for capacity seals new-prompt admission for the round
-(`new_prompts_sealed`), as on the D role.
+(`new_prompts_sealed`), as on the D role. A waiting prompt that cannot obtain
+a request slot or pages must not keep its token reserve after its admission
+attempt: resident decodes need to finish to release that capacity. The final
+decode pass does not schedule a request twice or take budget already spent
+by a prefill.
 
 **Phases, non-mixed:** after the restore, the prefill phases run first and
 alone; decodes get the round only when no prefill scheduled. No prefill
