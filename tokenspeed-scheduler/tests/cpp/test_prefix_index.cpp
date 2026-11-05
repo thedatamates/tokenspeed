@@ -784,4 +784,47 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
                                     60, first);
     EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 60u);
 }
+TEST(PrefixCacheIndexCapacityTest, ParentBoundTracksUnpublishedOwnersPinsAndEviction) {
+    BlockPool pool(2, {4});
+    PrefixCacheIndex index(kGroupId);
+    CacheBlockRef unpublished = pool.AcquireBlock(kGroupId);
+    const auto first = Cache(index, pool, "first", 1);
+    const auto second = Cache(index, pool, "second", 2);
+    EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 2u);
+    EXPECT_EQ(index.PotentiallyEvictableParents(pool), 0);
+
+    unpublished.reset();
+    EXPECT_EQ(index.PotentiallyEvictableParents(pool), 1);
+    auto pin = index.Find(pool, KeyOf("first"));
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{second}));
+    EXPECT_EQ(index.PotentiallyEvictableParents(pool), 0);
+    // Re-keying a pinned entry and moving the index preserve its notification.
+    index.Register(pool, pin, KeyOf("first"), 8, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
+    auto moved = std::move(index);
+    pin.reset();
+    EXPECT_EQ(moved.PotentiallyEvictableParents(pool), 1);
+    EXPECT_EQ(moved.Evict(pool, first), KeyOf("first"));
+    EXPECT_EQ(moved.PotentiallyEvictableParents(pool), 1);
+    EXPECT_EQ(moved.Evict(pool, second), KeyOf("second"));
+    EXPECT_EQ(moved.PotentiallyEvictableParents(pool), 0);
+    EXPECT_EQ(moved.PotentiallyEvictableEntries(pool), 0u);
+}
+
+TEST(PrefixCacheIndexCapacityTest, CanonicalRegistrationAndTiersDoNotDoubleCountParents) {
+    BlockPool device(2, {4});
+    BlockPool host(2, {4});
+    PrefixCacheIndex index(kGroupId);
+    auto pin = device.AcquireBlock(kGroupId);
+    Cache(index, device, "shared", 1);
+    auto duplicate = device.AcquireBlock(kGroupId);
+    index.Register(device, duplicate, KeyOf("shared"), 2, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
+    duplicate.reset();
+    Cache(index, host, "shared", 1);
+    EXPECT_EQ(index.PotentiallyEvictableEntries(device), 1u);
+    EXPECT_EQ(index.PotentiallyEvictableParents(device), 0);
+    EXPECT_EQ(index.PotentiallyEvictableParents(host), 1);
+    pin.reset();
+    EXPECT_EQ(index.PotentiallyEvictableParents(device), 1);
+}
+
 }  // namespace tokenspeed::test

@@ -773,6 +773,11 @@ private:
     }
 
     bool couldFitAfterEviction() const {
+        struct Reclaimable {
+            std::int64_t parents{0};
+            std::int64_t request_slots{0};
+        };
+        std::vector<Reclaimable> reclaimable(groups_.size());
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             std::int64_t need = blocks_needed_[i] + 2 * pair_need_[i];
@@ -799,15 +804,31 @@ private:
                 static_cast<std::int64_t>(groups_[i].Index().PotentiallyEvictableEntries(pool_)) + request_reclaim;
             const std::int64_t excess = need - pool_.NumFreeSlots(static_cast<std::uint32_t>(i)) - removable;
             const std::int64_t packing = pool_.Packing(static_cast<std::uint32_t>(i));
-            // Existing holes cannot move to another group by themselves.
-            // Emptying any parent requires releasing at least the smallest
-            // current parent occupancy, even if all eligible slots line up.
-            const std::int64_t parents_reclaimable =
-                removable / pool_.MinimumParentOccupancy(static_cast<std::uint32_t>(i));
-            parents_needed +=
-                excess > 0 ? (excess + packing - 1) / packing : -std::min((-excess) / packing, parents_reclaimable);
+            if (excess > 0) {
+                parents_needed += (excess + packing - 1) / packing;
+            } else {
+                // Existing holes cannot move to another group by themselves.
+                // A parent costs at least the minimum current occupancy to free.
+                reclaimable[i] = {
+                    .parents = std::min((-excess) / packing,
+                                        removable / pool_.MinimumParentOccupancy(static_cast<std::uint32_t>(i))),
+                    .request_slots = request_reclaim,
+                };
+            }
         }
-        return parents_needed <= pool_.NumEmptyLcmBlocks();
+        // No cross-group borrowing: do not scan parents for ordinary eviction
+        // into holes in the same group.
+        if (parents_needed <= pool_.NumEmptyLcmBlocks()) return true;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (reclaimable[i].parents == 0) continue;
+            // Many cached children cannot fund another group if an unpublished
+            // or known-pinned owner holds every parent. Each request release
+            // could complete at most one additional parent.
+            parents_needed -= std::min(reclaimable[i].parents, groups_[i].Index().PotentiallyEvictableParents(pool_) +
+                                                                   reclaimable[i].request_slots);
+            if (parents_needed <= pool_.NumEmptyLcmBlocks()) return true;
+        }
+        return false;
     }
 
     void collectCandidates() {

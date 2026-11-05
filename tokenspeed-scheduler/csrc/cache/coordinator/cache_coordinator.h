@@ -491,6 +491,12 @@ public:
     // gauge. Per-step accounting composes NumEmptyLcmBlocks and
     // NumActiveLcmBlocks instead.
     std::int32_t NumAvailableLcmBlocks() const;
+    std::uint64_t DeviceEvictionEntriesVisited() const {
+        std::uint64_t visited = 0;
+        for (const CacheGroup& group : groups_) visited += group.Index().EvictionEntriesVisited(pool_);
+        return visited;
+    }
+
     std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }

@@ -144,6 +144,17 @@ plan also skips epochs whose entries are all known to be pinned. Temporary
 lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
+The available-entry index also counts its entries per parent. Before an
+ordered eviction walk, admission compares those counts with live parent
+occupancy to bound how many whole parents could move between groups. Many
+cached children cannot fund another group if unpublished or known-pinned
+children hold every parent. The count is deliberately optimistic about newly
+acquired pins, protected hits and bucket placement; the exact planner still
+checks them. Counts follow the same registration, lazy pin removal, ownership
+notification and eviction lifetime as the available-entry order. Unpublished
+owner releases are observed through the pool's current occupancy. Request-local
+releases contribute an upper bound of one additional parent per released child.
+
 Host duplicate reclamation checks pending stores on a candidate's ancestor
 chain once per scan and reuses that answer for other candidates sharing it.
 The memo and traversal buffers belong to the scan: the next scan rechecks

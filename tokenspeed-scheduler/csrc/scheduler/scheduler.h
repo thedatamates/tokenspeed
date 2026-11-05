@@ -135,6 +135,11 @@ public:
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
     std::int32_t ActiveLcmBlocks() const;
+    // Cumulative local new-prompt work; resident chunks and restores are separate.
+    std::uint64_t NewPrefillAttempts() const { return new_prefill_attempts_; }
+    std::uint64_t FailedNewPrefillAttempts() const { return failed_new_prefill_attempts_; }
+    std::uint64_t DeviceEvictionEntriesVisited() const { return coordinator_.DeviceEvictionEntriesVisited(); }
+
     // RemotePrefilling only: a subset of PrefillSize(), never an extra total.
     std::size_t RemotePrefillSize() const;
     // Requests whose pages PD still pins. This resource count overlaps FSM states.
@@ -519,6 +524,8 @@ private:
     BlockPool host_pool_;
     BlockPool snapshot_pool_;
     CacheCoordinator coordinator_;
+    std::uint64_t new_prefill_attempts_{0};
+    std::uint64_t failed_new_prefill_attempts_{0};
     TierTransferManager tier_transfers_;
     std::unique_ptr<StorageTransferManager> storage_transfers_;
     std::int64_t storage_now_us_{0};

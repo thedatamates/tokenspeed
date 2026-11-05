@@ -176,12 +176,13 @@ public:
         entry.logical_block_index = logical_block_index;
         entry.boundary_kind = boundary_kind;
         entry.max_access_epoch = access_epoch;
-        entry.available_order = &cache_index.available_order;
+        entry.cache_index = &cache_index;
         entry.session = std::move(session);
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         cache_index.available_order.emplace(evictionOrder(*entry_it), entry_it);
+        ++cache_index.available_per_parent[block_ref->Location().lcm_block_id];
         linkCommonEntry(cache_index, entry_it);
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
@@ -322,6 +323,7 @@ public:
             const std::uint64_t epoch = cursor.next_->first.last_access_epoch;
             const std::size_t initial_size = out.size();
             while (cursor.next_ != available.end() && cursor.next_->first.last_access_epoch == epoch) {
+                ++cursor.cache_index_->eviction_entries_visited;
                 const auto current = cursor.next_++;
                 CacheEntry& cache_entry = *current->second;
                 if (cache_entry.block_ref.unique()) {
@@ -334,6 +336,7 @@ public:
                     // last request/transfer owner releases this block. Ordinary
                     // temporary Find() references need no index maintenance.
                     cache_entry.pinned_order = available.extract(current);
+                    --cache_entry.cache_index->available_per_parent[cache_entry.block_ref->Location().lcm_block_id];
                     cache_entry.unique_observer.Observe(cache_entry.block_ref, restoreAvailable, &cache_entry);
                 }
             }
@@ -405,6 +408,28 @@ public:
     std::size_t PotentiallyEvictableEntries(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index == nullptr ? 0 : cache_index->available_order.size();
+    }
+
+    // Upper bound on parents eviction could empty. Cached children cannot
+    // fund another group while an unpublished or known-pinned child holds
+    // their parent. Consult live occupancy: releasing an unpublished owner
+    // can make a parent reclaimable without changing this index.
+    std::int64_t PotentiallyEvictableParents(const BlockPool& pool) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) return 0;
+        std::int64_t parents = 0;
+        for (std::size_t id = 1; id < cache_index->available_per_parent.size(); ++id) {
+            const std::int32_t available = cache_index->available_per_parent[id];
+            if (available > 0 && available >= pool.OccupiedCount(static_cast<std::int32_t>(id))) {
+                ++parents;
+            }
+        }
+        return parents;
+    }
+
+    std::uint64_t EvictionEntriesVisited(const BlockPool& pool) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        return cache_index == nullptr ? 0 : cache_index->eviction_entries_visited;
     }
 
     // Every unpinned entry of one tier, in no particular order. Callers that
@@ -566,7 +591,7 @@ private:
         bool was_acquired{false};
         // See CachedBlockMetadata::max_access_epoch.
         std::uint64_t max_access_epoch{0};
-        EvictionOrderMap* available_order{nullptr};
+        CacheEntries* cache_index{nullptr};
         EvictionOrderMap::node_type pinned_order;
         CacheBlockUniqueObserver unique_observer;
         CacheEntry* common_peer{nullptr};
@@ -588,6 +613,10 @@ private:
         // Entries known to be pinned are removed lazily during traversal.
         // Ownership notifications restore them without changing their age.
         mutable EvictionOrderMap available_order;
+        // Same membership as available_order, counted by parent. Dense pool
+        // IDs keep pin-release callbacks allocation-free.
+        mutable std::vector<std::int32_t> available_per_parent;
+        mutable std::uint64_t eviction_entries_visited{0};
         // Only the source keeps the order. Entries in both pools point at
         // each other while their keys coexist; erasing either unlinks them.
         CacheEntries* common_peer{nullptr};
@@ -613,7 +642,8 @@ private:
 
     static void restoreAvailable(void* context) noexcept {
         auto& entry = *static_cast<CacheEntry*>(context);
-        entry.available_order->insert(std::move(entry.pinned_order));
+        entry.cache_index->available_order.insert(std::move(entry.pinned_order));
+        ++entry.cache_index->available_per_parent[entry.block_ref->Location().lcm_block_id];
     }
 
     static CachedBlockMetadata metadataOf(const CacheEntry& cache_entry) noexcept {
@@ -663,7 +693,9 @@ private:
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
-        return cache_entries_by_pool_.try_emplace(&pool).first->second;
+        auto [it, inserted] = cache_entries_by_pool_.try_emplace(&pool);
+        if (inserted) it->second.available_per_parent.resize(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1);
+        return it->second;
     }
     CacheEntries* findCacheEntries(const BlockPool& pool) {
         auto it = cache_entries_by_pool_.find(&pool);
@@ -702,7 +734,9 @@ private:
             peer->common_peer = nullptr;
         }
         entry_it->unique_observer.Reset();
-        cache_index.available_order.erase(evictionOrder(*entry_it));
+        if (cache_index.available_order.erase(evictionOrder(*entry_it))) {
+            --cache_index.available_per_parent[entry_it->block_ref->Location().lcm_block_id];
+        }
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);

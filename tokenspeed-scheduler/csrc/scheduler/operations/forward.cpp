@@ -1645,6 +1645,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 build.Scheduled(*request)) {
                 continue;
             }
+            if (!resident) ++new_prefill_attempts_;
             feedback.admission_failed = false;
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                          decode_reserve, build.load_backs, build.kv_page_budget)) {
@@ -1654,6 +1655,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                     return;
                 }
             } else if (feedback.admission_failed) {
+                if (!resident) ++failed_new_prefill_attempts_;
                 feedback.NoteCapacityBlocked(request);
                 if (resident) {
                     return;

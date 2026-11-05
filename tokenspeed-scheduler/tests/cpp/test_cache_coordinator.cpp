@@ -16592,4 +16592,74 @@ TEST(CacheCoordinatorSessionAccess, TheRegistrationLivesAsLongAsItsHandle) {
     coordinator.Free(untagged_tables);
 }
 
+TEST(CacheCoordinatorAdmissionCapacity, FragmentedParentsAllowLocalHolesAndRecoverAfterOwnerRelease) {
+    BlockPool pool(2, {1, 4});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, 0);
+    auto blocks = pool.AcquireBlocks(1, 8);
+    ASSERT_EQ(blocks.size(), 8u);
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        if (blocks[i]->Location().slot_index == 0) continue;
+        coordinator.GroupPrefixIndex(1).Register(pool, blocks[i],
+                                                 CacheKey{.group_id = 1, .content_hash = std::to_string(i)}, i + 1, -1,
+                                                 CacheBoundaryKind::kChunk, nullptr, nullptr);
+        blocks[i].reset();
+    }
+    std::array<BlockTable, 2> tables;
+    std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}, GroupDemand{.table = &tables[1]}};
+    auto admit = [&] {
+        return coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, {}, std::nullopt,
+                                 std::nullopt, false, {});
+    };
+    EXPECT_FALSE(admit());
+    EXPECT_FALSE(admit());
+    EXPECT_EQ(coordinator.DeviceEvictionEntriesVisited(), 0u);
+    // A smaller demand in the existing group still fits by evicting a child.
+    demands[0].extent = DenseGrowth{0};
+    demands[1].extent = DenseGrowth{4};
+    ASSERT_TRUE(admit());
+    EXPECT_GT(coordinator.DeviceEvictionEntriesVisited(), 0u);
+    coordinator.Free(tables);
+    // Releasing a private owner changes whole-parent feasibility immediately.
+    blocks.front().reset();
+    demands[0].extent = DenseGrowth{4};
+    demands[1].extent = DenseGrowth{0};
+    ASSERT_TRUE(admit());
+    coordinator.Free(tables);
+}
+
+TEST(CacheCoordinatorAdmissionCapacity, KnownPinnedParentsSkipRepeatedWalksAndUnpinRestoresCapacity) {
+    BlockPool pool(2, {1, 4});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, 0);
+    auto blocks = pool.AcquireBlocks(1, 8);
+    ASSERT_EQ(blocks.size(), 8u);
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        coordinator.GroupPrefixIndex(1).Register(pool, blocks[i],
+                                                 CacheKey{.group_id = 1, .content_hash = std::to_string(i)}, i + 1, -1,
+                                                 CacheBoundaryKind::kChunk, nullptr, nullptr);
+        if (blocks[i]->Location().slot_index != 0) blocks[i].reset();
+    }
+    std::array<BlockTable, 2> tables;
+    std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}, GroupDemand{.table = &tables[1]}};
+    auto admit = [&] {
+        return coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, {}, std::nullopt,
+                                 std::nullopt, false, {});
+    };
+    EXPECT_FALSE(admit());
+    const auto visited = coordinator.DeviceEvictionEntriesVisited();
+    EXPECT_GT(visited, 0u);
+    EXPECT_FALSE(admit());
+    EXPECT_EQ(coordinator.DeviceEvictionEntriesVisited(), visited);
+    blocks.front().reset();
+    ASSERT_TRUE(admit());
+    coordinator.Free(tables);
+}
+
 }  // namespace tokenspeed::test
